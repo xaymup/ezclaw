@@ -13,7 +13,7 @@ class ChatAgent:
     def __init__(self, session_id: Optional[int] = None):
         self.client = ollama.Client(host=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"))
         self.db = Database(os.getenv("DATABASE_PATH", "ezclaw.db"))
-        self.model = os.getenv("OLLAMA_MODEL", "qwen3.5:9b")
+        self.model = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:14b")
         
         ka = os.getenv("OLLAMA_KEEP_ALIVE", "60m")
         try:
@@ -65,30 +65,39 @@ class ChatAgent:
         self.messages = [{"role": "system", "content": self.system_prompt}]
 
     def chat_stream(self, user_input: str) -> Iterator[Dict[str, Any]]:
-        # Proactive Memory Recall
+        # 1. Proactive Fuzzy Memory Search
         memories = self.db.search_memories(user_input)
+        memory_block = ""
         if memories:
-            memory_context = "\n[RELEVANT MEMORIES]\n- " + "\n- ".join(memories)
-            # Inject memories as a hidden context hint in the user message for the model
-            augmented_input = f"{user_input}\n{memory_context}"
-        else:
-            augmented_input = user_input
+            memory_block = "\n<memory_recall>\n" + "\n".join([f"- {m}" for m in memories]) + "\n</memory_recall>"
 
-        user_msg = {"role": "user", "content": augmented_input}
-        self.messages.append({"role": "user", "content": user_input}) # Keep clean version in history
+        # 2. Add clean version to database, use augmented for current turn
+        user_msg_augmented = {"role": "user", "content": f"{memory_block}\nUser: {user_input}"}
+        self.messages.append({"role": "user", "content": user_input})
         self.db.add_message(self.session_id, "user", user_input)
 
-        while True:
+        iteration_count = 0
+        max_iterations = 10
+        last_tool_hash = None
+
+        while iteration_count < max_iterations:
+            iteration_count += 1
             full_response_content = ""
             full_reasoning_content = ""
             tool_calls = []
-            
             in_thinking = False
             raw_buffer = ""
 
-            # Use augmented input for the latest user message in the context
-            history_for_context = self.messages[:-1] + [user_msg]
-            context_messages = [self.messages[0]] + history_for_context[-10:] if len(history_for_context) > 11 else history_for_context
+            # 3. Smart Context Truncation
+            # Keep System [0], keep original session goal [1], and last 15 messages
+            if len(self.messages) > 18:
+                context_messages = [self.messages[0], self.messages[1]] + self.messages[-15:]
+            else:
+                context_messages = self.messages
+            
+            # Use the augmented message for the very last user interaction
+            if context_messages[-1]["role"] == "user":
+                context_messages[-1] = user_msg_augmented
 
             stream = self.client.chat(
                 model=self.model,
@@ -107,35 +116,23 @@ class ChatAgent:
                 if chunk.message.content:
                     text = chunk.message.content
                     raw_buffer += text
-                    
                     if not in_thinking:
-                        # Check for opening tags
                         match = re.search(r'<(think|thought)>', raw_buffer, re.IGNORECASE)
                         if match:
                             in_thinking = True
-                            pre_tag = raw_buffer[:match.start()]
-                            if pre_tag:
-                                full_response_content += pre_tag
-                                yield {"type": "content", "content": pre_tag}
+                            pre_tag = raw_buffer[:match.start()]; yield {"type": "content", "content": pre_tag} if pre_tag else None
                             raw_buffer = raw_buffer[match.end():]
                         elif not any(tag.startswith(raw_buffer.lower()[raw_buffer.lower().rfind('<'):]) for tag in ["<think>", "<thought>"] if '<' in raw_buffer):
-                            # Not a potential tag, yield everything
                             full_response_content += raw_buffer
                             yield {"type": "content", "content": raw_buffer}
                             raw_buffer = ""
-                        # Otherwise (is a potential tag prefix), wait for more data.
                     else:
-                        # Check for closing tags
                         match = re.search(r'</(think|thought)>', raw_buffer, re.IGNORECASE)
                         if match:
                             in_thinking = False
-                            pre_tag = raw_buffer[:match.start()]
-                            if pre_tag:
-                                full_reasoning_content += pre_tag
-                                yield {"type": "reasoning", "content": pre_tag}
+                            pre_tag = raw_buffer[:match.start()]; yield {"type": "reasoning", "content": pre_tag} if pre_tag else None
                             raw_buffer = raw_buffer[match.end():]
                         elif not any(tag.startswith(raw_buffer.lower()[raw_buffer.lower().rfind('</'):]) for tag in ["</think>", "</thought>"] if '</' in raw_buffer):
-                            # Not a potential closing tag prefix, yield everything
                             full_reasoning_content += raw_buffer
                             yield {"type": "reasoning", "content": raw_buffer}
                             raw_buffer = ""
@@ -143,72 +140,50 @@ class ChatAgent:
                 if chunk.message.tool_calls:
                     tool_calls.extend(chunk.message.tool_calls)
 
-            # Final flush
             if raw_buffer:
-                if in_thinking:
-                    full_reasoning_content += raw_buffer
-                    yield {"type": "reasoning", "content": raw_buffer}
-                else:
-                    full_response_content += raw_buffer
-                    yield {"type": "content", "content": raw_buffer}
+                if in_thinking: full_reasoning_content += raw_buffer; yield {"type": "reasoning", "content": raw_buffer}
+                else: full_response_content += raw_buffer; yield {"type": "content", "content": raw_buffer}
 
             if not tool_calls:
                 assistant_msg = {"role": "assistant", "content": full_response_content}
-                if full_reasoning_content:
-                    assistant_msg["reasoning"] = full_reasoning_content
+                if full_reasoning_content: assistant_msg["reasoning"] = full_reasoning_content
                 self.messages.append(assistant_msg)
                 self.db.add_message(self.session_id, assistant_msg["role"], assistant_msg["content"])
                 break
 
-            # Handle tools
+            # 4. Repetition Detection
+            current_hash = hash(str([(t.function.name, t.function.arguments) for t in tool_calls]))
+            if current_hash == last_tool_hash:
+                yield {"type": "content", "content": "\n[System: Loop Detected. You are repeating actions. Stop and ask for help.]"}
+                break
+            last_tool_hash = current_hash
+
+            # Process Tools
             self.messages.append({
-                "role": "assistant", 
-                "content": full_response_content,
+                "role": "assistant", "content": full_response_content,
                 "tool_calls": [{"function": {"name": t.function.name, "arguments": t.function.arguments}} for t in tool_calls]
             })
-            self.db.add_message(self.session_id, "assistant", full_response_content, 
-                                tool_calls=[{"function": {"name": t.function.name, "arguments": t.function.arguments}} for t in tool_calls])
 
             for tool in tool_calls:
                 tool_func = registry.tools.get(tool.function.name)
-                
-                # Check for authorization
                 if tool_func and getattr(tool_func, 'auth_required', False) and not self.session_authorized:
-                    auth_response = yield {
-                        "type": "auth_required", 
-                        "name": tool.function.name, 
-                        "arguments": tool.function.arguments
-                    }
+                    auth_response = yield {"type": "auth_required", "name": tool.function.name, "arguments": tool.function.arguments}
                     if auth_response == "deny":
-                        result = "Authorization denied by user."
-                        tool_msg = {'role': 'tool', 'content': result, 'name': tool.function.name}
-                        self.messages.append(tool_msg)
-                        self.db.add_message(self.session_id, tool_msg["role"], tool_msg["content"])
+                        result = "Authorization denied."
+                        self.messages.append({'role': 'tool', 'content': result, 'name': tool.function.name})
                         yield {"type": "tool_end", "name": tool.function.name, "result": result}
                         continue
-                    elif auth_response == "allow_session":
-                        self.session_authorized = True
+                    elif auth_response == "allow_session": self.session_authorized = True
 
                 yield {"type": "tool_start", "name": tool.function.name, "arguments": tool.function.arguments}
-                if tool_func:
-                    try:
-                        result = tool_func(**tool.function.arguments)
-                    except Exception as e:
-                        result = f"Error executing tool: {str(e)}"
-                    tool_msg = {'role': 'tool', 'content': str(result), 'name': tool.function.name}
-                    self.messages.append(tool_msg)
-                    self.db.add_message(self.session_id, tool_msg["role"], tool_msg["content"])
-                    yield {"type": "tool_end", "name": tool.function.name, "result": str(result)}
-                else:
-                    error_msg = f"Tool {tool.function.name} not found."
-                    tool_msg = {'role': 'tool', 'content': error_msg, 'name': tool.function.name}
-                    self.messages.append(tool_msg)
-                    self.db.add_message(self.session_id, tool_msg["role"], tool_msg["content"])
-                    yield {"type": "tool_end", "name": tool.function.name, "result": error_msg}
+                try:
+                    result = tool_func(**tool.function.arguments) if tool_func else "Tool not found."
+                except Exception as e:
+                    result = f"Error: {str(e)}"
+                
+                self.messages.append({'role': 'tool', 'content': str(result), 'name': tool.function.name})
+                self.db.add_message(self.session_id, "tool", str(result))
+                yield {"type": "tool_end", "name": tool.function.name, "result": str(result)}
 
-    def chat(self, user_input: str, stream_callback: Optional[Callable[[str], None]] = None) -> str:
-        full_content = ""
-        for chunk in self.chat_stream(user_input):
-            if chunk["type"] == "content":
-                full_content += chunk["content"]
-        return full_content
+        if iteration_count >= max_iterations:
+            yield {"type": "content", "content": "\n[System: Action limit reached.]"}

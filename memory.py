@@ -11,7 +11,6 @@ class Database:
     def _init_db(self):
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
-            # Sessions table
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS sessions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -19,7 +18,6 @@ class Database:
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
-            # Messages table
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS messages (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -31,7 +29,6 @@ class Database:
                     FOREIGN KEY (session_id) REFERENCES sessions (id)
                 )
             ''')
-            # Long-term memory table
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS memories (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -82,15 +79,24 @@ class Database:
             conn.commit()
 
     def search_memories(self, query: str) -> List[str]:
-        # Simple keyword-based search for now
+        # Keyword-based fuzzy search
+        stop_words = {'what', 'when', 'is', 'the', 'how', 'many', 'days', 'until', 'of', 'a', 'an', 'my', 'your', 'me', 'tell'}
+        words = [w.strip().lower() for w in query.split() if w.lower() not in stop_words and len(w) > 2]
+        
+        if not words:
+            words = [query]
+
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
-            # Simple LIKE search on fact and tags
-            cursor.execute(
-                "SELECT fact FROM memories WHERE fact LIKE ? OR tags LIKE ?",
-                (f"%{query}%", f"%{query}%")
-            )
-            return [row[0] for row in cursor.fetchall()]
+            results = []
+            for word in words:
+                cursor.execute(
+                    "SELECT fact FROM memories WHERE fact LIKE ? OR tags LIKE ?",
+                    (f"%{word}%", f"%{word}%")
+                )
+                results.extend([row[0] for row in cursor.fetchall()])
+            
+            return list(set(results))[:8] # Return unique matches
 
     def get_last_session_id(self) -> Optional[int]:
         with sqlite3.connect(self.db_path) as conn:

@@ -21,3 +21,6 @@ workspace/
 
 # Logs
 *.log
+
+repomix-output.xml
+
