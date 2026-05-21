@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+build/
+dist/
+*.egg-info/
+
+# Project Specific
+.env
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+.ezclaw_history
+heartbeat.md
+workspace/
+!workspace/.gitkeep
+
+# Logs
+*.log

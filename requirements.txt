@@ -1,0 +1,5 @@
+ollama>=0.4.0
+rich
+prompt_toolkit
+python-dotenv
+httpx
