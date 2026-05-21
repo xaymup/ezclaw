@@ -153,7 +153,23 @@ JSON:"""
                 self.db.add_memory(fact)
                 yield {"type": "memory_stored", "fact": fact}
 
-        # 3. Memory recall & Context Augmentation
+        # 3. Dynamic Model Selection
+        selected_model = self.model
+        agent_label = "Generalist"
+        
+        if intent.get("search"):
+            selected_model = "qwen3.5:9b"
+            agent_label = "Researcher"
+        elif "error" in user_input.lower() or "bug" in user_input.lower() or "fix" in user_input.lower():
+            selected_model = "deepseek-r1:14b"
+            agent_label = "Debugger"
+        elif "code" in user_input.lower() or "script" in user_input.lower():
+            selected_model = "qwen2.5-coder:14b"
+            agent_label = "Coder"
+            
+        yield {"type": "content", "content": f"🛠️ [Agent: {agent_label} ({selected_model})]\n"}
+
+        # 4. Memory recall & Context Augmentation
         memory_block = ""
         if intent.get("memory"):
             query = intent.get("memory_q") or user_input
