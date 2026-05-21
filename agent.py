@@ -97,25 +97,28 @@ class ChatAgent:
     def _process_intent(self, user_input: str) -> Dict[str, Any]:
         """
         Context Augmentor: Uses deep reasoning to identify what personal context 
-        is missing OR relevant from the prompt to fulfill the user's intent.
+        is missing OR relevant from the prompt to fulfill the user's intent,
+        and if a web search is required for accuracy or clarification.
         """
         key_facts = self.db.get_key_facts()
         
-        prompt = f"""You are a Context Augmentor. Your goal is to identify if the user's input can be "improved" or personalized by using information from their long-term memory.
+        prompt = f"""You are a Context Augmentor. Your goal is to identify if the user's input can be "improved" by using information from their long-term memory OR if it requires a web search for current accuracy, debugging, or clarification.
 
 [Key Facts already in mind]: {key_facts}
 
 User Input: "{user_input}"
 
 Instructions:
-1. Even if you "know" the answer from [Key Facts], if the fact is RELEVANT (e.g., you see their location and they ask about weather), you MUST set "memory": true so it can be explicitly injected into the final prompt.
-2. If the user's prompt is generic (e.g., "What's the weather?", "How are you?"), search for personalizing details (location, name, preferences).
-3. Generate a SEMANTIC search query for anything not covered in [Key Facts] but needed for the intent.
+1. Memory: If a fact from memory is RELEVANT, set "memory": true.
+2. Search: If the prompt contains a technical error, a software bug, an obscure term, or a dynamic topic (news, versions), set "search": true and provide a "search_q".
+3. Clarification: If the prompt is vague but could be clarified by a quick web search (e.g., unfamiliar acronyms or products), set "search": true.
 
 Return a valid JSON object:
-- "reasoning": Your analysis of why context is or isn't needed.
-- "memory": bool, true if context (from [Key Facts] or a new search) should be explicitly "provoked" and used.
-- "memory_q": A search query for additional details or null.
+- "reasoning": Your analysis.
+- "memory": bool, true if memory context should be used.
+- "memory_q": search query for memory or null.
+- "search": bool, true if a web search is RECOMMENDED or MANDATORY.
+- "search_q": search query for web_fetch or null.
 - "facts": list of new facts to store.
 - "skill": skill name or null.
 
@@ -129,15 +132,12 @@ JSON:"""
             )
             intent = json.loads(response["message"]["content"].strip())
             
-            # If the model finds the input is relevant to personalization, 
-            # we ensure a query exists to trigger the recall.
             if intent.get("memory") and not intent.get("memory_q"):
-                # If no specific query, we use the user input to find the related facts again
                 intent["memory_q"] = user_input
                 
             return intent
         except Exception:
-            return {"memory": False, "memory_q": None, "facts": [], "skill": None}
+            return {"memory": False, "memory_q": None, "search": False, "search_q": None, "facts": [], "skill": None}
 
     def clear_session_history(self):
         """Restores the chat history to just the system prompt."""
@@ -162,7 +162,13 @@ JSON:"""
                 memory_block = f"\n[Background Context retrieved from Memory for this request]:\n" + "\n".join([f"- {m}" for m in memories]) + "\n"
                 yield {"type": "context_augmented", "memories": memories}
 
-        # 4. Skill matching
+        # 4. Search recommendation
+        search_nudge = ""
+        if intent.get("search"):
+            sq = intent.get("search_q") or user_input
+            search_nudge = f"\n[Proactive Search Recommended]: Use `web_fetch` to research: '{sq}'. This is flagged for current accuracy or clarification.\n"
+
+        # 5. Skill matching
         skill_name = intent.get("skill")
         matched_skills = []
         if skill_name:
@@ -174,12 +180,12 @@ JSON:"""
         skills_block = format_skills_block(matched_skills)
 
         # 5. History & Augmentation
-        # We keep the real input for history, but use augmented for the model
         self.messages.append({"role": "user", "content": user_input})
         self.db.add_message(self.session_id, "user", user_input)
         
-        # Augmented content is used for ALL follow-up turns in this request
-        user_msg_augmented_content = f"{memory_block}{skills_block}\n[User Prompt]: {user_input}"
+        # Nudge the model to follow the CoT protocol from agents.md
+        cot_nudge = "\n[System Reminder]: Follow the MANDATORY CHAIN OF THOUGHT protocol using <think> tags as defined in your persona."
+        user_msg_augmented_content = f"{memory_block}{skills_block}{search_nudge}{cot_nudge}\n[User Prompt]: {user_input}"
 
         iteration_count = 0
         max_iterations = 15 
@@ -205,71 +211,81 @@ JSON:"""
             stream = self.client.chat(model=self.model, messages=context_messages, tools=self.tools, options=self.options, keep_alive=self.keep_alive, stream=True)
 
             for chunk in stream:
-                if hasattr(chunk.message, 'reasoning') and chunk.message.reasoning:
-                    full_reasoning += chunk.message.reasoning
-                    yield {"type": "reasoning", "content": chunk.message.reasoning}
+                # Handle dedicated reasoning field (e.g. DeepSeek-R1)
+                reasoning = getattr(chunk.message, 'reasoning', None) or (chunk.message.get('reasoning') if isinstance(chunk.message, dict) else None)
+                if reasoning:
+                    full_reasoning += reasoning
+                    yield {"type": "reasoning", "content": reasoning}
                 
                 if chunk.message.content:
                     raw_buffer += chunk.message.content
                     
-                    if not in_thinking:
-                        # Check for opening tags
-                        match = re.search(r'<(think|thought)>', raw_buffer, re.IGNORECASE)
-                        if match:
-                            in_thinking = True
-                            pre = raw_buffer[:match.start()]
-                            if pre: 
-                                full_response += pre
-                                yield {"type": "content", "content": pre}
-                            raw_buffer = raw_buffer[match.end():]
-                        else:
-                            # Avoid yielding if we might be in the middle of a tag
+                    while True:
+                        if not in_thinking:
+                            # Permissive search for opening tag
+                            match = re.search(r'<(think|thought|reasoning)\b[^>]*>', raw_buffer, re.IGNORECASE)
+                            if match:
+                                pre = raw_buffer[:match.start()]
+                                if pre:
+                                    full_response += pre
+                                    yield {"type": "content", "content": pre}
+                                in_thinking = True
+                                raw_buffer = raw_buffer[match.end():]
+                                continue
+                            
+                            # Check for partial tag start
                             if '<' in raw_buffer:
                                 last_bracket = raw_buffer.rfind('<')
-                                if any(tag.startswith(raw_buffer[last_bracket:].lower()) for tag in ["<think>", "<thought>"]):
-                                    # Yield everything BEFORE the bracket
+                                if any(tag.startswith(raw_buffer[last_bracket:].lower()) for tag in ["<think", "<thought", "<reasoning"]):
                                     pre = raw_buffer[:last_bracket]
                                     if pre:
                                         full_response += pre
                                         yield {"type": "content", "content": pre}
                                     raw_buffer = raw_buffer[last_bracket:]
+                                    break
                                 else:
-                                    # Not a tag start, yield it all
                                     full_response += raw_buffer
                                     yield {"type": "content", "content": raw_buffer}
                                     raw_buffer = ""
+                                    break
                             else:
-                                full_response += raw_buffer
-                                yield {"type": "content", "content": raw_buffer}
-                                raw_buffer = ""
-                    else:
-                        # Check for closing tags
-                        match = re.search(r'</(think|thought)>', raw_buffer, re.IGNORECASE)
-                        if match:
-                            in_thinking = False
-                            pre = raw_buffer[:match.start()]
-                            if pre:
-                                full_reasoning += pre
-                                yield {"type": "reasoning", "content": pre}
-                            raw_buffer = raw_buffer[match.end():]
+                                if raw_buffer:
+                                    full_response += raw_buffer
+                                    yield {"type": "content", "content": raw_buffer}
+                                    raw_buffer = ""
+                                break
                         else:
-                            # Avoid yielding if we might be in the middle of a closing tag
+                            # Search for closing tag
+                            match = re.search(r'</(think|thought|reasoning)\s*>', raw_buffer, re.IGNORECASE)
+                            if match:
+                                pre = raw_buffer[:match.start()]
+                                if pre:
+                                    full_reasoning += pre
+                                    yield {"type": "reasoning", "content": pre}
+                                in_thinking = False
+                                raw_buffer = raw_buffer[match.end():]
+                                continue
+                            
                             if '</' in raw_buffer:
                                 last_bracket = raw_buffer.rfind('</')
-                                if any(tag.startswith(raw_buffer[last_bracket:].lower()) for tag in ["</think>", "</thought>"]):
+                                if any(tag.startswith(raw_buffer[last_bracket:].lower()) for tag in ["</think", "</thought", "</reasoning"]):
                                     pre = raw_buffer[:last_bracket]
                                     if pre:
                                         full_reasoning += pre
                                         yield {"type": "reasoning", "content": pre}
                                     raw_buffer = raw_buffer[last_bracket:]
+                                    break
                                 else:
                                     full_reasoning += raw_buffer
                                     yield {"type": "reasoning", "content": raw_buffer}
                                     raw_buffer = ""
+                                    break
                             else:
-                                full_reasoning += raw_buffer
-                                yield {"type": "reasoning", "content": raw_buffer}
-                                raw_buffer = ""
+                                if raw_buffer:
+                                    full_reasoning += raw_buffer
+                                    yield {"type": "reasoning", "content": raw_buffer}
+                                    raw_buffer = ""
+                                break
                 
                 if chunk.message.tool_calls: tool_calls.extend(chunk.message.tool_calls)
 
