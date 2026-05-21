@@ -11,37 +11,13 @@ class Database:
     def _init_db(self):
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS sessions (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS messages (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    session_id INTEGER,
-                    role TEXT,
-                    content TEXT,
-                    tool_calls TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (session_id) REFERENCES sessions (id)
-                )
-            ''')
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS memories (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    fact TEXT,
-                    tags TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
+            cursor.execute('''CREATE TABLE IF NOT EXISTS sessions (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+            cursor.execute('''CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id INTEGER, role TEXT, content TEXT, tool_calls TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (session_id) REFERENCES sessions (id))''')
+            cursor.execute('''CREATE TABLE IF NOT EXISTS memories (id INTEGER PRIMARY KEY AUTOINCREMENT, fact TEXT, tags TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
             conn.commit()
 
     def create_session(self, name: Optional[str] = None) -> int:
-        if not name:
-            name = f"Session {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        if not name: name = f"Session {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
             cursor.execute("INSERT INTO sessions (name) VALUES (?)", (name,))
@@ -51,52 +27,119 @@ class Database:
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
             tool_calls_json = json.dumps(tool_calls) if tool_calls else None
-            cursor.execute(
-                "INSERT INTO messages (session_id, role, content, tool_calls) VALUES (?, ?, ?, ?)",
-                (session_id, role, content, tool_calls_json)
-            )
+            cursor.execute("INSERT INTO messages (session_id, role, content, tool_calls) VALUES (?, ?, ?, ?)", (session_id, role, content, tool_calls_json))
             conn.commit()
 
     def get_messages(self, session_id: int) -> List[Dict[str, Any]]:
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
-            cursor.execute(
-                "SELECT role, content, tool_calls FROM messages WHERE session_id = ? ORDER BY created_at ASC",
-                (session_id,)
-            )
+            cursor.execute("SELECT role, content, tool_calls FROM messages WHERE session_id = ? ORDER BY created_at ASC", (session_id,))
             messages = []
             for role, content, tool_calls_json in cursor.fetchall():
                 msg = {"role": role, "content": content}
-                if tool_calls_json:
-                    msg["tool_calls"] = json.loads(tool_calls_json)
+                if tool_calls_json: msg["tool_calls"] = json.loads(tool_calls_json)
                 messages.append(msg)
             return messages
 
     def add_memory(self, fact: str, tags: Optional[str] = None):
+        if not tags:
+            # Basic auto-tagging
+            keywords = {
+                'location': ['location', 'lives in', 'city', 'country', 'home'],
+                'birthday': ['birthday', 'born', 'birth'],
+                'preference': ['prefer', 'like', 'dislike', 'favorite'],
+                'project': ['project', 'work', 'repo', 'path']
+            }
+            found_tags = []
+            fact_lower = fact.lower()
+            for tag, keys in keywords.items():
+                if any(k in fact_lower for k in keys):
+                    found_tags.append(tag)
+            if found_tags:
+                tags = ",".join(found_tags)
+
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
             cursor.execute("INSERT INTO memories (fact, tags) VALUES (?, ?)", (fact, tags))
             conn.commit()
 
     def search_memories(self, query: str) -> List[str]:
-        # Keyword-based fuzzy search
-        stop_words = {'what', 'when', 'is', 'the', 'how', 'many', 'days', 'until', 'of', 'a', 'an', 'my', 'your', 'me', 'tell'}
-        words = [w.strip().lower() for w in query.split() if w.lower() not in stop_words and len(w) > 2]
+        """Simple and robust keyword-based memory search."""
+        # Only filter out very common short words
+        stop_words = {'what', 'when', 'is', 'the', 'how', 'many', 'of', 'a', 'an', 'and', 'for', 'with'}
+        words = [w.strip().lower() for w in query.replace('?', '').replace('.', '').split() 
+                 if w.lower() not in stop_words and len(w) >= 2]
         
         if not words:
-            words = [query]
+            return []
 
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
-            results = []
-            for word in words:
-                cursor.execute(
-                    "SELECT fact FROM memories WHERE fact LIKE ? OR tags LIKE ?",
-                    (f"%{word}%", f"%{word}%")
-                )
-                results.extend([row[0] for row in cursor.fetchall()])
             
-            return list(set(results))[:8] # Return unique matches
+            # Search for each word and collect matches
+            all_matches = []
+            for word in words:
+                cursor.execute("SELECT fact FROM memories WHERE fact LIKE ? OR tags LIKE ?", (f"%{word}%", f"%{word}%"))
+                all_matches.extend([row[0] for row in cursor.fetchall()])
+            
+            if not all_matches:
+                return []
+            
+            # Score by frequency of keyword matches
+            fact_counts = {}
+            for fact in all_matches:
+                fact_counts[fact] = fact_counts.get(fact, 0) + 1
+            
+            # Sort by frequency (most matches first) and deduplicate
+            sorted_facts = sorted(fact_counts.items(), key=lambda x: x[1], reverse=True)
+            return [f[0] for f in sorted_facts[:10]]
+
+    def get_key_facts(self) -> List[str]:
+        """Retrieve most important and recent facts to provide context baseline."""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            # Combine specifically tagged 'important' facts and the 15 most recent ones
+            cursor.execute("""
+                SELECT fact FROM memories 
+                WHERE tags LIKE '%key%' OR tags LIKE '%important%' OR tags LIKE '%location%' 
+                OR tags LIKE '%user_name%' OR tags LIKE '%birthday%'
+                UNION
+                SELECT fact FROM (SELECT fact FROM memories ORDER BY created_at DESC LIMIT 15)
+            """)
+            results = [row[0] for row in cursor.fetchall()]
+            return list(set(results))[:15]
+
+    def delete_memory(self, query: str) -> List[str]:
+        """Delete memories matching the query keywords. Returns list of deleted facts."""
+        stop_words = {'what', 'when', 'is', 'the', 'how', 'many', 'of', 'a', 'an', 'my', 'your', 'forget', 'remove', 'delete'}
+        words = [w.strip().lower() for w in query.split() if w.lower() not in stop_words and len(w) > 2]
+        if not words: words = [query.lower()]
+
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+
+            # Find facts first so we can report what was deleted
+            conditions = []
+            params = []
+            for word in words:
+                conditions.append("(fact LIKE ? OR tags LIKE ?)")
+                params.extend([f"%{word}%", f"%{word}%"])
+
+            search_sql = f"SELECT id, fact FROM memories WHERE {' OR '.join(conditions)}"
+            cursor.execute(search_sql, params)
+            to_delete = cursor.fetchall()
+
+            if not to_delete:
+                return []
+
+            ids = [row[0] for row in to_delete]
+            facts = [row[1] for row in to_delete]
+
+            # Perform deletion
+            placeholders = ','.join(['?'] * len(ids))
+            cursor.execute(f"DELETE FROM memories WHERE id IN ({placeholders})", ids)
+            conn.commit()
+            return facts
 
     def get_last_session_id(self) -> Optional[int]:
         with sqlite3.connect(self.db_path) as conn:
