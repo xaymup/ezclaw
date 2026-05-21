@@ -153,7 +153,29 @@ JSON:"""
                 self.db.add_memory(fact)
                 yield {"type": "memory_stored", "fact": fact}
 
-        # 3. Dynamic Model Selection
+        # 3. Reasoning Supervisor (The Architect)
+        # Use phi4-reasoning to plan the approach based on global context
+        supervisor_model = "phi4-reasoning:plus"
+        yield {"type": "content", "content": f"🧠 [Supervisor: Architect ({supervisor_model})]\n"}
+        
+        # Prepare context for the supervisor
+        if len(self.messages) > 20:
+            context_messages = [self.messages[0], self.messages[1]] + self.messages[-18:]
+        else:
+            context_messages = [m.copy() for m in self.messages]
+
+        # 4. Supervisor creates a Plan/Context for the specialized agent
+        planning_messages = context_messages + [{"role": "user", "content": f"You are the Supervisor. Provide a concise execution plan for this request: {user_input}"}]
+        
+        supervisor_plan = ""
+        try:
+            plan_response = self.client.chat(model=supervisor_model, messages=planning_messages, options={"temperature": 0.0, "num_predict": 300})
+            supervisor_plan = plan_response["message"]["content"]
+            yield {"type": "reasoning", "content": f"Supervisor Plan: {supervisor_plan}\n"}
+        except Exception as e:
+            supervisor_plan = f"Proceed with standard execution. Error in supervisor: {str(e)}"
+
+        # 5. Dynamic Model Selection (Sub-Agents)
         selected_model = self.model
         agent_label = "Generalist"
         
@@ -167,9 +189,9 @@ JSON:"""
             selected_model = "qwen2.5-coder:14b"
             agent_label = "Coder"
             
-        yield {"type": "content", "content": f"🛠️ [Agent: {agent_label} ({selected_model})]\n"}
+        yield {"type": "content", "content": f"🛠️ [Executing: {agent_label} ({selected_model})]\n"}
 
-        # 4. Memory recall & Context Augmentation
+        # 6. Memory recall & Context Augmentation
         memory_block = ""
         if intent.get("memory"):
             query = intent.get("memory_q") or user_input
@@ -178,13 +200,16 @@ JSON:"""
                 memory_block = f"\n[Background Context retrieved from Memory for this request]:\n" + "\n".join([f"- {m}" for m in memories]) + "\n"
                 yield {"type": "context_augmented", "memories": memories}
 
-        # 4. Search recommendation
+        # 7. Search recommendation
         search_nudge = ""
         if intent.get("search"):
             sq = intent.get("search_q") or user_input
             search_nudge = f"\n[Proactive Search Recommended]: Use `web_fetch` to research: '{sq}'. This is flagged for current accuracy or clarification.\n"
 
-        # 5. Skill matching
+        # 8. Supervisor Context Injection
+        supervisor_block = f"\n[Supervisor's Execution Plan]:\n{supervisor_plan}\n"
+
+        # 9. Skill matching
         skill_name = intent.get("skill")
         matched_skills = []
         if skill_name:
@@ -195,13 +220,13 @@ JSON:"""
         
         skills_block = format_skills_block(matched_skills)
 
-        # 5. History & Augmentation
+        # 10. History & Augmentation
         self.messages.append({"role": "user", "content": user_input})
         self.db.add_message(self.session_id, "user", user_input)
         
         # Nudge the model to follow the CoT protocol from agents.md
         cot_nudge = "\n[System Reminder]: Follow the MANDATORY CHAIN OF THOUGHT protocol using <think> tags as defined in your persona."
-        user_msg_augmented_content = f"{memory_block}{skills_block}{search_nudge}{cot_nudge}\n[User Prompt]: {user_input}"
+        user_msg_augmented_content = f"{memory_block}{skills_block}{search_nudge}{supervisor_block}{cot_nudge}\n[User Prompt]: {user_input}"
 
         iteration_count = 0
         max_iterations = 15 
