@@ -17,6 +17,7 @@ dist/
 .ezclaw_history
 heartbeat.md
 workspace/
+skills/
 !workspace/.gitkeep
 
 # Logs
