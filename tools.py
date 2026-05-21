@@ -2,6 +2,7 @@ import os
 import subprocess
 import httpx
 import re
+import difflib
 from datetime import datetime
 from typing import Callable, Dict, Any, List, Optional
 import inspect
@@ -9,9 +10,18 @@ import inspect
 class ToolRegistry:
     def __init__(self):
         self.tools: Dict[str, Callable] = {}
-        self.schemas: List[Dict[str, Any]] = []
 
-    def register(self, func: Callable):
+    def register(self, func: Callable = None, *, auth_required: bool = False):
+        if func is None:
+            # Called as @register(auth_required=True)
+            def decorator(f):
+                f.auth_required = auth_required
+                self.tools[f.__name__] = f
+                return f
+            return decorator
+        
+        # Called as @register
+        func.auth_required = auth_required
         self.tools[func.__name__] = func
         return func
 
@@ -35,7 +45,7 @@ def get_workspace_path(path: str) -> str:
     safe_path = path.lstrip("./").lstrip("/")
     return os.path.join(WORKSPACE_DIR, safe_path)
 
-@registry.register
+@registry.register(auth_required=True)
 def run_shell(command: str) -> str:
     """
     Execute a shell command and return the output.
@@ -50,7 +60,7 @@ def run_shell(command: str) -> str:
     except Exception as e:
         return f"Error executing command: {str(e)}"
 
-@registry.register
+@registry.register(auth_required=True)
 def read_file(path: str) -> str:
     """
     Read the content of a file within the workspace.
@@ -64,7 +74,7 @@ def read_file(path: str) -> str:
     except Exception as e:
         return f"Error reading file: {str(e)}"
 
-@registry.register
+@registry.register(auth_required=True)
 def write_file(path: str, content: str) -> str:
     """
     Write or overwrite a file within the workspace.
@@ -72,9 +82,29 @@ def write_file(path: str, content: str) -> str:
     try:
         full_path = get_workspace_path(path)
         os.makedirs(os.path.dirname(full_path), exist_ok=True)
+        
+        old_content = ""
+        if os.path.exists(full_path):
+            with open(full_path, 'r') as f:
+                old_content = f.read()
+        
         with open(full_path, 'w') as f:
             f.write(content)
-        return f"File successfully written to workspace/{path}"
+        
+        if old_content:
+            diff = difflib.unified_diff(
+                old_content.splitlines(keepends=True),
+                content.splitlines(keepends=True),
+                fromfile=f"a/{path}",
+                tofile=f"b/{path}"
+            )
+            diff_text = "".join(diff)
+            if diff_text:
+                return f"File updated: workspace/{path}\n\nDiff:\n{diff_text}"
+            else:
+                return f"File workspace/{path} remains unchanged (content identical)."
+        else:
+            return f"File successfully created: workspace/{path}\n\nContent:\n{content}"
     except Exception as e:
         return f"Error writing file: {str(e)}"
 
@@ -135,6 +165,57 @@ def list_tasks() -> str:
             return f.read()
     except Exception as e:
         return f"Error reading heartbeat.md: {str(e)}"
+
+SKILLS_DIR = "skills"
+
+@registry.register(auth_required=True)
+def learn_skill(name: str, description: str, procedure: str) -> str:
+    """
+    Save a new skill or procedure that the agent has learned.
+    'name': A short, unique name for the skill (e.g., 'git_workflow').
+    'description': What this skill does.
+    'procedure': The step-by-step instructions or code.
+    """
+    try:
+        os.makedirs(SKILLS_DIR, exist_ok=True)
+        filename = f"{name.lower().replace(' ', '_')}.md"
+        path = os.path.join(SKILLS_DIR, filename)
+        
+        content = f"# Skill: {name}\n\n## Description\n{description}\n\n## Procedure\n{procedure}\n"
+        
+        with open(path, 'w') as f:
+            f.write(content)
+        return f"Skill '{name}' has been learned and saved to {path}."
+    except Exception as e:
+        return f"Error learning skill: {str(e)}"
+
+@registry.register
+def get_skill(name: str) -> str:
+    """
+    Retrieve the details of a specific learned skill.
+    """
+    try:
+        filename = f"{name.lower().replace(' ', '_')}.md"
+        path = os.path.join(SKILLS_DIR, filename)
+        if not os.path.exists(path):
+            return f"Skill '{name}' not found."
+        with open(path, 'r') as f:
+            return f.read()
+    except Exception as e:
+        return f"Error retrieving skill: {str(e)}"
+
+@registry.register
+def list_skills() -> str:
+    """
+    List all skills currently learned by the agent.
+    """
+    try:
+        if not os.path.exists(SKILLS_DIR):
+            return "No skills learned yet."
+        skills = [f.replace('.md', '') for f in os.listdir(SKILLS_DIR) if f.endswith('.md')]
+        return "\n".join(skills) if skills else "No skills learned yet."
+    except Exception as e:
+        return f"Error listing skills: {str(e)}"
 
 def create_memory_tools(db: Any):
     @registry.register

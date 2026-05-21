@@ -41,6 +41,7 @@ class ChatAgent:
         self.messages = self.db.get_messages(self.session_id)
         self.system_prompt = self._load_system_prompt()
         self._ensure_system_message()
+        self.session_authorized = False
 
     def _load_system_prompt(self) -> str:
         content = "You are EzClaw, a powerful terminal-based assistant."
@@ -64,9 +65,18 @@ class ChatAgent:
         self.messages = [{"role": "system", "content": self.system_prompt}]
 
     def chat_stream(self, user_input: str) -> Iterator[Dict[str, Any]]:
-        user_msg = {"role": "user", "content": user_input}
-        self.messages.append(user_msg)
-        self.db.add_message(self.session_id, user_msg["role"], user_msg["content"])
+        # Proactive Memory Recall
+        memories = self.db.search_memories(user_input)
+        if memories:
+            memory_context = "\n[RELEVANT MEMORIES]\n- " + "\n- ".join(memories)
+            # Inject memories as a hidden context hint in the user message for the model
+            augmented_input = f"{user_input}\n{memory_context}"
+        else:
+            augmented_input = user_input
+
+        user_msg = {"role": "user", "content": augmented_input}
+        self.messages.append({"role": "user", "content": user_input}) # Keep clean version in history
+        self.db.add_message(self.session_id, "user", user_input)
 
         while True:
             full_response_content = ""
@@ -76,11 +86,9 @@ class ChatAgent:
             in_thinking = False
             raw_buffer = ""
 
-            # Keep system prompt + last 10 messages for max speed
-            context_messages = [self.messages[0]] + self.messages[-10:] if len(self.messages) > 11 else self.messages
-
-            # We DO NOT pre-fill "<think>" because Ollama tools don't support assistant pre-filling well.
-            # Instead, we just use a more greedy streaming logic.
+            # Use augmented input for the latest user message in the context
+            history_for_context = self.messages[:-1] + [user_msg]
+            context_messages = [self.messages[0]] + history_for_context[-10:] if len(history_for_context) > 11 else history_for_context
 
             stream = self.client.chat(
                 model=self.model,
@@ -162,8 +170,26 @@ class ChatAgent:
                                 tool_calls=[{"function": {"name": t.function.name, "arguments": t.function.arguments}} for t in tool_calls])
 
             for tool in tool_calls:
-                yield {"type": "tool_start", "name": tool.function.name, "arguments": tool.function.arguments}
                 tool_func = registry.tools.get(tool.function.name)
+                
+                # Check for authorization
+                if tool_func and getattr(tool_func, 'auth_required', False) and not self.session_authorized:
+                    auth_response = yield {
+                        "type": "auth_required", 
+                        "name": tool.function.name, 
+                        "arguments": tool.function.arguments
+                    }
+                    if auth_response == "deny":
+                        result = "Authorization denied by user."
+                        tool_msg = {'role': 'tool', 'content': result, 'name': tool.function.name}
+                        self.messages.append(tool_msg)
+                        self.db.add_message(self.session_id, tool_msg["role"], tool_msg["content"])
+                        yield {"type": "tool_end", "name": tool.function.name, "result": result}
+                        continue
+                    elif auth_response == "allow_session":
+                        self.session_authorized = True
+
+                yield {"type": "tool_start", "name": tool.function.name, "arguments": tool.function.arguments}
                 if tool_func:
                     try:
                         result = tool_func(**tool.function.arguments)
