@@ -351,15 +351,4 @@ JSON:"""
                 yield {"type": "tool_end", "name": tool.function.name, "result": str(result)}
 
         if iteration_count >= max_iterations:
-            yield {"type": "content", "content": "\n[System: Action limit reached.]"}arguments, "interactive": is_interactive}
-                try:
-                    result = tool_func(**tool.function.arguments) if tool_func else "Tool not found."
-                except Exception as e: result = f"Error: {str(e)}"
-                
-                tool_msg = {'role': 'tool', 'content': str(result), 'name': tool.function.name}
-                self.messages.append(tool_msg)
-                self.db.add_message(self.session_id, "tool", str(result))
-                yield {"type": "tool_end", "name": tool.function.name, "result": str(result)}
-
-        if iteration_count >= max_iterations:
             yield {"type": "content", "content": "\n[System: Action limit reached.]"}
