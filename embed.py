@@ -32,3 +32,22 @@ def rank_by_similarity(query: str, candidates: List[str], top_n: Optional[int] =
     scored.sort(key=lambda x: x[0], reverse=True)
     result = [c for _, c in scored]
     return result[:top_n] if top_n else result
+
+
+def rank_by_similarity_vectors(q_vec: List[float], candidate_vectors: List[List[float]], candidates: List[str], top_n: Optional[int] = None) -> List[str]:
+    scored = [(cosine_similarity(q_vec, cv), c) for cv, c in zip(candidate_vectors, candidates)]
+    scored.sort(key=lambda x: x[0], reverse=True)
+    result = [c for _, c in scored]
+    return result[:top_n] if top_n else result
+
+
+def classify_by_similarity(query: str, examples: List[str], labels: List[str], threshold: float = 0.6) -> Optional[str]:
+    q_vec = embed(query)
+    best_label, best_score = None, threshold
+    for ex, label in zip(examples, labels):
+        ex_vec = embed(ex)
+        sim = cosine_similarity(q_vec, ex_vec)
+        if sim > best_score:
+            best_score = sim
+            best_label = label
+    return best_label

@@ -5,6 +5,7 @@ import re
 from typing import List, Dict, Any, Optional, Callable, Iterator
 from memory import Database
 from tools import registry, create_memory_tools
+from embed import embed, cosine_similarity
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -80,6 +81,7 @@ class ChatAgent:
         self.tools = registry.get_tool_definitions()
         self.skills = load_skills()
         self.skill_descriptions = "\n".join([f"- {s['name']}: {s['content'].split('## Description')[1].split('##')[0].strip() if '## Description' in s['content'] else 'No description'}" for s in self.skills])
+        self._pre_embed_tools()
         
         if session_id:
             self.session_id = session_id
@@ -95,6 +97,31 @@ class ChatAgent:
         if os.path.exists("agents.md"):
             with open("agents.md", "r") as f: return f.read()
         return "You are EzClaw, a powerful assistant."
+
+    def _pre_embed_tools(self):
+        self._tool_embeddings = {}
+        self._tool_name_map = {}
+        for t in self.tools:
+            name = t['function']['name']
+            desc = f"{name}: {t['function']['description']}"
+            self._tool_name_map[name] = t
+            try:
+                self._tool_embeddings[name] = embed(desc)
+            except Exception:
+                self._tool_embeddings[name] = None
+
+    def _select_relevant_tools(self, user_input: str, top_n: int = 12) -> List[Dict[str, Any]]:
+        q_vec = embed(user_input)
+        scored = []
+        for name, t_def in self._tool_name_map.items():
+            t_vec = self._tool_embeddings.get(name)
+            if t_vec is not None:
+                sim = cosine_similarity(q_vec, t_vec)
+                scored.append((sim, t_def))
+            else:
+                scored.append((0.0, t_def))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [t for _, t in scored[:top_n]]
 
     def _ensure_system_message(self):
         if not self.messages or self.messages[0]["role"] != "system":
@@ -257,18 +284,46 @@ Return JSON:
         iteration_count = 0
         max_iterations = 15 
         last_tool_hash = None
+        last_tool_vec = None
+
+        # Tool pre-selection: only pass tools relevant to the current query
+        selected_tools = self._select_relevant_tools(user_input, top_n=12) if len(self.tools) > 12 else self.tools
 
         while iteration_count < max_iterations:
             iteration_count += 1
             full_response, full_reasoning, tool_calls = "", "", []
             in_thinking, raw_buffer = False, ""
 
-            # 6. Context Retention logic
+            # 6. Context Retention logic (semantic)
             if len(self.messages) > 20:
-                context_messages = [self.messages[0], self.messages[1]] + self.messages[-18:]
+                q_vec = embed(user_input)
+
+                start = 2
+                end = max(start, len(self.messages) - 5)
+
+                always_keep = [self.messages[0], self.messages[1]]
+                recent = self.messages[end:]
+                candidates = self.messages[start:end]
+
+                scored = []
+                for idx, m in enumerate(candidates):
+                    content = m.get("content", "")
+                    if not content:
+                        continue
+                    try:
+                        m_vec = embed(content)
+                    except Exception:
+                        scored.append((0.0, m))
+                        continue
+                    sim = cosine_similarity(q_vec, m_vec)
+                    scored.append((sim, m))
+
+                scored.sort(key=lambda x: x[0], reverse=True)
+                top_semantic = [m for _, m in scored[:max(0, 18 - len(recent) - len(always_keep))]]
+                context_messages = always_keep + top_semantic + recent
             else:
                 context_messages = [m.copy() for m in self.messages]
-            
+
             # Augment the current request message (prepend augment block)
             for i in range(len(context_messages) - 1, -1, -1):
                 if context_messages[i]["role"] == "user":
@@ -277,7 +332,7 @@ Return JSON:
                     break
 
             try:
-                stream = self.client.chat(model=self.model, messages=context_messages, tools=self.tools, options=self.options, keep_alive=self.keep_alive, stream=True)
+                stream = self.client.chat(model=self.model, messages=context_messages, tools=selected_tools, options=self.options, keep_alive=self.keep_alive, stream=True)
                 # Test first chunk to see if it works
                 first_chunk = next(stream)
             except Exception as e:
@@ -382,6 +437,24 @@ Return JSON:
                 yield {"type": "content", "content": "\n[System: Loop detected. Stopping.]"}
                 break
             last_tool_hash = current_hash
+
+            if tool_calls and last_tool_vec is not None:
+                tool_summary = " ".join(f"{t.function.name}:{json.dumps(t.function.arguments, sort_keys=True)}" for t in tool_calls)
+                try:
+                    current_vec = embed(tool_summary)
+                    sim = cosine_similarity(current_vec, last_tool_vec)
+                    if sim > 0.95:
+                        yield {"type": "content", "content": "\n[Semantic loop detected. Stopping.]"}
+                        break
+                    last_tool_vec = current_vec
+                except Exception:
+                    pass
+            elif tool_calls:
+                try:
+                    tool_summary = " ".join(f"{t.function.name}:{json.dumps(t.function.arguments, sort_keys=True)}" for t in tool_calls)
+                    last_tool_vec = embed(tool_summary)
+                except Exception:
+                    pass
 
             if not tool_calls:
                 if full_response.strip() or full_reasoning.strip():

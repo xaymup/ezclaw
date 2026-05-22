@@ -6,6 +6,7 @@ from typing import List, Dict, Any, Optional, Iterator
 from memory import Database
 from tools import registry, create_memory_tools
 from agent import load_skills, match_skills, format_skills_block
+from embed import embed, cosine_similarity, classify_by_similarity
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -113,12 +114,43 @@ class SpecializedAgent:
         }
         self.keep_alive = os.getenv("OLLAMA_KEEP_ALIVE", "60m")
         self.session_authorized = False
+        self._pre_embed_tools()
+
+    def _pre_embed_tools(self):
+        self._tool_embeddings = {}
+        self._tool_name_map = {}
+        for t in self.tools:
+            name = t['function']['name']
+            desc = f"{name}: {t['function']['description']}"
+            self._tool_name_map[name] = t
+            try:
+                self._tool_embeddings[name] = embed(desc)
+            except Exception:
+                self._tool_embeddings[name] = None
+
+    def _select_relevant_tools(self, user_input: str, top_n: int = 10) -> List[Dict[str, Any]]:
+        if len(self.tools) <= top_n:
+            return self.tools
+        q_vec = embed(user_input)
+        scored = []
+        for name, t_def in self._tool_name_map.items():
+            t_vec = self._tool_embeddings.get(name)
+            if t_vec is not None:
+                sim = cosine_similarity(q_vec, t_vec)
+                scored.append((sim, t_def))
+            else:
+                scored.append((0.0, t_def))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [t for _, t in scored[:top_n]]
 
     def chat_stream(self, user_input: str) -> Iterator[Dict[str, Any]]:
         self.messages.append({"role": "user", "content": user_input})
         if len(self.messages) > 30:
             self.messages = [self.messages[0]] + self.messages[-28:]
         last_tool_hash = None
+        last_tool_vec = None
+
+        selected_tools = self._select_relevant_tools(user_input, top_n=10)
 
         for _ in range(10):
             full_response, full_reasoning, tool_calls = "", "", []
@@ -127,7 +159,7 @@ class SpecializedAgent:
             try:
                 stream = self.client.chat(
                     model=self.model, messages=self.messages,
-                    tools=self.tools or None,
+                    tools=selected_tools or None,
                     options=self.options, keep_alive=self.keep_alive, stream=True,
                 )
                 first_chunk = next(stream)
@@ -250,6 +282,24 @@ class SpecializedAgent:
                 break
             last_tool_hash = current_hash
 
+            if tool_calls and last_tool_vec is not None:
+                tool_summary = " ".join(f"{t.function.name}:{json.dumps(t.function.arguments, sort_keys=True)}" for t in tool_calls)
+                try:
+                    current_vec = embed(tool_summary)
+                    sim = cosine_similarity(current_vec, last_tool_vec)
+                    if sim > 0.95:
+                        yield {"type": "content", "content": "\n[Semantic loop detected. Stopping.]"}
+                        break
+                    last_tool_vec = current_vec
+                except Exception:
+                    pass
+            elif tool_calls:
+                try:
+                    tool_summary = " ".join(f"{t.function.name}:{json.dumps(t.function.arguments, sort_keys=True)}" for t in tool_calls)
+                    last_tool_vec = embed(tool_summary)
+                except Exception:
+                    pass
+
             self.messages.append({
                 "role": "assistant", "content": full_response,
                 "tool_calls": [
@@ -337,10 +387,12 @@ Decision rules (in order):
             "num_gpu": int(os.getenv("OLLAMA_NUM_GPU", 999)),
         }
 
-    def analyze(self, task_context: str, memory_block: str = "", skills_block: str = "") -> Dict[str, Any]:
+    def analyze(self, task_context: str, memory_block: str = "", skills_block: str = "", experiences_block: str = "", routing_block: str = "") -> Dict[str, Any]:
         prompt = f"""{task_context}
 {memory_block}
 {skills_block}
+{experiences_block}
+{routing_block}
 Based on the current state, what is the next action?
 - recommended_agent must be one of: executor, general, researcher, debugger.
 - If the user needs web info (fetch, search, lookup, research, news): use "researcher".
@@ -436,6 +488,28 @@ class MultiAgentSystem:
                 [self.architect.messages[0]] + self.architect.messages[-6:]
             )
 
+    # ── Routing Enhancements ──────────────────────────────────
+
+    ROUTING_EXAMPLES = [
+        ("hello", "general"), ("hi how are you", "general"), ("thanks", "general"),
+        ("goodbye", "general"), ("good morning", "general"),
+        ("search the web for", "researcher"), ("look up information about", "researcher"),
+        ("find documentation for", "researcher"), ("what is the latest news", "researcher"),
+    ]
+
+    def _short_circuit_classify(self, user_input: str) -> Optional[str]:
+        examples = [ex for ex, _ in self.ROUTING_EXAMPLES]
+        labels = [lb for _, lb in self.ROUTING_EXAMPLES]
+        return classify_by_similarity(user_input, examples, labels, threshold=0.65)
+
+    def _format_routing_priors(self, priors: List[Dict]) -> str:
+        if not priors:
+            return ""
+        lines = ["\n[Similar Past Routing Decisions]:"]
+        for p in priors:
+            lines.append(f"- Query: '{p['query'][:80]}' → {p['agent']} (success={p['success']})")
+        return "\n".join(lines) + "\n"
+
     # ── Orchestration ──────────────────────────────────────────
 
     def run(self, user_input: str) -> Iterator[Dict[str, Any]]:
@@ -444,6 +518,19 @@ class MultiAgentSystem:
         loop_hashes = set()
         agent_has_responded = False
         needs_debug = any(w in user_input.lower() for w in ["debug", "bug", "error", "fix", "analyze", "crash"])
+
+        # Short-circuit: for obvious patterns, skip architect entirely
+        short_circuit_agent = self._short_circuit_classify(user_input)
+        if short_circuit_agent and short_circuit_agent != "debugger":
+            agent_key = short_circuit_agent
+            agent = self.agents.get(agent_key)
+            if agent:
+                yield {"type": "status", "content": f"🚀 [{agent_key}] (classified)\n"}
+                for chunk in agent.chat_stream(user_input):
+                    yield chunk
+                yield {"type": "status", "content": "✅ Task complete.\n"}
+                self.db.store_routing_decision(user_input, agent_key, True)
+                return
 
         for step in range(1, max_steps + 1):
             yield {"type": "status", "content": f"🧠 [Architect] Step {step}: Planning...\n"}
@@ -454,8 +541,12 @@ class MultiAgentSystem:
             matched_skills = match_skills(task_context, self.skills)
             skills_block = format_skills_block(matched_skills)
 
+            # Routing priors: find similar past routing decisions
+            routing_priors = self.db.search_similar_routing(task_context[:2000], limit=3)
+            routing_block = self._format_routing_priors(routing_priors)
+
             self._prune_architect()
-            intent = self.architect.analyze(task_context, memory_block, skills_block)
+            intent = self.architect.analyze(task_context, memory_block, skills_block, routing_block=routing_block)
 
             if intent.get("complete") and agent_has_responded:
                 yield {"type": "status", "content": "✅ Task complete.\n"}
@@ -526,6 +617,10 @@ class MultiAgentSystem:
             parts = task_context.split("\n\n--- Step ")
             if len(parts) > 4:
                 task_context = parts[0] + "\n\n--- Step " + "\n\n--- Step ".join(parts[-3:])
+
+            step_decision_text = user_input if step == 1 else task_context[:300]
+            step_success = bool(step_output.strip() or step_tool_results)
+            self.db.store_routing_decision(step_decision_text, agent_key, step_success)
 
             is_debugger_output = agent_key == "debugger" and step_output.strip()
             is_error = any(w in step_context.lower() for w in ["error", "exception", "traceback", "failed", "exit code", "not found"])
