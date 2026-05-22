@@ -368,31 +368,17 @@ Return valid JSON with these exact keys: category, reasoning, recommended_agent,
             intent.setdefault("plan", "")
             intent.setdefault("reasoning", "")
             intent.setdefault("complete", False)
-            # Ensure recommended_agent is valid; if missing or unknown, infer from category + context
+            # Ensure recommended_agent is valid; if missing or unknown, infer via embeddings
             valid_agents = {"executor", "general", "researcher", "debugger"}
             agent = intent.get("recommended_agent")
             if agent not in valid_agents:
-                cat = intent.get("category", "")
-                ctx = task_context.lower()
-                if cat == "research" or any(w in ctx for w in ["search", "fetch", "news", "web", "lookup"]):
-                    intent["recommended_agent"] = "researcher"
-                elif any(w in ctx for w in ["debug", "bug", "error", "fix", "crash", "exception"]):
-                    intent["recommended_agent"] = "executor"
-                elif cat in ("technical", "action", "code_analysis", "debugging"):
-                    intent["recommended_agent"] = "executor"
-                else:
-                    intent["recommended_agent"] = "general"
+                from embed import classify_intent
+                intent["recommended_agent"] = classify_intent(task_context)
             self.messages.append({"role": "assistant", "content": json.dumps(intent)})
             return intent
         except Exception:
-            # Smart fallback based on query content
-            ctx = task_context.lower()
-            if any(w in ctx for w in ["fetch", "web", "news", "search", "research", "lookup", "find"]):
-                agent = "researcher"
-            elif any(w in ctx for w in ["debug", "bug", "error", "fix", "issue"]):
-                agent = "debugger"
-            else:
-                agent = "executor"
+            from embed import classify_intent
+            agent = classify_intent(task_context)
             return {
                 "category": "technical",
                 "reasoning": "Continuing execution...",
