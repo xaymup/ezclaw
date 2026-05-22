@@ -373,12 +373,19 @@ Return valid JSON with these exact keys: category, reasoning, recommended_agent,
             agent = intent.get("recommended_agent")
             if agent not in valid_agents:
                 from embed import classify_intent
-                intent["recommended_agent"] = classify_intent(task_context)
+                agent = classify_intent(task_context)
+                intent["recommended_agent"] = agent
+            # Context-prep override: always route debugger requests to executor FIRST
+            if agent == "debugger" and "--- Step" not in task_context:
+                intent["recommended_agent"] = "executor"
+                intent["plan"] = f"1. Read the relevant files and gather context\n2. Pass context to debugger for analysis\n\nDebug task: {task_context[:200]}"
             self.messages.append({"role": "assistant", "content": json.dumps(intent)})
             return intent
         except Exception:
             from embed import classify_intent
             agent = classify_intent(task_context)
+            if agent == "debugger" and "--- Step" not in task_context:
+                agent = "executor"
             return {
                 "category": "technical",
                 "reasoning": "Continuing execution...",
