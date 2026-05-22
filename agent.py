@@ -112,7 +112,7 @@ class ChatAgent:
             except Exception:
                 self._tool_embeddings[name] = None
 
-    def _select_relevant_tools(self, user_input: str, top_n: int = 12) -> List[Dict[str, Any]]:
+    def _select_relevant_tools(self, user_input: str, top_n: int = 20) -> List[Dict[str, Any]]:
         try:
             q_vec = embed(user_input)
         except Exception:
@@ -304,7 +304,7 @@ Respond with JSON only:
         last_tool_hash = None
 
         # Tool pre-selection: only pass tools relevant to the current query
-        selected_tools = self._select_relevant_tools(user_input, top_n=12) if len(self.tools) > 12 else self.tools
+        selected_tools = self._select_relevant_tools(user_input, top_n=20) if len(self.tools) > 20 else self.tools
 
         while iteration_count < max_iterations:
             iteration_count += 1

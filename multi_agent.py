@@ -26,25 +26,10 @@ AGENT_DEFS = {
 - If a step fails, retry once with adjusted input, then report and move on.
 - When all steps are done, summarize what was accomplished in 2-3 sentences.
 
-## Tool Selection
-- `read_file` → examine code BEFORE editing. Always read first.
-- `write_file` → create/update files. Show diffs for updates.
-- `run_shell` → execute commands. interactive=True ONLY for vim/ssh/REPLs.
-- `web_fetch` → fetch URLs for docs, news, research.
-- `remember`/`recall` → store or retrieve personal info and context.
-- `learn_skill` → save a reusable procedure after completing a novel task.
-
 ## Output
 - Lead with results, not commentary.
 - Show diffs for edits, summaries for long output.
 - After running a command, include relevant output (errors, key lines).""",
-        "tools": [
-            "run_shell", "read_file", "write_file", "list_dir",
-            "web_fetch", "schedule_task",
-            "learn_skill", "get_skill", "list_skills",
-            "remember", "recall", "forget",
-            "delegate",
-        ],
     },
     "researcher": {
         "model": os.getenv("OLLAMA_RESEARCHER_MODEL", "qwen3:14b"),
@@ -61,15 +46,7 @@ Research strategy:
 4. Synthesize into a concise summary (2-4 bullet points or 1-2 paragraphs).
 5. Never exceed 4 web_fetch calls.
 
-Source quality: Prefer official docs, reputable sources, recent dates. Note when info might be stale.
-
-Memory: Use `remember` to save useful research findings for later. Use `recall` if the user references past research.""",
-        "tools": [
-            "web_fetch", "schedule_task",
-            "list_skills", "get_skill",
-            "remember", "recall", "forget",
-            "delegate",
-        ],
+Source quality: Prefer official docs, reputable sources, recent dates. Note when info might be stale.""",
     },
     "debugger": {
         "model": os.getenv("OLLAMA_DEBUGGER_MODEL", "deepseek-r1:14b"),
@@ -86,12 +63,6 @@ Debug methodology:
 4. **Fix**: Minimal, targeted change. Fix the cause, not the symptom.
 5. **Verify**: Run again to confirm the fix works.
 
-Tool use:
-- `read_file` to examine code, `run_shell` to reproduce and test.
-- `write_file` to apply your own fixes directly.
-- `web_fetch` to look up error messages or API docs.
-- `delegate` to executor if the fix is complex (multiple files) or to researcher for docs.
-
 Format:
 ## Analysis
 (what you examined, the flow, your reasoning)
@@ -101,12 +72,6 @@ Format:
 
 ## Fix
 (exact change needed, with file path and line references)""",
-        "tools": [
-            "run_shell", "read_file", "write_file", "list_dir",
-            "web_fetch",
-            "remember", "recall", "forget",
-            "delegate",
-        ],
     },
     "general": {
         "model": os.getenv("OLLAMA_GENERAL_MODEL", "qwen3.5:9b"),
@@ -118,16 +83,8 @@ Rules:
 - When user asks about themselves ("what's my name", "do you know me"), use `recall` to check.
 - Use `forget` if the user asks you to delete something.
 - If recall returns nothing relevant, say so directly — don't fabricate.""",
-        "tools": [
-            "remember", "recall", "forget",
-        ],
     },
 }
-
-
-def filter_tools(tool_names: List[str]) -> List[Dict[str, Any]]:
-    all_defs = registry.get_tool_definitions()
-    return [d for d in all_defs if d["function"]["name"] in tool_names]
 
 
 class SpecializedAgent:
@@ -138,7 +95,8 @@ class SpecializedAgent:
         self.client = build_agent_client()
         self.model = config["model"]
         self.system_prompt = config["system_prompt"]
-        self.tools = filter_tools(config["tools"])
+        # Give all agents access to all registered tools
+        self.tools = registry.get_tool_definitions()
         self.db = db
         self.messages: List[Dict] = [{"role": "system", "content": self.system_prompt}]
         self.num_ctx = int(os.getenv("OLLAMA_NUM_CTX", 16384))
@@ -164,7 +122,7 @@ class SpecializedAgent:
             except Exception:
                 self._tool_embeddings[name] = None
 
-    def _select_relevant_tools(self, user_input: str, top_n: int = 10) -> List[Dict[str, Any]]:
+    def _select_relevant_tools(self, user_input: str, top_n: int = 20) -> List[Dict[str, Any]]:
         if len(self.tools) <= top_n:
             return self.tools
         try:
@@ -197,7 +155,7 @@ class SpecializedAgent:
 
         last_tool_hash = None
 
-        selected_tools = self._select_relevant_tools(user_input, top_n=10)
+        selected_tools = self._select_relevant_tools(user_input, top_n=20)
 
         max_messages = max(6, int(self.num_ctx / 2048))  # scale with context size
 
@@ -407,25 +365,26 @@ class Architect:
             "content": """You are the **Architect** — a planner that decomposes tasks and routes work to specialized agents.
 
 ## Agents
-| Agent | Capabilities | Use When |
-|-------|-------------|----------|
-| executor | shell, files, code, memory, skills | ANY local action, code changes, memory ops |
-| researcher | web_fetch, memory | Need external info: docs, news, APIs, versions |
-| debugger | shell, files, code | Bug/error analysis AFTER context is gathered |
-| general | memory only | Pure conversation, greetings, opinions |
+All agents have access to ALL tools (shell, files, web, memory, skills). Route based on their specialized expertise:
+
+| Agent | Expertise | Use When |
+|-------|-----------|----------|
+| executor | Action-oriented | Local actions, code changes, system ops |
+| researcher | Information gathering | Research, docs, web APIs, data synthesis |
+| debugger | Root-cause analysis | Analyzing logs/errors AFTER context is gathered |
+| general | Conversation | Greetings, general advice, personal context |
 
 ## Pipelines (multi-step patterns)
-- **Debug**: executor(read files, reproduce) → debugger(analyze root cause) → executor(apply fix, verify)
-- **Research+Act**: researcher(search, fetch) → executor(apply findings)
-- **Simple action**: executor(do it) → complete
-- **Chat**: general(respond) → complete
+- **Debug**: executor(gather context) → debugger(analyze) → executor(fix)
+- **Research+Act**: researcher(investigate) → executor(implement)
+- **Direct Action**: executor(execute)
+- **Chat**: general(respond)
 
 ## Plan Quality Rules
 - Plans MUST be numbered concrete steps with file paths, commands, or specific actions
-- BAD: "Fix the bug" / "Look into it" / "Investigate"
-- GOOD: "1. Read src/main.py lines 40-60  2. Run pytest tests/test_main.py  3. Fix the TypeError on line 52"
-- Include WHAT to look for, not just WHERE to look
-- If previous step gave output, reference specific findings in the next plan
+- BAD: "Fix the bug" / "Look into it"
+- GOOD: "1. Read src/main.py lines 40-60  2. Run pytest  3. Fix the logic error"
+- If previous step gave output, reference findings in the next plan
 
 ## Completion Rules
 - Set complete:true ONLY when the user's FULL original request is satisfied

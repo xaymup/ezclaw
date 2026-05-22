@@ -15,12 +15,26 @@ EzClaw solves this by:
 ## Features
 - **Persistent Chat History**: All conversations are saved in an SQLite database.
 - **Long-term Memory**: The agent can explicitly `remember` facts and `recall` them later across different sessions.
+- **Hybrid RAG Memory**: Uses a combination of full-text search and vector embeddings (Cosine Similarity) for high-precision memory recall.
+- **Multi-Agent Orchestration**: Iterative **Super-Architect** pattern that decomposes complex tasks and routes them to specialized agents (Executor, Researcher, Debugger).
 - **Tool Support**: 
-    - `run_shell`: Execute terminal commands.
-    - `read_file` / `write_file`: Manipulate files.
+    - `run_shell`: Execute terminal commands (interactive & background).
+    - `read_file` / `write_file`: Manipulate files with unified diff previews.
     - `list_dir`: Explore the file system.
+    - `web_fetch`: Search and synthesize information from the web.
     - `remember` / `recall`: Manage long-term state.
-- **Beautiful UI**: Built with `rich` and `prompt_toolkit` for a modern terminal experience.
+    - `learn_skill`: Save and reuse complex procedures and workflows.
+- **Beautiful TUI**: Full-screen terminal interface with real-time thinking visualization, interactive tool authorization, and prompt history.
+
+## Performance Metrics
+
+EzClaw is optimized for high-performance local execution. Below are the benchmarks from our primary development machine:
+
+**Hardware Profile:**
+- **GPU**: NVIDIA GeForce RTX 4080 (16GB VRAM)
+- **VRAM Utilization**: ~8.9 GB / 16.4 GB (running 14B models)
+- **GPU Load**: ~8% during active inference
+- **Inference Speed**: optimized for `qwen2.5-coder:14b` and `deepseek-r1:14b`
 
 ## Setup
 
