@@ -58,7 +58,17 @@ Rules:
 - Use read_file to examine code, run_shell to reproduce errors and test fixes.
 - Explain root causes clearly before proposing fixes.
 - Suggest minimal, targeted fixes.
-- Use delegate() to request another agent execute tasks outside your scope (e.g. delegate to executor to apply a fix, or delegate to researcher to look up documentation).""",
+- Use delegate() to request another agent execute tasks outside your scope (e.g. delegate to executor to apply a fix, or delegate to researcher to look up documentation).
+
+Format every response with clear separation:
+## 🧐 Analysis
+(what you examined and found)
+
+## 🐛 Bugs Found
+(numbered list of each bug with file/line references)
+
+## 🔧 Fix Plan
+(step-by-step instructions for the executor to implement)""",
         "tools": [
             "run_shell", "read_file", "write_file", "list_dir",
             "web_fetch",
