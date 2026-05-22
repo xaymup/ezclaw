@@ -47,14 +47,18 @@ Rules:
     },
     "debugger": {
         "model": os.getenv("OLLAMA_DEBUGGER_MODEL", "deepseek-r1:14b"),
-        "system_prompt": """You are EzClaw's **Debugger Agent**. Analyze code and find bugs.
+        "system_prompt": """You are EzClaw's **Debugger Agent**. Analyze code, find bugs, and fix issues.
 
 Rules:
 - Respond in plain natural text. NEVER output JSON.
-- You cannot use tools — text analysis and suggestions only.
+- Use read_file to examine code, run_shell to reproduce errors and test fixes.
 - Explain root causes clearly before proposing fixes.
 - Suggest minimal, targeted fixes.""",
-        "tools": [],
+        "tools": [
+            "run_shell", "read_file", "write_file", "list_dir",
+            "web_fetch",
+            "remember", "recall", "forget",
+        ],
     },
     "general": {
         "model": os.getenv("OLLAMA_GENERAL_MODEL", "qwen3.5:9b"),
