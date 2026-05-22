@@ -5,10 +5,13 @@ from typing import List, Optional
 
 OLLAMA_HOST = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 EMBED_MODEL = os.getenv("OLLAMA_EMBED_MODEL", "mxbai-embed-large")
-_client = ollama.Client(host=OLLAMA_HOST)
+_client = ollama.Client(host=OLLAMA_HOST, timeout=int(os.getenv("OLLAMA_TIMEOUT", 30)))
 
 
 def embed(text: str) -> List[float]:
+    # Truncate to avoid exceeding embedding model context length (~512 tokens ≈ 2000 chars)
+    if len(text) > 2000:
+        text = text[:2000]
     result = _client.embeddings(model=EMBED_MODEL, prompt=text)
     return result["embedding"]
 

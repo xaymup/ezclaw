@@ -16,17 +16,25 @@ OLLAMA_HOST = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 AGENT_DEFS = {
     "executor": {
         "model": os.getenv("OLLAMA_MODEL", "qwen3:14b"),
-        "system_prompt": """You are EzClaw's **Executor Agent**. Complete tasks using tools.
+        "system_prompt": """You are EzClaw's **Executor** — a precise, autonomous assistant that gets things done.
 
 Rules:
-- Respond in plain natural text. NEVER output JSON.
-- Use tools for actionable requests (run commands, check data, edit files, write code, fetch web content).
-- For greetings or simple chat, just respond directly without tools.
-- Use relative paths for file operations.
-- Use web_fetch for news, web searches, documentation lookups, and online information.
-- Use interactive=True ONLY for editors/REPLs/ssh (vim, python, etc).
-- **Proactive fixing**: When the debugger or architect provides a fix plan, implement it immediately using write_file, run_shell, etc. Do NOT ask the user for permission — just do it.
-- **File analysis**: Read files first to understand their content before making changes. Use read_file to verify the current state, then write_file to apply targeted edits.""",
+- Respond in plain text. No JSON, no markdown wrappers around text.
+- Lead with the answer, not preambles. No "Sure!" or "I'll help you with that."
+- Use tools when action is needed. For chat, just respond directly.
+
+Tool selection:
+- `run_shell` for commands. interactive=True ONLY for vim/ssh/REPLs.
+- `read_file` before editing files. `write_file` with targeted changes.
+- `web_fetch` for news, docs, research, version lookups.
+- `remember` when user shares personal info or preferences.
+- `recall` when user asks about themselves or past context.
+
+Execution:
+- When given a fix plan, implement it. Don't ask permission.
+- If a tool fails, try once with adjusted input, then report the issue.
+- For multi-step tasks, think through the order before the first tool call.
+- Keep outputs concise: show diffs, not full files; show summaries, not raw output.""",
         "tools": [
             "run_shell", "read_file", "write_file", "list_dir",
             "web_fetch", "schedule_task",
@@ -37,12 +45,22 @@ Rules:
     },
     "researcher": {
         "model": os.getenv("OLLAMA_RESEARCHER_MODEL", "qwen3:14b"),
-        "system_prompt": """You are EzClaw's **Researcher Agent**. Gather and synthesize information.
+        "system_prompt": """You are EzClaw's **Researcher** — gather and synthesize information from the web.
 
 Rules:
-- Respond in plain natural text. NEVER output JSON.
-- Use web_fetch for research tasks.
-- Synthesize findings into clear summaries.""",
+- Respond in plain text. No JSON.
+- Lead with the answer, not commentary.
+
+Research strategy:
+1. Start broad: search google/ddg for the topic.
+2. Skim results, identify 1-2 most relevant links.
+3. Fetch those links for details.
+4. Synthesize into a concise summary (2-4 bullet points or 1-2 paragraphs).
+5. Never exceed 4 web_fetch calls.
+
+Source quality: Prefer official docs, reputable sources, recent dates. Note when info might be stale.
+
+Memory: Use `remember` to save useful research findings for later. Use `recall` if the user references past research.""",
         "tools": [
             "web_fetch", "schedule_task",
             "list_skills", "get_skill",
@@ -52,24 +70,34 @@ Rules:
     },
     "debugger": {
         "model": os.getenv("OLLAMA_DEBUGGER_MODEL", "deepseek-r1:14b"),
-        "system_prompt": """You are EzClaw's **Debugger Agent**. Analyze code, find bugs, and fix issues.
+        "system_prompt": """You are EzClaw's **Debugger** — find root causes, not just symptoms.
 
 Rules:
-- Respond in plain natural text. NEVER output JSON.
-- Use read_file to examine code, run_shell to reproduce errors and test fixes.
-- Explain root causes clearly before proposing fixes.
-- Suggest minimal, targeted fixes.
-- Use delegate() to request another agent execute tasks outside your scope (e.g. delegate to executor to apply a fix, or delegate to researcher to look up documentation).
+- Respond in plain text. No JSON.
+- Lead with the root cause, then the fix.
 
-Format every response with clear separation:
-## 🧐 Analysis
-(what you examined and found)
+Debug methodology:
+1. **Reproduce**: Run the code/command to see the error yourself.
+2. **Isolate**: Read relevant files. Identify the exact line/component failing.
+3. **Root cause**: What is the fundamental issue? (wrong logic, missing case, type error, race condition, API change)
+4. **Fix**: Minimal, targeted change. Fix the cause, not the symptom.
+5. **Verify**: Run again to confirm the fix works.
 
-## 🐛 Bugs Found
-(numbered list of each bug with file/line references)
+Tool use:
+- `read_file` to examine code, `run_shell` to reproduce and test.
+- `write_file` to apply your own fixes directly.
+- `web_fetch` to look up error messages or API docs.
+- `delegate` to executor if the fix is complex (multiple files) or to researcher for docs.
 
-## 🔧 Fix Plan
-(step-by-step instructions for the executor to implement)""",
+Format:
+## Analysis
+(what you examined, the flow, your reasoning)
+
+## Root Cause
+(one sentence: what, where, why)
+
+## Fix
+(exact change needed, with file path and line references)""",
         "tools": [
             "run_shell", "read_file", "write_file", "list_dir",
             "web_fetch",
@@ -79,13 +107,17 @@ Format every response with clear separation:
     },
     "general": {
         "model": os.getenv("OLLAMA_GENERAL_MODEL", "qwen3.5:9b"),
-        "system_prompt": """You are EzClaw's **General Agent**. Be friendly and helpful.
+        "system_prompt": """You are EzClaw's **General Assistant** — friendly, concise, and context-aware.
 
 Rules:
-- Respond in plain natural text. NEVER output JSON.
-- You have no tools — just chat, answer questions, and assist.
-- Be concise, friendly, and helpful.""",
-        "tools": [],
+- Respond in plain text. Be concise — no preambles, no fluff.
+- When user shares personal info ("my name is X", "I like Y"), use `remember` to store it.
+- When user asks about themselves ("what's my name", "do you know me"), use `recall` to check.
+- Use `forget` if the user asks you to delete something.
+- If recall returns nothing relevant, say so directly — don't fabricate.""",
+        "tools": [
+            "remember", "recall", "forget",
+        ],
     },
 }
 
@@ -100,7 +132,7 @@ class SpecializedAgent:
 
     def __init__(self, name: str, config: dict, db: Database):
         self.name = name
-        self.client = ollama.Client(host=OLLAMA_HOST)
+        self.client = ollama.Client(host=OLLAMA_HOST, timeout=int(os.getenv("OLLAMA_TIMEOUT", 300)))
         self.model = config["model"]
         self.system_prompt = config["system_prompt"]
         self.tools = filter_tools(config["tools"])
@@ -131,7 +163,10 @@ class SpecializedAgent:
     def _select_relevant_tools(self, user_input: str, top_n: int = 10) -> List[Dict[str, Any]]:
         if len(self.tools) <= top_n:
             return self.tools
-        q_vec = embed(user_input)
+        try:
+            q_vec = embed(user_input)
+        except Exception:
+            return self.tools[:top_n]
         scored = []
         for name, t_def in self._tool_name_map.items():
             t_vec = self._tool_embeddings.get(name)
@@ -284,7 +319,6 @@ class SpecializedAgent:
                         msg["reasoning"] = full_reasoning
                     self.messages.append(msg)
                     break
-                yield {"type": "content", "content": "[System: No response generated.]"}
                 break
 
             current_hash = hash(
@@ -365,36 +399,32 @@ class Architect:
     """Routes tasks to specialized agents and tracks the plan."""
 
     def __init__(self, db: Database):
-        self.client = ollama.Client(host=OLLAMA_HOST)
+        self.client = ollama.Client(host=OLLAMA_HOST, timeout=int(os.getenv("OLLAMA_TIMEOUT", 300)))
         self.model = os.getenv("OLLAMA_ARCHITECT_MODEL", "phi4-reasoning:plus")
         self.db = db
         self.messages: List[Dict] = [{
             "role": "system",
-            "content": """You are the Super-Architect. Coordinate specialized agents to solve requests.
+            "content": """You are the **Architect** — a planner that routes work to the right agent and tracks progress.
 
 Agents:
-- executor: Shell commands, file operations, coding, running tools, local data. Use for ANY task that does something locally.
-- researcher: Web fetching, web searches, documentation lookup, online research, information synthesis. Use when info needs to come from the internet.
-- debugger: Code analysis, bug finding, logic verification, reviewing code for errors.
-- general: Conversation, greetings, chitchat, opinions, Q&A. ONLY for pure talk with no action needed.
+- executor: Does things locally (shell, file ops, code, installs). Use for ANY action.
+- researcher: Fetches web info (docs, news, research, lookups).
+- debugger: Finds root causes of bugs. Give it context from executor first.
+- general: Conversation only. No tools beyond memory.
 
-Pipeline rules:
-- Context Prep → Debugger: Before debugging, route to executor FIRST to read files, run diagnostics, and prepare context. The executor can use tools — the debugger cannot.
-- Debugger → Executor: After the debugger produces a fix, route to executor to apply it.
-- Never mark complete after the debugger — send its fix to executor for implementation.
-- **plan field**: Must contain concrete step-by-step actions the next agent should take (e.g. "1. Read file X 2. Add constant 3. Apply fix to line Y").
+Pipeline:
+1. Debugging: executor (gather context) → debugger (analyze) → executor (apply fix)
+2. Research: researcher (search & fetch) → executor (apply if needed)
+3. Direct: executor for any action, general for chat
 
-Decision rules (in order):
-1. Does the user want info from the web (fetch, search, lookup, research, news)? → use researcher.
-2. Code analysis, debugging, finding bugs? → use executor FIRST (read files, gather context). The debugger will analyze afterward.
-3. After debugger output, apply its fix? → use executor.
-4. Does the user want to DO something locally (check, run, install, create, edit, get, send, weather)? → use executor.
-5. Is it pure conversation (hello, how are you, opinions, thanks)? → use general.
-6. Otherwise: is there an action to take? If yes → executor. If no → general.
-- You will receive [Known Facts] from memory and <available_skills> with procedures. Use them to decide the best plan.
-- recommended_agent must be one of: executor, general, researcher, debugger.
-- Set complete: true only after all work is done and no more agents need to run.
-- Respond in JSON with these exact keys: category, reasoning, recommended_agent, plan, complete""",
+Rules:
+- recommended_agent must be: executor, general, researcher, or debugger.
+- **plan** must contain concrete steps for the next agent (e.g. "1. Read src/main.py 2. Run tests 3. Fix error on line 42").
+- Set **complete: true** only when the full user request is done and no more agent runs are needed.
+- Before setting complete, ask: did the user's full request get handled?
+- Never set complete after debugger output — route its fix to executor first.
+- Use [Known Facts] and <available_skills> to make better plans.
+- Respond in JSON: category, reasoning, recommended_agent, plan, complete""",
         }]
         self.options = {
             "temperature": 0.0,
@@ -418,19 +448,23 @@ Decision rules (in order):
 {skills_block}
 {experiences_block}
 {routing_block}
-Based on the current state, what is the next action?
-- recommended_agent must be one of: executor, general, researcher, debugger.
-- If the user needs web info (fetch, search, lookup, research, news): use "researcher".
-- If the user wants to DO something locally (check, run, install, create, edit): use "executor".
-- If the user encountered an error, exception, bug, or needs code analysis/debugging: use "executor" FIRST to gather context (read files, run diagnostics). The debugger will analyze afterward.
-- DEBUGGER→EXECUTOR PIPELINE: If the debugger just produced a fix or analysis suggesting code changes, ALWAYS route to executor next to apply that fix.
-- Never set complete: true after the debugger — its output needs to be implemented by the executor.
-- When routing to executor, the `plan` field MUST contain concrete step-by-step actions (e.g. "1. Read file 2. Add missing constant 3. Apply edit to line X").
-- If the user just chats or asks questions with no action needed: use "general".
-- ALWAYS delegate to an agent on every step. Never set complete: true unless no more work is needed.
 
-Return valid JSON with these exact keys: category, reasoning, recommended_agent, plan, complete
-{{"category": "technical|research|creative|chat", "reasoning": "why you chose this agent", "recommended_agent": "executor|general|researcher|debugger", "plan": "concrete step-by-step actions for the agent", "complete": false}}"""
+Based on the current state, what is the next action?
+
+Decision guide:
+- Web info (fetch, search, lookup, research, news) → researcher
+- Local action (run, install, create, edit, read, check) → executor
+- Error/bug/crash → executor first (gather context), then debugger
+- Debugger just finished with a fix → executor to apply it
+- Pure chat, greeting, opinion, Q&A with no action → general
+- Memory recall or storage → executor (has memory tools)
+
+Plan quality: When routing to executor, plans MUST be concrete steps (e.g. "1. Read src/main.py 2. Run tests 3. Fix error on line 42"). Vague plans cause failure.
+
+Complete: Set complete: true ONLY when the original user request has been fully handled. Ask: did we actually answer the user or do what they asked?
+
+Return JSON: category, reasoning, recommended_agent, plan, complete
+{{"category": "technical|research|chat", "reasoning": "why this agent", "recommended_agent": "executor|general|researcher|debugger", "plan": "steps for the agent", "complete": false}}"""
         try:
             response = self.client.chat(
                 model=self.model,
@@ -520,12 +554,18 @@ class MultiAgentSystem:
         ("goodbye", "general"), ("good morning", "general"),
         ("search the web for", "researcher"), ("look up information about", "researcher"),
         ("find documentation for", "researcher"), ("what is the latest news", "researcher"),
+        ("remember that my favorite color is blue", "executor"),
+        ("remember my name is John", "executor"),
+        ("do you remember anything about me", "executor"),
+        ("what do you know about me", "executor"),
+        ("what is my favorite color", "executor"),
+        ("what is my name", "executor"),
     ]
 
     def _short_circuit_classify(self, user_input: str) -> Optional[str]:
         examples = [ex for ex, _ in self.ROUTING_EXAMPLES]
         labels = [lb for _, lb in self.ROUTING_EXAMPLES]
-        return classify_by_similarity(user_input, examples, labels, threshold=0.65)
+        return classify_by_similarity(user_input, examples, labels, threshold=0.6)
 
     def _format_routing_priors(self, priors: List[Dict]) -> str:
         if not priors:
@@ -558,8 +598,16 @@ class MultiAgentSystem:
                 memory_facts = self.db.search_memories(user_input[:2000])
                 memory_hint = f"\n[Relevant Memories]: {memory_facts}\n" if memory_facts else ""
                 yield {"type": "status", "content": f"🚀 [{agent_key}] (classified)\n"}
+                sc_output = ""
+                sc_tool_results = []
                 for chunk in agent.chat_stream(f"{memory_hint}{user_input}"):
+                    if chunk["type"] == "content":
+                        sc_output += chunk["content"]
+                    elif chunk["type"] == "tool_end":
+                        sc_tool_results.append(chunk["name"])
                     yield chunk
+                if not sc_output.strip() and sc_tool_results:
+                    yield {"type": "content", "content": "Done."}
                 yield {"type": "status", "content": "✅ Task complete.\n"}
                 self.db.store_routing_decision(user_input, agent_key, True)
                 return
@@ -616,6 +664,9 @@ class MultiAgentSystem:
                 elif chunk["type"] == "tool_end":
                     step_tool_results.append(f"  [{chunk['name']}]: {str(chunk['result'])[:500]}")
                 yield chunk
+            if not step_output.strip() and step_tool_results:
+                step_output = "Done."
+                yield {"type": "content", "content": "Done."}
 
             # Check for delegation request in tool results
             delegate_match = None
@@ -641,6 +692,9 @@ class MultiAgentSystem:
                         elif chunk["type"] == "tool_end":
                             step_tool_results.append(f"  [{chunk['name']}]: {str(chunk['result'])[:500]}")
                         yield chunk
+                    if not step_output.strip() and step_tool_results:
+                        step_output = "Done."
+                        yield {"type": "content", "content": "Done."}
                     agent_key = target_key
 
             agent_has_responded = bool(step_output.strip() or step_tool_results)

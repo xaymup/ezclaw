@@ -64,7 +64,7 @@ def format_skills_block(skills: List[Dict[str, str]]) -> str:
 
 class ChatAgent:
     def __init__(self, session_id: Optional[int] = None):
-        self.client = ollama.Client(host=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"))
+        self.client = ollama.Client(host=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"), timeout=int(os.getenv("OLLAMA_TIMEOUT", 300)))
         self.db = Database(os.getenv("DATABASE_PATH", "ezclaw.db"))
         self.model = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:14b")
         
@@ -111,7 +111,10 @@ class ChatAgent:
                 self._tool_embeddings[name] = None
 
     def _select_relevant_tools(self, user_input: str, top_n: int = 12) -> List[Dict[str, Any]]:
-        q_vec = embed(user_input)
+        try:
+            q_vec = embed(user_input)
+        except Exception:
+            return self.tools[:top_n]
         scored = []
         for name, t_def in self._tool_name_map.items():
             t_vec = self._tool_embeddings.get(name)
@@ -144,8 +147,7 @@ class ChatAgent:
             tool_info.append(f"- {name}: {desc}")
         tool_str = "\n".join(tool_info)
 
-        prompt = f"""You are analyzing a user request as part of your persona's "Search-First Analysis Protocol".
-Your goal is to identify if the request can be "improved", personalized, or successfully executed by retrieving context from your long-term memory or using tools.
+        prompt = f"""You are analyzing a user request to extract intent, context needs, and tool requirements.
 
 [Known Facts]: {key_facts}
 
@@ -157,21 +159,14 @@ Your goal is to identify if the request can be "improved", personalized, or succ
 
 User Input: "{user_input}"
 
-Your priority is to determine if you have ALL the information needed to answer the user perfectly. 
-If the user mentions names, locations, past projects, preferences, or specific tasks that imply previous context (e.g., "my website", "the draft we made", "my favorite X"), you MUST trigger a memory recall.
+Analyze:
+1. **Intent**: What does the user actually want? Does it need a tool? Which one?
+2. **Gap Analysis**: Compare against [Known Facts]. Is anything missing that memory could fill?
+3. **Memory Trigger**: Set memory:true if the user references anything personal ("my", "I", past context, names, locations, projects, preferences). Write a semantic query optimized to find the missing context, not just a repeat of the prompt.
+4. **Skill Match**: Does any skill match this request?
 
-Instructions:
-1. Intent: Identify the core goal. Does it require a tool?
-   - For `run_shell`: Only set `interactive: true` for commands that NEED it (vim, ssh). For `ls`, `cat`, etc., use `interactive: false`.
-   - For file tools (`read_file`, `write_file`, etc.): ALWAYS use relative paths. Do NOT prefix paths with 'workspace/' or use absolute paths.
-2. Gap Analysis: Compare the request against [Known Facts]. Is there a missing piece of context that might be in your long-term memory?
-3. Memory Trigger: Set "memory": true if there is ANY chance that past interactions or stored facts could help provide a better, more personalized response.
-4. Semantic Query: If "memory" is true, write a query optimized for finding the MISSING context (e.g., if you need a city for weather, query "user location or city"). Do NOT just repeat the user's prompt.
-
-Return ONLY a valid JSON object. 
-Example: {{"reasoning": "User asked for weather but city is missing from [Known Facts]. Searching memory for location.", "memory": true, "memory_q": "user city and location", "facts": [], "skill": null}}
-
-JSON:"""
+Return ONLY valid JSON:
+{{"reasoning": "your analysis", "memory": true/false, "memory_q": "optimized search query or null", "facts": [], "skill": "skill_name_or_null"}}"""
         
         # Self-Correction Loop for Intent Analysis
         for attempt in range(2):
@@ -214,22 +209,20 @@ JSON:"""
                 continue
 
     def _judge_response(self, user_input: str, response: str, reasoning: str) -> Dict[str, Any]:
-        prompt = f"""Evaluate the quality of this response.
+        prompt = f"""Evaluate this response.
 
-User Request: "{user_input}"
+User: "{user_input[:300]}"
+Response: "{response[:500]}"
+Reasoning: "{reasoning[:300] if reasoning else 'N/A'}"
 
-Agent's Response: "{response}"
-
-Agent's Reasoning: "{reasoning[:500] if reasoning else 'N/A'}"
-
-Criteria:
-1. Completeness: Does it fully address the request?
-2. Correctness: Is the information accurate?
-3. Clarity: Is it well-structured?
-4. Actionability: Does it provide concrete help?
+Rate 1-10 on:
+- Completeness: Does it fully answer the request?
+- Correctness: Is the information accurate? Any hallucination risk?
+- Conciseness: Is it as short as it should be?
+- Actionability: Does it give the user what they need?
 
 Return JSON:
-{{"score": 1-10, "needs_improvement": bool, "feedback": "what to improve"}}"""
+{{"score": 1-10, "needs_improvement": bool, "feedback": "what to improve, or empty"}}"""
         try:
             res = self.client.chat(model=self.model, messages=[{"role": "user", "content": prompt}], format="json", options={"temperature": 0.0, "num_ctx": 4096, "num_predict": 300})
             content = res["message"]["content"].strip()
@@ -277,12 +270,11 @@ Return JSON:
         self.messages.append({"role": "user", "content": user_input})
         self.db.add_message(self.session_id, "user", user_input)
         
-        # Nudge the model to follow the CoT protocol
-        cot_nudge = "\n[System Reminder]: Follow the MANDATORY CHAIN OF THOUGHT protocol using <think> tags as defined in your persona."
-        augment_prefix = f"{memory_block}{skills_block}{cot_nudge}\n[User Prompt]: "
+        cot_nudge = "\n[Reminder]: Analyze the request in <think> tags before responding."
+        augment_prefix = f"{memory_block}{skills_block}{cot_nudge}\n[User]: "
 
         iteration_count = 0
-        max_iterations = 15 
+        max_iterations = 8 
         last_tool_hash = None
         last_tool_vec = None
 
