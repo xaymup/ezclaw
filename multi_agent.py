@@ -332,7 +332,7 @@ Decision rules (in order):
         }]
         self.options = {
             "temperature": 0.0,
-            "num_ctx": min(int(os.getenv("OLLAMA_NUM_CTX", 16384)), 8192),
+            "num_ctx": int(os.getenv("OLLAMA_NUM_CTX", 16384)),
             "top_p": 0.9,
             "num_gpu": int(os.getenv("OLLAMA_NUM_GPU", 999)),
         }
@@ -429,6 +429,13 @@ class MultiAgentSystem:
             a.messages = [a.messages[0]]
         self.architect.messages = [self.architect.messages[0]]
 
+    def _prune_architect(self):
+        """Keep architect history bounded — system prompt + last 3 turns."""
+        if len(self.architect.messages) > 7:
+            self.architect.messages = (
+                [self.architect.messages[0]] + self.architect.messages[-6:]
+            )
+
     # ── Orchestration ──────────────────────────────────────────
 
     def run(self, user_input: str) -> Iterator[Dict[str, Any]]:
@@ -447,6 +454,7 @@ class MultiAgentSystem:
             matched_skills = match_skills(task_context, self.skills)
             skills_block = format_skills_block(matched_skills)
 
+            self._prune_architect()
             intent = self.architect.analyze(task_context, memory_block, skills_block)
 
             if intent.get("complete") and agent_has_responded:
@@ -514,6 +522,10 @@ class MultiAgentSystem:
                 step_context += "\n\nTool results:\n" + "\n".join(step_tool_results)
 
             task_context += f"\n\n--- Step {step} ({agent_key}) ---\n{step_context}"
+            # Keep only last 3 steps to avoid context overflow
+            parts = task_context.split("\n\n--- Step ")
+            if len(parts) > 4:
+                task_context = parts[0] + "\n\n--- Step " + "\n\n--- Step ".join(parts[-3:])
 
             is_debugger_output = agent_key == "debugger" and step_output.strip()
             is_error = any(w in step_context.lower() for w in ["error", "exception", "traceback", "failed", "exit code", "not found"])
