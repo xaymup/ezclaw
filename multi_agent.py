@@ -368,17 +368,17 @@ Return valid JSON with these exact keys: category, reasoning, recommended_agent,
             intent.setdefault("plan", "")
             intent.setdefault("reasoning", "")
             intent.setdefault("complete", False)
-            # Ensure recommended_agent is valid; if missing or unknown, infer via embeddings
-            valid_agents = {"executor", "general", "researcher", "debugger"}
-            agent = intent.get("recommended_agent")
-            if agent not in valid_agents:
-                from embed import classify_intent
-                agent = classify_intent(task_context)
-                intent["recommended_agent"] = agent
-            # Context-prep override: always route debugger requests to executor FIRST
-            if agent == "debugger" and "--- Step" not in task_context:
+
+            # Use embedding classifier for agent selection (more reliable than model's JSON)
+            from embed import classify_intent
+            embedding_agent = classify_intent(task_context)
+            intent["recommended_agent"] = embedding_agent
+
+            # Context-prep override: route debugger requests to executor FIRST
+            if embedding_agent == "debugger" and "--- Step" not in task_context:
                 intent["recommended_agent"] = "executor"
                 intent["plan"] = f"1. Read the relevant files and gather context\n2. Pass context to debugger for analysis\n\nDebug task: {task_context[:200]}"
+
             self.messages.append({"role": "assistant", "content": json.dumps(intent)})
             return intent
         except Exception:

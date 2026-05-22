@@ -24,6 +24,11 @@ _AGENT_PROTOTYPES = {
         "write to a file",
         "what files are here",
         "delete a directory",
+        "what is my name",
+        "recall my preferences",
+        "what did I tell you",
+        "remember this fact",
+        "look up my information",
     ],
     "researcher": [
         "search the web for",
@@ -110,7 +115,7 @@ def rank_by_similarity(query: str, candidates: List[str], top_n: Optional[int] =
 
 def classify_intent(query: str) -> str:
     """Classify user intent into one of: executor, researcher, debugger, general.
-    Uses embedding similarity against prototype queries for each agent type.
+    Uses max embedding similarity against prototype queries for each agent type.
     """
     q_vec = embed(query)
     protos = _get_prototype_vecs()
@@ -118,9 +123,9 @@ def classify_intent(query: str) -> str:
     best_score = -1.0
 
     for agent, vecs in protos.items():
-        avg_sim = sum(cosine_similarity(q_vec, pv) for pv in vecs) / len(vecs)
-        if avg_sim > best_score:
-            best_score = avg_sim
+        max_sim = max(cosine_similarity(q_vec, pv) for pv in vecs)
+        if max_sim > best_score:
+            best_score = max_sim
             best_agent = agent
 
     return best_agent
