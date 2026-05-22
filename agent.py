@@ -135,104 +135,124 @@ class ChatAgent:
             else: self.messages[0] = system_msg
             self.db.add_message(self.session_id, "system", self.system_prompt)
 
+    _MEMORY_PATTERNS = re.compile(
+        r'\b(my|i\'m|i am|i have|i live|i work|i prefer|i like|remember|'
+        r'recall|what do you know|do you remember|what\'s my|where do i|'
+        r'who am i|my name|my email|my location|my project|my favorite|'
+        r'last time|previously|you told me|i told you|we discussed)\b',
+        re.IGNORECASE
+    )
+
+    _STORE_PATTERNS = re.compile(
+        r'\b(my name is|i live in|i\'m from|i work at|i prefer|my favorite|'
+        r'remember that|i am \d+|my birthday|my email is|i use|my project)\b',
+        re.IGNORECASE
+    )
+
     def _process_intent(self, user_input: str) -> Dict[str, Any]:
-        """
-        Context Augmentor: Unifies persona, capabilities, and memory retrieval.
-        Uses robust extraction to work with any model (reasoning, markdown, etc.).
-        """
-        key_facts = self.db.get_key_facts()
-        
-        tool_info = []
-        for t in self.tools:
-            name = t['function']['name']
-            desc = t['function']['description']
-            tool_info.append(f"- {name}: {desc}")
-        tool_str = "\n".join(tool_info)
+        intent_prompt = f"""Analyze the user's request and determine:
+1. Does it require retrieving stored memory/context? (personal info, past discussions, preferences, etc.)
+2. If yes, what search query should be used to retrieve relevant memories?
+3. Does it contain facts that should be stored? (user stating personal information)
+4. Which skill (if any) is relevant?
 
-        prompt = f"""You are analyzing a user request to extract intent, context needs, and tool requirements.
+Available skills:
+{self.skill_descriptions if self.skills else "None"}
 
-[Known Facts]: {key_facts}
+User request: "{user_input}"
 
-[Available Tools]:
-{tool_str}
+Respond with JSON only:
+{{
+  "needs_memory": true/false,
+  "memory_query": "query to search memories" or null,
+  "store_facts": ["fact to store"] or [],
+  "relevant_skill": "skill_name" or null
+}}"""
 
-[Available Skills]:
-{self.skill_descriptions}
-
-User Input: "{user_input}"
-
-Analyze:
-1. **Intent**: What does the user actually want? Does it need a tool? Which one?
-2. **Gap Analysis**: Compare against [Known Facts]. Is anything missing that memory could fill?
-3. **Memory Trigger**: Set memory:true if the user references anything personal ("my", "I", past context, names, locations, projects, preferences). Write a semantic query optimized to find the missing context, not just a repeat of the prompt.
-4. **Skill Match**: Does any skill match this request?
-
-Return ONLY valid JSON:
-{{"reasoning": "your analysis", "memory": true/false, "memory_q": "optimized search query or null", "facts": [], "skill": "skill_name_or_null"}}"""
-        
-        # Self-Correction Loop for Intent Analysis
-        for attempt in range(2):
-            try:
-                response = self.client.chat(
-                    model=self.model,
-                    messages=[
-                        {"role": "system", "content": self.system_prompt},
-                        {"role": "user", "content": prompt if attempt == 0 else prompt + "\n\nCRITICAL: Your previous response was not valid JSON. Return ONLY the JSON object."}
-                    ],
-                    format="json",
-                    options={"temperature": 0.0, "num_ctx": min(self.num_ctx, 8192), "num_predict": 300}
-                )
-                content = response["message"]["content"].strip()
-                
-                # ROBUST EXTRACTION:
-                # 1. Strip reasoning/thinking tags (even unclosed ones)
-                content = re.sub(r'<(think|thought|reasoning)\b[^>]*>.*?(</\1>|$)', '', content, flags=re.DOTALL | re.IGNORECASE)
-                
-                # 2. Extract content between first { and last }
-                match = re.search(r'(\{.*\})', content, re.DOTALL)
-                if match:
-                    content = match.group(1)
-                
-                # 3. Clean up common LLM JSON hallucinations
-                content = re.sub(r',\s*\}', '}', content) 
-                content = re.sub(r',\s*\]', ']', content)
-                
-                intent = json.loads(content)
-                
-                # Ensure memory_q exists if memory is triggered
-                if intent.get("memory") and not intent.get("memory_q"):
-                    intent["memory_q"] = user_input
-                    
-                return intent
-            except Exception:
-                if attempt == 1:
-                    # Final fallback if even self-correction fails
-                    return {"memory": False, "memory_q": None, "facts": [], "skill": None}
-                continue
-
-    def _judge_response(self, user_input: str, response: str, reasoning: str) -> Dict[str, Any]:
-        prompt = f"""Evaluate this response.
-
-User: "{user_input[:300]}"
-Response: "{response[:500]}"
-Reasoning: "{reasoning[:300] if reasoning else 'N/A'}"
-
-Rate 1-10 on:
-- Completeness: Does it fully answer the request?
-- Correctness: Is the information accurate? Any hallucination risk?
-- Conciseness: Is it as short as it should be?
-- Actionability: Does it give the user what they need?
-
-Return JSON:
-{{"score": 1-10, "needs_improvement": bool, "feedback": "what to improve, or empty"}}"""
         try:
-            res = self.client.chat(model=self.model, messages=[{"role": "user", "content": prompt}], format="json", options={"temperature": 0.0, "num_ctx": 4096, "num_predict": 300})
-            content = res["message"]["content"].strip()
-            match = re.search(r'(\{.*\})', content, re.DOTALL)
-            if match: content = match.group(1)
-            return json.loads(content)
-        except Exception:
-            return {"score": 10, "needs_improvement": False, "feedback": ""}
+            response = self.client.chat(
+                model=self.model,
+                messages=[{"role": "user", "content": intent_prompt}],
+                options={"temperature": 0.0, "num_ctx": 4096},
+                keep_alive=self.keep_alive,
+                stream=False
+            )
+            
+            content = response.message.content.strip()
+            
+            json_match = re.search(r'\{.*\}', content, re.DOTALL)
+            if json_match:
+                content = json_match.group(0)
+            
+            intent = json.loads(content)
+            
+            return {
+                "memory": intent.get("needs_memory", False),
+                "memory_q": intent.get("memory_query"),
+                "facts": intent.get("store_facts", []),
+                "skill": intent.get("relevant_skill"),
+            }
+        except Exception as e:
+            lower = user_input.lower()
+            needs_memory = bool(self._MEMORY_PATTERNS.search(user_input))
+            
+            memory_q = None
+            if needs_memory:
+                stripped = re.sub(r'\b(what|where|who|how|when|do|does|is|are|can|could|you|please|tell|me|about)\b', '', lower)
+                stripped = re.sub(r'\s+', ' ', stripped).strip()
+                memory_q = stripped if len(stripped) > 3 else user_input
+
+            facts = []
+            if self._STORE_PATTERNS.search(user_input):
+                facts = [user_input.strip()]
+
+            skill = None
+            if self.skills:
+                matched = match_skills(user_input, self.skills)
+                if matched:
+                    skill = matched[0]['name']
+
+            return {
+                "memory": needs_memory,
+                "memory_q": memory_q,
+                "facts": facts,
+                "skill": skill,
+            }
+
+    @staticmethod
+    def _consume_buffer(raw_buffer: str, in_thinking: bool):
+        _OPEN_TAG = re.compile(r'<(think|thought|reasoning)\b[^>]*>', re.IGNORECASE)
+        _CLOSE_TAG = re.compile(r'</(think|thought|reasoning)\s*>', re.IGNORECASE)
+        _OPEN_TAGS = ("<think", "<thought", "<reasoning")
+        _CLOSE_TAGS = ("</think", "</thought", "</reasoning")
+
+        while raw_buffer:
+            if not in_thinking:
+                match = _OPEN_TAG.search(raw_buffer)
+                if match:
+                    yield raw_buffer[:match.start()], (raw_buffer[match.end():], True)
+                    raw_buffer = raw_buffer[match.end():]
+                    in_thinking = True
+                    continue
+                idx = raw_buffer.rfind('<')
+                if idx >= 0 and any(t.startswith(raw_buffer[idx:].lower()) for t in _OPEN_TAGS):
+                    yield raw_buffer[:idx], (raw_buffer[idx:], False)
+                    return
+                yield raw_buffer, ("", False)
+                return
+            else:
+                match = _CLOSE_TAG.search(raw_buffer)
+                if match:
+                    yield raw_buffer[:match.start()], (raw_buffer[match.end():], False)
+                    raw_buffer = raw_buffer[match.end():]
+                    in_thinking = False
+                    continue
+                idx = raw_buffer.rfind('</')
+                if idx >= 0 and any(t.startswith(raw_buffer[idx:].lower()) for t in _CLOSE_TAGS):
+                    yield raw_buffer[:idx], (raw_buffer[idx:], True)
+                    return
+                yield raw_buffer, ("", True)
+                return
 
     def clear_session_history(self):
         """Restores the chat history to just the system prompt."""
@@ -252,13 +272,12 @@ Return JSON:
                 self.db.add_memory(fact)
                 yield {"type": "memory_stored", "fact": fact}
 
-        # 3. Memory recall & Context Augmentation
         memory_block = ""
         if intent.get("memory"):
             query = intent.get("memory_q") or user_input
-            memories = self.db.search_memories(query)
+            memories = self.db.search_memories_hybrid(query, alpha=0.6, threshold=0.2)
             if memories:
-                memory_block = f"\n[Background Context retrieved from Memory for this request]:\n" + "\n".join([f"- {m}" for m in memories]) + "\n"
+                memory_block = f"\n[Memory]:\n" + "\n".join([f"- {m}" for m in memories]) + "\n"
                 yield {"type": "context_augmented", "memories": memories}
 
         # 4. Skill matching
@@ -276,8 +295,9 @@ Return JSON:
         self.messages.append({"role": "user", "content": user_input})
         self.db.add_message(self.session_id, "user", user_input)
         
-        cot_nudge = "\n[Reminder]: Analyze the request in <think> tags before responding."
-        augment_prefix = f"{memory_block}{skills_block}{cot_nudge}\n[User]: "
+        augment_prefix = ""
+        if memory_block or skills_block:
+            augment_prefix = f"{memory_block}{skills_block}\n---\n"
 
         iteration_count = 0
         max_iterations = 8 
@@ -297,12 +317,12 @@ Return JSON:
             else:
                 context_messages = [m.copy() for m in self.messages]
 
-            # Augment the current request message (prepend augment block)
-            for i in range(len(context_messages) - 1, -1, -1):
-                if context_messages[i]["role"] == "user":
-                    if not context_messages[i]["content"].startswith(augment_prefix):
-                        context_messages[i]["content"] = augment_prefix + context_messages[i]["content"]
-                    break
+            if augment_prefix:
+                for i in range(len(context_messages) - 1, -1, -1):
+                    if context_messages[i]["role"] == "user":
+                        if not context_messages[i]["content"].startswith(augment_prefix):
+                            context_messages[i]["content"] = augment_prefix + context_messages[i]["content"]
+                        break
 
             # Total content length pruning: keep within ~75% of num_ctx (chars ≈ tokens * 3)
             max_chars = int(self.num_ctx * 2.5)
@@ -342,83 +362,25 @@ Return JSON:
                 if reasoning:
                     reasoning_parts.append(reasoning)
                     yield {"type": "reasoning", "content": reasoning}
-                
+
                 if chunk.message.content:
                     raw_buffer += chunk.message.content
-                    
-                    while True:
-                        if not in_thinking:
-                            match = re.search(r'<(think|thought|reasoning)\b[^>]*>', raw_buffer, re.IGNORECASE)
-                            if match:
-                                pre = raw_buffer[:match.start()]
-                                if pre:
-                                    response_parts.append(pre)
-                                    yield {"type": "content", "content": pre}
-                                in_thinking = True
-                                raw_buffer = raw_buffer[match.end():]
-                                continue
-                            
-                            if '<' in raw_buffer:
-                                last_bracket = raw_buffer.rfind('<')
-                                if any(tag.startswith(raw_buffer[last_bracket:].lower()) for tag in ["<think", "<thought", "<reasoning"]):
-                                    pre = raw_buffer[:last_bracket]
-                                    if pre:
-                                        response_parts.append(pre)
-                                        yield {"type": "content", "content": pre}
-                                    raw_buffer = raw_buffer[last_bracket:]
-                                    break
-                                else:
-                                    response_parts.append(raw_buffer)
-                                    yield {"type": "content", "content": raw_buffer}
-                                    raw_buffer = ""
-                                    break
+                    for emitted, target in self._consume_buffer(raw_buffer, in_thinking):
+                        if emitted:
+                            if in_thinking:
+                                reasoning_parts.append(emitted)
                             else:
-                                if raw_buffer:
-                                    response_parts.append(raw_buffer)
-                                    yield {"type": "content", "content": raw_buffer}
-                                    raw_buffer = ""
-                                break
-                        else:
-                            match = re.search(r'</(think|thought|reasoning)\s*>', raw_buffer, re.IGNORECASE)
-                            if match:
-                                pre = raw_buffer[:match.start()]
-                                if pre:
-                                    reasoning_parts.append(pre)
-                                    yield {"type": "reasoning", "content": pre}
-                                in_thinking = False
-                                raw_buffer = raw_buffer[match.end():]
-                                continue
-                            
-                            if '</' in raw_buffer:
-                                last_bracket = raw_buffer.rfind('</')
-                                if any(tag.startswith(raw_buffer[last_bracket:].lower()) for tag in ["</think>", "</thought>", "</reasoning"]):
-                                    pre = raw_buffer[:last_bracket]
-                                    if pre:
-                                        reasoning_parts.append(pre)
-                                        yield {"type": "reasoning", "content": pre}
-                                    raw_buffer = raw_buffer[last_bracket:]
-                                    break
-                                else:
-                                    reasoning_parts.append(raw_buffer)
-                                    yield {"type": "reasoning", "content": raw_buffer}
-                                    raw_buffer = ""
-                                    break
-                            else:
-                                if raw_buffer:
-                                    reasoning_parts.append(raw_buffer)
-                                    yield {"type": "reasoning", "content": raw_buffer}
-                                    raw_buffer = ""
-                                break
-                
-                if chunk.message.tool_calls: tool_calls.extend(chunk.message.tool_calls)
+                                response_parts.append(emitted)
+                            yield {"type": "reasoning" if in_thinking else "content", "content": emitted}
+                        raw_buffer, in_thinking = target
+
+                if chunk.message.tool_calls:
+                    tool_calls.extend(chunk.message.tool_calls)
 
             if raw_buffer:
-                if in_thinking:
-                    reasoning_parts.append(raw_buffer)
-                    yield {"type": "reasoning", "content": raw_buffer}
-                else:
-                    response_parts.append(raw_buffer)
-                    yield {"type": "content", "content": raw_buffer}
+                target = reasoning_parts if in_thinking else response_parts
+                target.append(raw_buffer)
+                yield {"type": "reasoning" if in_thinking else "content", "content": raw_buffer}
                 raw_buffer = ""
 
             full_response = "".join(response_parts)
@@ -463,12 +425,15 @@ Return JSON:
                 except Exception as e: result = f"Error: {str(e)}"
                 
                 result_str = str(result)
+                full_result = result_str
                 if len(result_str) > 8000:
-                    result_str = result_str[:8000] + f"\n... (truncated, {len(result_str)} chars total)"
+                    head = result_str[:5000]
+                    tail = result_str[-2500:]
+                    result_str = f"{head}\n\n... ({len(result_str)} chars total, middle truncated) ...\n\n{tail}"
                 tool_msg = {'role': 'tool', 'content': result_str, 'name': tool.function.name}
                 self.messages.append(tool_msg)
                 self.db.add_message(self.session_id, "tool", result_str)
-                yield {"type": "tool_end", "name": tool.function.name, "result": str(result)}
+                yield {"type": "tool_end", "name": tool.function.name, "result": full_result}
 
         if iteration_count >= max_iterations:
             yield {"type": "content", "content": "\n[System: Action limit reached.]"}

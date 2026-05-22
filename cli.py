@@ -270,7 +270,7 @@ def main():
                     parts.append(_build_tool_panel(tool))
                 current_content = "".join(content_chunks)
                 if current_content:
-                    parts.append(Text(current_content))
+                    parts.append(Markdown(current_content))
                 if not parts:
                     return Spinner("dots", text=f"[dim {DIM}]connecting...[/dim {DIM}]")
                 return Group(*parts)
@@ -347,10 +347,6 @@ def main():
                 except StopIteration:
                     _flush_live(live, force=True)
 
-            final_content = "".join(content_chunks)
-            if final_content.strip():
-                console.print()
-                console.print(Markdown(final_content))
             for tool in tool_executions:
                 if tool.get("result"):
                     console.print(_build_tool_panel(tool))

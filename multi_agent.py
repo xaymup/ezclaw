@@ -17,28 +17,27 @@ OLLAMA_HOST = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 AGENT_DEFS = {
     "executor": {
         "model": os.getenv("OLLAMA_MODEL", "qwen3:14b"),
-        "system_prompt": """You are EzClaw's **Executor** — execute instructions precisely using tools.
+        "system_prompt": """You are EzClaw's **Executor** — you receive a numbered plan and execute it step by step using tools.
 
-Rules:
-- Respond in plain text. Lead with the answer, no preambles.
-- The user message contains an instruction or plan — follow it step by step.
-- If the instruction says read a file, do it. If it says create a skill, do it.
-- Do NOT ask "how can I help" or "what would you like" — just execute.
+## Core Rules
+- The user message contains ## Instructions with a numbered plan. Follow it in order.
+- After each tool result, proceed to the NEXT step. Do NOT repeat a step.
+- Do NOT ask questions. Do NOT say "how can I help". Just execute.
+- If a step fails, retry once with adjusted input, then report and move on.
+- When all steps are done, summarize what was accomplished in 2-3 sentences.
 
-Tool selection:
-- `read_file` to examine code before editing.
-- `write_file` for creating/updating files (skills, code, etc).
-- `run_shell` for commands. interactive=True ONLY for vim/ssh/REPLs.
-- `web_fetch` for news, docs, research.
-- `remember`/`recall` for memory.
-- `learn_skill` to save a reusable skill from what you just did.
+## Tool Selection
+- `read_file` → examine code BEFORE editing. Always read first.
+- `write_file` → create/update files. Show diffs for updates.
+- `run_shell` → execute commands. interactive=True ONLY for vim/ssh/REPLs.
+- `web_fetch` → fetch URLs for docs, news, research.
+- `remember`/`recall` → store or retrieve personal info and context.
+- `learn_skill` → save a reusable procedure after completing a novel task.
 
-Execution rules:
-- Read files first to understand them, then act.
-- After a tool returns, continue the plan — don't repeat the same tool.
-- If the instruction says "create a new skill", call learn_skill with the extracted knowledge.
-- If a tool fails, try once with adjusted input, then report.
-- Keep outputs concise: show diffs, not full files; show summaries, not raw output.""",
+## Output
+- Lead with results, not commentary.
+- Show diffs for edits, summaries for long output.
+- After running a command, include relevant output (errors, key lines).""",
         "tools": [
             "run_shell", "read_file", "write_file", "list_dir",
             "web_fetch", "schedule_task",
@@ -384,12 +383,15 @@ class SpecializedAgent:
                     result = f"Error: {str(e)}"
 
                 result_str = str(result)
+                full_result = result_str
                 if len(result_str) > 8000:
-                    result_str = result_str[:8000] + f"\n... (truncated, {len(result_str)} chars total)"
+                    head = result_str[:5000]
+                    tail = result_str[-2500:]
+                    result_str = f"{head}\n\n... ({len(full_result)} chars total, middle truncated) ...\n\n{tail}"
                 self.messages.append({
                     "role": "tool", "content": result_str, "name": tool_call.function.name,
                 })
-                yield {"type": "tool_end", "name": tool_call.function.name, "result": str(result)}
+                yield {"type": "tool_end", "name": tool_call.function.name, "result": full_result}
 
 
 class Architect:
@@ -402,27 +404,38 @@ class Architect:
         self.use_deepseek = os.getenv("ARCHITECT_PROVIDER", "ollama") == "deepseek"
         self.messages: List[Dict] = [{
             "role": "system",
-            "content": """You are the **Architect** — a planner that routes work to the right agent and tracks progress.
+            "content": """You are the **Architect** — a planner that decomposes tasks and routes work to specialized agents.
 
-Agents:
-- executor: Does things locally (shell, file ops, code, installs). Use for ANY action.
-- researcher: Fetches web info (docs, news, research, lookups).
-- debugger: Finds root causes of bugs. Give it context from executor first.
-- general: Conversation only. No tools beyond memory.
+## Agents
+| Agent | Capabilities | Use When |
+|-------|-------------|----------|
+| executor | shell, files, code, memory, skills | ANY local action, code changes, memory ops |
+| researcher | web_fetch, memory | Need external info: docs, news, APIs, versions |
+| debugger | shell, files, code | Bug/error analysis AFTER context is gathered |
+| general | memory only | Pure conversation, greetings, opinions |
 
-Pipeline:
-1. Debugging: executor (gather context) → debugger (analyze) → executor (apply fix)
-2. Research: researcher (search & fetch) → executor (apply if needed)
-3. Direct: executor for any action, general for chat
+## Pipelines (multi-step patterns)
+- **Debug**: executor(read files, reproduce) → debugger(analyze root cause) → executor(apply fix, verify)
+- **Research+Act**: researcher(search, fetch) → executor(apply findings)
+- **Simple action**: executor(do it) → complete
+- **Chat**: general(respond) → complete
 
-Rules:
-- recommended_agent must be: executor, general, researcher, or debugger.
-- **plan** must contain concrete steps for the next agent (e.g. "1. Read src/main.py 2. Run tests 3. Fix error on line 42").
-- Set **complete: true** only when the full user request is done and no more agent runs are needed.
-- Before setting complete, ask: did the user's full request get handled?
-- Never set complete after debugger output — route its fix to executor first.
-- Use [Known Facts] and <available_skills> to make better plans.
-- Respond in JSON: category, reasoning, recommended_agent, plan, complete""",
+## Plan Quality Rules
+- Plans MUST be numbered concrete steps with file paths, commands, or specific actions
+- BAD: "Fix the bug" / "Look into it" / "Investigate"
+- GOOD: "1. Read src/main.py lines 40-60  2. Run pytest tests/test_main.py  3. Fix the TypeError on line 52"
+- Include WHAT to look for, not just WHERE to look
+- If previous step gave output, reference specific findings in the next plan
+
+## Completion Rules
+- Set complete:true ONLY when the user's FULL original request is satisfied
+- NEVER complete after debugger output — route fix to executor first
+- NEVER complete after errors — re-route or escalate
+- If an agent produced useful output that answers the user, complete
+
+## Response Format
+Return ONLY valid JSON:
+{"category": "technical|research|chat", "reasoning": "1-2 sentences", "recommended_agent": "executor|general|researcher|debugger", "plan": "numbered steps", "complete": false}""",
         }]
 
     def _prune_messages(self):
@@ -466,32 +479,40 @@ Rules:
             overflow = total - max_prompt_len
             if overflow > 0 and len(task_context) > overflow + 500:
                 task_context = task_context[:-(overflow + 100)] + "\n... (truncated)"
-        prompt = f"""{task_context}
-{memory_block}
-{skills_block}
-{experiences_block}
-{routing_block}
 
-Based on the current state, what is the next action?
+        has_steps = "--- Step " in task_context
+        last_had_error = any(w in task_context[-800:].lower() for w in ["error", "exception", "traceback", "failed"]) if has_steps else False
+        debugger_ran = "debugger" in task_context.split("--- Step")[-1] if has_steps else False
 
-Decision guide:
-- Web info (fetch, search, lookup, research, news) → researcher
-- Local action (run, install, create, edit, read, check) → executor
-- Error/bug/crash → executor first (gather context), then debugger
-- Debugger just finished with a fix → executor to apply it
-- Pure chat, greeting, opinion, Q&A with no action → general
-- Memory recall or storage → executor (has memory tools)
+        situation = "initial"
+        if debugger_ran:
+            situation = "debugger_done"
+        elif last_had_error and has_steps:
+            situation = "error_detected"
+        elif has_steps:
+            situation = "mid_pipeline"
 
-Plan quality: When routing to executor, plans MUST be concrete steps (e.g. "1. Read src/main.py 2. Run tests 3. Fix error on line 42"). Vague plans cause failure.
+        prompt = f"""## Current State: {situation}
 
-Complete: Set complete: true ONLY when the original user request has been fully handled. Ask: did we actually answer the user or do what they asked?
+{task_context}
+{memory_block}{skills_block}{experiences_block}{routing_block}
 
-Return JSON: category, reasoning, recommended_agent, plan, complete
-{{"category": "technical|research|chat", "reasoning": "why this agent", "recommended_agent": "executor|general|researcher|debugger", "plan": "steps for the agent", "complete": false}}"""
+## Decision Required
+Analyze the state above and decide the NEXT action.
+
+Routing logic:
+- {situation} == "initial": Route based on what the user asked.
+- {situation} == "error_detected": Route to debugger with the error context.
+- {situation} == "debugger_done": Route to executor to apply the debugger's fix.
+- {situation} == "mid_pipeline": Check if the user's request is fully handled. If yes, complete. If no, plan next step.
+
+Your plan MUST be concrete numbered steps with specific file paths, commands, or actions.
+
+Return ONLY JSON: {{"category": "technical|research|chat", "reasoning": "1-2 sentences", "recommended_agent": "executor|general|researcher|debugger", "plan": "numbered concrete steps", "complete": false}}"""
 
         for attempt in range(2):
             try:
-                content = self._chat(prompt if attempt == 0 else prompt + "\n\nCRITICAL: Previous response was not valid JSON. Return ONLY valid JSON with keys: category, reasoning, recommended_agent, plan, complete.")
+                content = self._chat(prompt if attempt == 0 else prompt + "\n\nCRITICAL: Return ONLY valid JSON.")
                 content = extract_json(content)
                 intent = content
                 intent.setdefault("plan", "")
@@ -502,9 +523,13 @@ Return JSON: category, reasoning, recommended_agent, plan, complete
                 if intent.get("recommended_agent") not in valid_agents:
                     intent["recommended_agent"] = "executor"
 
-                if intent["recommended_agent"] == "debugger" and "--- Step" not in task_context:
+                if intent["recommended_agent"] == "debugger" and not has_steps:
                     intent["recommended_agent"] = "executor"
-                    intent["plan"] = f"1. Read the relevant files and gather context\n2. Pass context to debugger for analysis"
+                    intent["plan"] = "1. Read the relevant files and gather context\n2. Reproduce the error\n3. Pass findings to debugger"
+
+                if situation == "debugger_done" and intent["recommended_agent"] != "executor":
+                    intent["recommended_agent"] = "executor"
+                    intent["plan"] = "Apply the debugger's recommended fix and verify it works."
 
                 self.messages.append({"role": "assistant", "content": json.dumps(intent)})
                 return intent
@@ -512,7 +537,7 @@ Return JSON: category, reasoning, recommended_agent, plan, complete
                 if attempt == 1:
                     return {
                         "category": "technical",
-                        "reasoning": "Continuing execution...",
+                        "reasoning": "Fallback routing",
                         "recommended_agent": "executor",
                         "plan": "",
                         "complete": False,
@@ -530,6 +555,7 @@ class MultiAgentSystem:
             name: SpecializedAgent(name, cfg, self.db)
             for name, cfg in AGENT_DEFS.items()
         }
+        self._conversation_history: List[Dict[str, str]] = []
 
     def chat_stream(self, user_input: str) -> Iterator[Dict[str, Any]]:
         yield from self.run(user_input)
@@ -553,10 +579,21 @@ class MultiAgentSystem:
     def messages(self):
         return self.architect.messages
 
+    def _format_history(self) -> str:
+        if not self._conversation_history:
+            return ""
+        lines = []
+        for turn in self._conversation_history[-5:]:
+            lines.append(f"User: {turn['user']}")
+            if turn.get('assistant'):
+                lines.append(f"You: {turn['assistant'][:500]}")
+        return "\n".join(lines) + "\n"
+
     def clear_session_history(self):
         for a in self.agents.values():
             a.messages = [a.messages[0]]
         self.architect.messages = [self.architect.messages[0]]
+        self._conversation_history.clear()
 
     def _prune_architect(self):
         """Keep architect history bounded — system prompt + last 3 turns."""
@@ -596,100 +633,110 @@ class MultiAgentSystem:
     # ── Orchestration ──────────────────────────────────────────
 
     def run(self, user_input: str) -> Iterator[Dict[str, Any]]:
-        # Truncate long user input to prevent context overflow
         if len(user_input) > 4000:
             user_input = user_input[:4000] + "\n... (truncated)"
         task_context = f"User Request: {user_input}"
-        max_steps = 5
+        max_steps = 7
         loop_hashes = set()
         agent_has_responded = False
-        needs_debug = any(w in user_input.lower() for w in ["debug", "bug", "error", "fix", "analyze", "crash"])
+        step_history = []
+        final_response = ""
 
-        # Reset agent histories for fresh context each request
         for a in self.agents.values():
             a.messages = [a.messages[0]]
 
-        # Short-circuit: for obvious patterns, skip architect entirely
+        recent_history = self._format_history()
+        history_block = f"\n## Conversation History\n{recent_history}\n" if recent_history else ""
+
         short_circuit_agent = self._short_circuit_classify(user_input)
         if short_circuit_agent and short_circuit_agent != "debugger":
             agent_key = short_circuit_agent
             agent = self.agents.get(agent_key)
             if agent:
                 agent.messages = [agent.messages[0]]
-                memory_facts = self.db.search_memories(user_input[:2000])
-                memory_hint = f"\n[Relevant Memories]: {memory_facts}\n" if memory_facts else ""
-                yield {"type": "status", "content": f"🚀 [{agent_key}] (classified)\n"}
+                memory_facts = self.db.search_memories_hybrid(user_input[:1000], alpha=0.6)
+                memory_hint = f"\n[Memory]: {memory_facts}\n" if memory_facts else ""
+                yield {"type": "status", "content": f"[{agent_key}] (fast-routed)\n"}
                 sc_output = ""
                 sc_tool_results = []
-                for chunk in agent.chat_stream(f"{memory_hint}{user_input}"):
+                agent_input = f"{history_block}{memory_hint}{user_input}"
+                for chunk in agent.chat_stream(agent_input):
                     if chunk["type"] == "content":
                         sc_output += chunk["content"]
                     elif chunk["type"] == "tool_end":
                         sc_tool_results.append(chunk["name"])
                     yield chunk
                 if not sc_output.strip() and sc_tool_results:
+                    sc_output = "Done."
                     yield {"type": "content", "content": "Done."}
-                yield {"type": "status", "content": "✅ Task complete.\n"}
+                yield {"type": "status", "content": "Done.\n"}
                 self.db.store_routing_decision(user_input, agent_key, True)
+                self._conversation_history.append({"user": user_input, "assistant": sc_output.strip()})
                 return
 
         for step in range(1, max_steps + 1):
-            yield {"type": "status", "content": f"🧠 [Architect] Step {step}: Planning...\n"}
+            yield {"type": "status", "content": f"[Architect] Step {step}/{max_steps}\n"}
 
-            # Search memory for facts relevant to the current conversation
-            memory_facts = self.db.search_memories(task_context[:2000])
-            memory_block = f"\n[Relevant Memories]: {memory_facts}\n" if memory_facts else ""
+            memory_facts = self.db.search_memories_hybrid(user_input[:1000], alpha=0.6)
+            memory_block = f"\n[Memory]: {memory_facts}\n" if memory_facts else ""
             matched_skills = match_skills(task_context, self.skills)
             skills_block = format_skills_block(matched_skills)
 
-            # Routing priors: find similar past routing decisions
-            routing_priors = self.db.search_similar_routing(task_context[:2000], limit=3)
+            routing_priors = self.db.search_similar_routing(user_input[:1000], limit=3)
             routing_block = self._format_routing_priors(routing_priors)
 
             self._prune_architect()
             intent = self.architect.analyze(task_context, memory_block, skills_block, routing_block=routing_block)
 
-            # Save memory for agent context
-            agent_memory_block = memory_block
-
             if intent.get("complete") and agent_has_responded:
-                yield {"type": "status", "content": "✅ Task complete.\n"}
+                yield {"type": "status", "content": "Done.\n"}
+                self._conversation_history.append({"user": user_input, "assistant": final_response.strip()})
                 break
 
             agent_key = intent.get("recommended_agent", "executor")
             agent = self.agents.get(agent_key)
             if not agent:
-                yield {"type": "status", "content": "✅ Task complete.\n"}
+                yield {"type": "status", "content": "Done.\n"}
+                self._conversation_history.append({"user": user_input, "assistant": final_response.strip()})
                 break
 
-            plan = intent.get("plan") or intent.get("reasoning", "") or "Executing task..."
+            plan = intent.get("plan") or intent.get("reasoning", "") or "Executing..."
             yield {
                 "type": "reasoning",
-                "content": f"Plan: {plan}\nDelegating to: {agent_key} ({agent.model})\n",
+                "content": f"[{agent_key}] {plan}\n",
             }
-            yield {"type": "status", "content": f"🚀 [{agent_key}]\n"}
+            yield {"type": "status", "content": f"[{agent_key}]\n"}
 
             instruction = intent.get("plan") or intent.get("reasoning", "Execute the next step.")
-            matched_skills = match_skills(f"{instruction} {task_context}", self.skills)
-            skills_block = format_skills_block(matched_skills)
 
-            # Reset agent messages before each step to prevent cross-step accumulation
-            agent.messages = [agent.messages[0]]
+            prev_step_summary = ""
+            if step_history:
+                last = step_history[-1]
+                prev_step_summary = f"\n## Previous Step Result ({last['agent']})\n{last['output'][:2000]}"
+                if last.get('tools'):
+                    prev_step_summary += f"\nTools used: {', '.join(last['tools'][:5])}"
 
-            step_output = ""
+            history_block = f"\n## Conversation History\n{recent_history}\n" if recent_history else ""
+            agent_context = f"{memory_block}{history_block}## Instructions\n{instruction}\n\n## Original Request\n{user_input}{prev_step_summary}"
+
+            step_output_parts = []
             step_tool_results = []
-            agent_context = f"## Task\n{instruction}\n\n## Original Request\n{user_input}\n\n## Context So Far\n{task_context}"
+            step_tool_names = []
             for chunk in agent.chat_stream(agent_context):
                 if chunk["type"] == "content":
-                    step_output += chunk["content"]
+                    step_output_parts.append(chunk["content"])
                 elif chunk["type"] == "tool_end":
+                    step_tool_names.append(chunk["name"])
                     step_tool_results.append(f"  [{chunk['name']}]: {str(chunk['result'])[:500]}")
                 yield chunk
+
+            step_output = "".join(step_output_parts)
             if not step_output.strip() and step_tool_results:
                 step_output = "Done."
                 yield {"type": "content", "content": "Done."}
+            if step_output.strip():
+                final_response = step_output.strip()
 
-            # Check for delegation request in tool results
             delegate_match = None
             for r in step_tool_results:
                 m = re.search(r'\[DELEGATE:(\w+)\](.*?)\[/DELEGATE\]', r)
@@ -701,61 +748,72 @@ class MultiAgentSystem:
                 target_key, delegate_instruction = delegate_match
                 target_agent = self.agents.get(target_key)
                 if target_agent:
-                    yield {"type": "status", "content": f"🔄 {agent_key} delegated to {target_key}\n"}
-                    task_context += f"\n\n--- Delegation: {agent_key} → {target_key} ---\n{delegate_instruction}"
-                    step_output = ""
-                    step_tool_results = []
+                    yield {"type": "status", "content": f"{agent_key} -> {target_key}\n"}
+                    del_output_parts = []
+                    del_tool_results = []
                     for chunk in target_agent.chat_stream(
-                        f"{skills_block}{delegate_instruction}\n\nContext: {task_context}"
+                        f"## Instructions\n{delegate_instruction}\n\n## Original Request\n{user_input}"
                     ):
                         if chunk["type"] == "content":
-                            step_output += chunk["content"]
+                            del_output_parts.append(chunk["content"])
                         elif chunk["type"] == "tool_end":
-                            step_tool_results.append(f"  [{chunk['name']}]: {str(chunk['result'])[:500]}")
+                            del_tool_results.append(f"  [{chunk['name']}]: {str(chunk['result'])[:500]}")
                         yield chunk
-                    if not step_output.strip() and step_tool_results:
-                        step_output = "Done."
+                    del_output = "".join(del_output_parts)
+                    if not del_output.strip() and del_tool_results:
+                        del_output = "Done."
                         yield {"type": "content", "content": "Done."}
+                    step_output += f"\n\n[Delegated to {target_key}]: {del_output}"
+                    step_tool_results.extend(del_tool_results)
                     agent_key = target_key
 
             agent_has_responded = bool(step_output.strip() or step_tool_results)
 
-            step_context = step_output[:4000]
-            if step_tool_results:
-                step_context += "\n\nTool results:\n" + "\n".join(step_tool_results)
+            step_record = {
+                "agent": agent_key,
+                "output": step_output[:3000],
+                "tools": step_tool_names,
+                "had_error": any(w in step_output.lower() for w in ["error", "exception", "traceback"]),
+            }
+            step_history.append(step_record)
 
-            task_context += f"\n\n--- Step {step} ({agent_key}) ---\n{step_context}"
-            # Keep only last 3 steps to avoid context overflow
+            step_ctx = step_output[:3000]
+            if step_tool_results:
+                step_ctx += "\n\nTool results:\n" + "\n".join(step_tool_results[:10])
+
+            task_context += f"\n\n--- Step {step} ({agent_key}) ---\n{step_ctx}"
             parts = task_context.split("\n\n--- Step ")
             if len(parts) > 4:
                 task_context = parts[0] + "\n\n--- Step " + "\n\n--- Step ".join(parts[-3:])
 
-            step_decision_text = user_input if step == 1 else task_context[:300]
             step_success = bool(step_output.strip() or step_tool_results)
-            self.db.store_routing_decision(step_decision_text, agent_key, step_success)
+            self.db.store_routing_decision(
+                user_input if step == 1 else task_context[:300],
+                agent_key, step_success
+            )
 
             is_debugger_output = agent_key == "debugger" and step_output.strip()
-            is_error = any(w in step_context.lower() for w in ["error", "exception", "traceback", "failed", "exit code", "not found"])
-            debugger_has_run = "--- Step" in task_context and "debugger" in task_context[task_context.rfind("--- Step"):]
-            is_context_prep = needs_debug and not debugger_has_run and agent_key == "executor" and step_output.strip()
+            has_error = step_record["had_error"]
+            debugger_ran_recently = any(h["agent"] == "debugger" for h in step_history[-2:])
+
             if step_output.strip() or step_tool_results:
-                if is_error and agent_key != "debugger":
-                    yield {"type": "status", "content": "⚠️ Error detected. Re-routing to debugger.\n"}
+                if has_error and agent_key != "debugger" and not debugger_ran_recently:
+                    yield {"type": "status", "content": "Error detected, routing to debugger.\n"}
                     continue
                 if is_debugger_output:
-                    yield {"type": "status", "content": "🔧 Debugger produced a fix. Routing to executor to apply...\n"}
+                    yield {"type": "status", "content": "Fix identified, routing to executor.\n"}
                     continue
-                if is_context_prep:
-                    yield {"type": "status", "content": "📄 Context prepared. Routing to debugger for analysis...\n"}
-                    continue
-                yield {"type": "status", "content": "✅ Task complete.\n"}
+                yield {"type": "status", "content": "Done.\n"}
+                self._conversation_history.append({"user": user_input, "assistant": final_response})
                 break
 
-            decision_hash = hash(agent_key)
-            if decision_hash in loop_hashes:
-                yield {"type": "status", "content": "⚠️ Loop detected. Stopping.\n"}
+            agent_hash = hash((agent_key, step))
+            if agent_hash in loop_hashes:
+                yield {"type": "status", "content": "Loop detected. Stopping.\n"}
                 break
-            loop_hashes.add(decision_hash)
+            loop_hashes.add(agent_hash)
 
         if step >= max_steps:
-            yield {"type": "status", "content": "⚠️ Orchestration limit reached.\n"}
+            yield {"type": "status", "content": "Step limit reached.\n"}
+            if final_response:
+                self._conversation_history.append({"user": user_input, "assistant": final_response})

@@ -86,12 +86,22 @@ class Database:
             cursor.execute("INSERT INTO memories (fact, tags, embedding) VALUES (?, ?, ?)", (fact, tags, blob))
             conn.commit()
 
-    def search_memories(self, query: str) -> List[str]:
+    def _ensure_embedding(self, row_id: int, fact: str, emb_blob: Optional[bytes]):
+        if emb_blob:
+            return pickle.loads(emb_blob)
+        from embed import embed as _embed
+        f_vec = _embed(fact)
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("UPDATE memories SET embedding=? WHERE id=?", (pickle.dumps(f_vec), row_id))
+            conn.commit()
+        return f_vec
+
+    def search_memories(self, query: str, threshold: float = 0.25) -> List[str]:
         from embed import embed, cosine_similarity
 
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT fact, embedding FROM memories")
+            cursor.execute("SELECT id, fact, embedding FROM memories")
             rows = cursor.fetchall()
 
         if not rows:
@@ -99,27 +109,21 @@ class Database:
 
         q_vec = embed(query)
         scored = []
-        for fact, emb_blob in rows:
-            if emb_blob:
-                f_vec = pickle.loads(emb_blob)
-            else:
-                from embed import embed as _embed
-                f_vec = _embed(fact)
-                with sqlite3.connect(self.db_path) as conn:
-                    conn.execute("UPDATE memories SET embedding=? WHERE fact=?", (pickle.dumps(f_vec), fact))
-                    conn.commit()
+        for row_id, fact, emb_blob in rows:
+            f_vec = self._ensure_embedding(row_id, fact, emb_blob)
             sim = cosine_similarity(q_vec, f_vec)
-            scored.append((sim, fact))
+            if sim >= threshold:
+                scored.append((sim, fact))
 
         scored.sort(key=lambda x: x[0], reverse=True)
-        return [f for _, f in scored[:5]] if scored else []
+        return [f for _, f in scored[:5]]
 
-    def search_memories_hybrid(self, query: str, alpha: float = 0.7) -> List[str]:
+    def search_memories_hybrid(self, query: str, alpha: float = 0.7, threshold: float = 0.2) -> List[str]:
         from embed import embed, cosine_similarity
 
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT fact, embedding FROM memories")
+            cursor.execute("SELECT id, fact, embedding FROM memories")
             rows = cursor.fetchall()
 
         if not rows:
@@ -131,26 +135,18 @@ class Database:
 
         q_vec = embed(query)
         scored = []
-        for fact, emb_blob in rows:
-            emb_score = 0.0
-            if emb_blob:
-                f_vec = pickle.loads(emb_blob)
-                emb_score = cosine_similarity(q_vec, f_vec)
-            else:
-                from embed import embed as _embed
-                f_vec = _embed(fact)
-                with sqlite3.connect(self.db_path) as conn:
-                    conn.execute("UPDATE memories SET embedding=? WHERE fact=?", (pickle.dumps(f_vec), fact))
-                    conn.commit()
-                emb_score = cosine_similarity(q_vec, f_vec)
+        for row_id, fact, emb_blob in rows:
+            f_vec = self._ensure_embedding(row_id, fact, emb_blob)
+            emb_score = cosine_similarity(q_vec, f_vec)
 
             bm25_score = sum(1 for w in query_words if w in fact.lower()) / max(len(query_words), 1) if query_words else 0.0
 
             combined = alpha * emb_score + (1 - alpha) * bm25_score
-            scored.append((combined, fact))
+            if combined >= threshold:
+                scored.append((combined, fact))
 
         scored.sort(key=lambda x: x[0], reverse=True)
-        return [f for _, f in scored[:5]] if scored else []
+        return [f for _, f in scored[:5]]
 
     def get_key_facts(self) -> List[str]:
         with sqlite3.connect(self.db_path) as conn:
