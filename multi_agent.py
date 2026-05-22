@@ -368,12 +368,20 @@ Return valid JSON with these exact keys: category, reasoning, recommended_agent,
             intent.setdefault("plan", "")
             intent.setdefault("reasoning", "")
             intent.setdefault("complete", False)
-            if intent.get("category") == "research":
-                intent.setdefault("recommended_agent", "researcher")
-            elif intent.get("category") in ("technical", "action"):
-                intent.setdefault("recommended_agent", "executor")
-            else:
-                intent.setdefault("recommended_agent", "general")
+            # Ensure recommended_agent is valid; if missing or unknown, infer from category + context
+            valid_agents = {"executor", "general", "researcher", "debugger"}
+            agent = intent.get("recommended_agent")
+            if agent not in valid_agents:
+                cat = intent.get("category", "")
+                ctx = task_context.lower()
+                if cat == "research" or any(w in ctx for w in ["search", "fetch", "news", "web", "lookup"]):
+                    intent["recommended_agent"] = "researcher"
+                elif any(w in ctx for w in ["debug", "bug", "error", "fix", "crash", "exception"]):
+                    intent["recommended_agent"] = "executor"
+                elif cat in ("technical", "action", "code_analysis", "debugging"):
+                    intent["recommended_agent"] = "executor"
+                else:
+                    intent["recommended_agent"] = "general"
             self.messages.append({"role": "assistant", "content": json.dumps(intent)})
             return intent
         except Exception:
