@@ -10,24 +10,24 @@ from rich.panel import Panel
 from rich.live import Live
 from rich.spinner import Spinner
 from rich.text import Text
-from rich.box import ROUNDED, HEAVY
+from rich.box import ROUNDED
 from rich.syntax import Syntax
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.styles import Style
-from prompt_toolkit.layout import FormattedTextControl, Window, HSplit
-from prompt_toolkit.application import get_app
 from agent import ChatAgent
 from multi_agent import MultiAgentSystem
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# ── Theme ──────────────────────────────────────────────────────
-PRIMARY = "magenta"
-SECONDARY = "cyan"
+# ── Theme (opencode-inspired) ───────────────────────────────────
+PRIMARY = "gold1"
+SECONDARY = "grey74"
 ACCENT = "green"
-WARN = "yellow"
+WARN = "dark_orange"
+ERR = "red"
+DIM = "grey42"
 ERR = "red"
 DIM = "grey50"
 
@@ -92,19 +92,18 @@ def truncate_text(text: str, max_lines: int = 15) -> str:
     return text
 
 def build_status_bar(agent):
-    auth_icon = "🔓" if agent.session_authorized else "🔒"
-    mode = "Multi" if ENABLE_MULTI_AGENT else "Single"
-    model_info = agent.model.split(",")[0][:50] if "," in agent.model else agent.model[:50]
+    auth_icon = "◉" if agent.session_authorized else "○"
+    auth_color = ACCENT if agent.session_authorized else DIM
+    mode = "⚡" if ENABLE_MULTI_AGENT else "●"
+    model_info = agent.model.split(",")[0][:45] if "," in agent.model else agent.model[:45]
     msg_count = len(agent.messages) if hasattr(agent, 'messages') and agent.messages else 0
     return [
-        ("class:bar.text", f"  {auth_icon} "),
-        ("class:bar.auth", "AUTH " if agent.session_authorized else "LOCKED "),
-        ("class:bar.sep", "│"),
-        ("class:bar.text", f" {mode} "),
-        ("class:bar.sep", "│"),
-        ("class:bar.text", f" {model_info} "),
-        ("class:bar.sep", "│"),
-        ("class:bar.text", f" {msg_count} msgs "),
+        ("class:bar.auth", f"  {auth_icon} "),
+        ("class:bar.sep", "  "),
+        ("class:bar.text", f"{mode} "),
+        ("class:bar.text", f"{model_info} "),
+        ("class:bar.sep", "·"),
+        ("class:bar.count", f" {msg_count} "),
     ]
 
 def main():
@@ -115,8 +114,9 @@ def main():
     pt_style = Style.from_dict({
         'prompt': f'bold {PRIMARY}',
         'bar.text': f'bold {SECONDARY}',
-        'bar.auth': f'bold {ACCENT}',
-        'bar.sep': f'dim',
+        'bar.auth': f'{ACCENT}',
+        'bar.sep': f'dim {DIM}',
+        'bar.count': f'dim {DIM}',
     })
 
     session = PromptSession(
@@ -129,15 +129,19 @@ def main():
 
     welcome = Panel(
         Text.assemble(
-            (f"EzClaw ", f"bold {PRIMARY}"), ("v2.2", f"bold {WARN}"),
-            ("\n\nModel: ", "bold"), (f"{agent.model}", f"{SECONDARY}"),
-            ("\nMode: ", "bold"), (f"{'Multi-Agent' if ENABLE_MULTI_AGENT else 'Single-Agent'}", f"{SECONDARY}"),
-            ("\nWorkspace: ", "bold"), ("./workspace", f"{SECONDARY}"),
-            ("\n\nCommands: ", "bold"),
-            ("/help, /diagnose, /clear, /thinking, /settings, /authorize", f"{DIM}"),
+            ("EzClaw ", f"bold {PRIMARY}"),
+            ("v2.2", f"dim {DIM}"),
+            ("\n\n", ""),
+            (f"{'⚡' if ENABLE_MULTI_AGENT else '●'} ", ""),
+            (f"{agent.model}", f"{SECONDARY}"),
+            ("\n", ""),
+            (f"./workspace", f"dim {DIM}"),
+            ("\n\n", ""),
+            ("Commands: ", "bold"),
+            ("/help · /diagnose · /clear · /thinking · /settings · /authorize", f"dim {DIM}"),
         ),
-        box=ROUNDED, padding=(1, 2), border_style=PRIMARY,
-        title="[bold]EzClaw[/bold]",
+        box=ROUNDED, padding=(1, 2), border_style=DIM,
+        title=f"[bold {PRIMARY}]EzClaw[/bold {PRIMARY}]",
     )
     console.print(welcome)
 
@@ -166,7 +170,7 @@ def main():
                         f"**Session Auth:** `{auth}`\n"
                         f"**History Size:** `{history}` messages"
                     )
-                    console.print(Panel(Markdown(info), title="[bold]System Settings[/bold]", border_style=SECONDARY))
+                    console.print(Panel(Markdown(info), title=f"[bold {PRIMARY}]settings[/bold {PRIMARY}]", border_style=DIM))
                 elif cmd == "/help":
                     help_text = (
                         "## Commands\n\n"
@@ -186,7 +190,7 @@ def main():
                         "- Skills in `skills/` are auto-loaded and matched to your requests\n"
                         "- Scheduled tasks in `heartbeat.md` are checked every 30s"
                     )
-                    console.print(Panel(Markdown(help_text), title="[bold]EzClaw Help[/bold]", border_style=PRIMARY))
+                    console.print(Panel(Markdown(help_text), title=f"[bold {PRIMARY}]help[/bold {PRIMARY}]", border_style=DIM))
                 elif cmd == "/diagnose":
                     run_diagnostics()
                 elif cmd == "/clear":
@@ -208,25 +212,25 @@ def main():
             def get_renderable():
                 parts = []
                 for msg in side_messages:
-                    parts.append(Text(msg, style=f"dim italic"))
+                    parts.append(Text(msg, style=f"dim {DIM} italic"))
                 if SHOW_THINKING and current_reasoning:
                     parts.append(Panel(
                         Text(current_reasoning, style=f"italic {DIM}"),
-                        title=f"[bold {SECONDARY}]Thinking Process[/bold {SECONDARY}]",
-                        border_style=SECONDARY, box=ROUNDED,
+                        title=f"[bold {PRIMARY}]thinking[/bold {PRIMARY}]",
+                        border_style=DIM, box=ROUNDED,
                     ))
                 for tool in tool_executions:
                     tool_name = tool["name"]
                     args = tool.get("args", {})
                     result = tool.get("result")
                     header = Text.assemble(
-                        ("⚒  Tool: ", f"bold {WARN}"),
-                        (tool_name, f"bold {SECONDARY}"),
+                        ("▸ ", f"bold {WARN}"),
+                        (tool_name, f"bold"),
                     )
                     tool_parts = []
                     if args:
                         arg_str = "\n".join([f"[bold]{k}:[/bold] {v}" for k, v in args.items()])
-                        tool_parts.append(Panel(truncate_text(arg_str, max_lines=5), title="Arguments", border_style=f"dim"))
+                        tool_parts.append(Panel(truncate_text(arg_str, max_lines=5), title="args", border_style=f"dim {DIM}"))
                     if result:
                         renderable_result = str(result)
                         if tool_name == "write_file" and "Diff:" in renderable_result:
@@ -235,18 +239,18 @@ def main():
                                 tool_parts.append(Text(parts_of_result[0]))
                                 tool_parts.append(Syntax(truncate_text(parts_of_result[1], 20), "diff", theme="monokai", background_color="default"))
                             else:
-                                tool_parts.append(Panel(truncate_text(renderable_result), title="Output", border_style=ACCENT))
+                                tool_parts.append(Panel(truncate_text(renderable_result), title="output", border_style=DIM))
                         elif tool_name == "read_file":
                             tool_parts.append(Syntax(truncate_text(renderable_result, 25), "python", theme="monokai", background_color="default"))
                         else:
-                            tool_parts.append(Panel(truncate_text(renderable_result), title="Output", border_style=ACCENT))
+                            tool_parts.append(Panel(truncate_text(renderable_result), title="output", border_style=DIM))
                     else:
-                        tool_parts.append(Text("Executing...", style=f"blink {WARN}"))
-                    parts.append(Panel(Group(*tool_parts), title=header, border_style=WARN, box=ROUNDED))
+                        tool_parts.append(Text("running...", style=f"dim {DIM}"))
+                    parts.append(Panel(Group(*tool_parts), title=header, border_style=DIM, box=ROUNDED))
                 if current_content:
                     parts.append(Markdown(current_content))
                 if not parts:
-                    return Spinner("dots", text=f"[dim]Connecting to Ollama...[/dim]")
+                    return Spinner("dots", text=f"[dim {DIM}]connecting...[/dim {DIM}]")
                 return Group(*parts)
 
             with Live(get_renderable(), refresh_per_second=10, console=console) as live:
@@ -265,16 +269,16 @@ def main():
                             live.stop()
                             console.print(Panel(
                                 Text.assemble(
-                                    ("⚒  Authorization Required: ", f"bold {WARN}"),
-                                    (chunk['name'], f"bold {SECONDARY}"),
-                                    ("\nArguments: ", "bold"),
-                                    (str(chunk['arguments']), f"{DIM}"),
+                                    ("authorization required: ", f"bold {WARN}"),
+                                    (chunk['name'], "bold"),
+                                    ("\n", ""),
+                                    (str(chunk['arguments']), f"dim {DIM}"),
                                 ),
-                                border_style=ERR, title="[bold]Security Check[/bold]",
+                                border_style=WARN,
                             ))
                             choice = ""
                             while choice not in ["y", "n", "a"]:
-                                choice = console.input(f"[bold {ERR}]Authorize? (y/n/a): [/bold {ERR}]").lower().strip()
+                                choice = console.input(f"[bold {ERR}]? (y/n/a): [/bold {ERR}]").lower().strip()
                             if choice == "y":
                                 chunk = gen.send("allow")
                             elif choice == "n":
@@ -284,11 +288,11 @@ def main():
                             live.start()
                             continue
                         elif chunk["type"] == "memory_stored":
-                            side_messages.append(f"💭 Memory stored: {chunk['fact']}")
+                            side_messages.append(f"📝 {chunk['fact']}")
                             live.update(get_renderable())
                         elif chunk["type"] == "context_augmented":
                             for m in chunk["memories"]:
-                                side_messages.append(f"🧠 Context augmented: {m}")
+                                side_messages.append(f"📎 {m}")
                             live.update(get_renderable())
                         elif chunk["type"] == "tool_start":
                             is_int = chunk.get("interactive", False)
@@ -296,7 +300,7 @@ def main():
                             if is_int:
                                 live.stop()
                                 console.print(Panel(
-                                    f"[bold {WARN}]Entering interactive mode for: {chunk['name']}[/bold {WARN}]",
+                                    f"[bold {WARN}]interactive: {chunk['name']}[/bold {WARN}]",
                                     border_style=WARN,
                                 ))
                             else:
@@ -307,7 +311,7 @@ def main():
                                     tool["result"] = chunk["result"]
                                     if tool.get("interactive"):
                                         console.print(Panel(
-                                            f"[bold {ACCENT}]Interactive mode completed: {chunk['name']}[/bold {ACCENT}]",
+                                            f"[bold {ACCENT}]done: {chunk['name']}[/bold {ACCENT}]",
                                             border_style=ACCENT,
                                         ))
                                         live.start()
