@@ -555,8 +555,10 @@ class MultiAgentSystem:
             agent = self.agents.get(agent_key)
             if agent:
                 agent.messages = [agent.messages[0]]
+                memory_facts = self.db.search_memories(user_input[:2000])
+                memory_hint = f"\n[Relevant Memories]: {memory_facts}\n" if memory_facts else ""
                 yield {"type": "status", "content": f"🚀 [{agent_key}] (classified)\n"}
-                for chunk in agent.chat_stream(user_input):
+                for chunk in agent.chat_stream(f"{memory_hint}{user_input}"):
                     yield chunk
                 yield {"type": "status", "content": "✅ Task complete.\n"}
                 self.db.store_routing_decision(user_input, agent_key, True)
@@ -577,6 +579,9 @@ class MultiAgentSystem:
 
             self._prune_architect()
             intent = self.architect.analyze(task_context, memory_block, skills_block, routing_block=routing_block)
+
+            # Save memory for agent context
+            agent_memory_block = memory_block
 
             if intent.get("complete") and agent_has_responded:
                 yield {"type": "status", "content": "✅ Task complete.\n"}
@@ -604,9 +609,8 @@ class MultiAgentSystem:
 
             step_output = ""
             step_tool_results = []
-            for chunk in agent.chat_stream(
-                f"{skills_block}{instruction}\n\nContext: {task_context}"
-            ):
+            agent_context = f"{agent_memory_block}{skills_block}{instruction}\n\nContext: {task_context}"
+            for chunk in agent.chat_stream(agent_context):
                 if chunk["type"] == "content":
                     step_output += chunk["content"]
                 elif chunk["type"] == "tool_end":
