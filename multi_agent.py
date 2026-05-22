@@ -144,9 +144,16 @@ class SpecializedAgent:
         return [t for _, t in scored[:top_n]]
 
     def chat_stream(self, user_input: str) -> Iterator[Dict[str, Any]]:
+        # Truncate user input to prevent context overflow
+        if len(user_input) > 4000:
+            user_input = user_input[:4000] + "\n... (truncated)"
         self.messages.append({"role": "user", "content": user_input})
-        if len(self.messages) > 30:
-            self.messages = [self.messages[0]] + self.messages[-28:]
+
+        # Enforce total char limit on messages
+        total_chars = sum(len(m.get("content", "")) for m in self.messages)
+        if total_chars > 20000 or len(self.messages) > 12:
+            self.messages = [self.messages[0]] + self.messages[-10:]
+
         last_tool_hash = None
         last_tool_vec = None
 
@@ -155,6 +162,12 @@ class SpecializedAgent:
         for _ in range(10):
             full_response, full_reasoning, tool_calls = "", "", []
             in_thinking, raw_buffer = False, ""
+
+            # Re-check total context length before each LLM call
+            total_chars = sum(len(m.get("content", "")) for m in self.messages)
+            if total_chars > 18000:
+                yield {"type": "content", "content": "[System: Context limit reached, ending conversation turn.]"}
+                break
 
             try:
                 stream = self.client.chat(
@@ -339,8 +352,11 @@ class SpecializedAgent:
                 except Exception as e:
                     result = f"Error: {str(e)}"
 
+                result_str = str(result)
+                if len(result_str) > 2000:
+                    result_str = result_str[:2000] + f"\n... (truncated, {len(result_str)} chars total)"
                 self.messages.append({
-                    "role": "tool", "content": str(result), "name": tool_call.function.name,
+                    "role": "tool", "content": result_str, "name": tool_call.function.name,
                 })
                 yield {"type": "tool_end", "name": tool_call.function.name, "result": str(result)}
 
@@ -388,6 +404,15 @@ Decision rules (in order):
         }
 
     def analyze(self, task_context: str, memory_block: str = "", skills_block: str = "", experiences_block: str = "", routing_block: str = "") -> Dict[str, Any]:
+        # Ensure total context stays under 12000 chars to avoid context overflow
+        max_prompt_len = 12000
+        blocks = [task_context, memory_block, skills_block, experiences_block, routing_block]
+        total = sum(len(b) for b in blocks)
+        if total > max_prompt_len:
+            # Truncate task_context first, then other blocks
+            overflow = total - max_prompt_len
+            if overflow > 0 and len(task_context) > overflow + 500:
+                task_context = task_context[:-(overflow + 100)] + "\n... (truncated)"
         prompt = f"""{task_context}
 {memory_block}
 {skills_block}
@@ -519,12 +544,17 @@ class MultiAgentSystem:
         agent_has_responded = False
         needs_debug = any(w in user_input.lower() for w in ["debug", "bug", "error", "fix", "analyze", "crash"])
 
+        # Reset agent histories for fresh context each request
+        for a in self.agents.values():
+            a.messages = [a.messages[0]]
+
         # Short-circuit: for obvious patterns, skip architect entirely
         short_circuit_agent = self._short_circuit_classify(user_input)
         if short_circuit_agent and short_circuit_agent != "debugger":
             agent_key = short_circuit_agent
             agent = self.agents.get(agent_key)
             if agent:
+                agent.messages = [agent.messages[0]]
                 yield {"type": "status", "content": f"🚀 [{agent_key}] (classified)\n"}
                 for chunk in agent.chat_stream(user_input):
                     yield chunk
@@ -568,6 +598,9 @@ class MultiAgentSystem:
             instruction = intent.get("plan") or intent.get("reasoning", "Execute the next step.")
             matched_skills = match_skills(f"{instruction} {task_context}", self.skills)
             skills_block = format_skills_block(matched_skills)
+
+            # Reset agent messages before each step to prevent cross-step accumulation
+            agent.messages = [agent.messages[0]]
 
             step_output = ""
             step_tool_results = []

@@ -294,33 +294,9 @@ Return JSON:
             full_response, full_reasoning, tool_calls = "", "", []
             in_thinking, raw_buffer = False, ""
 
-            # 6. Context Retention logic (semantic)
+            # 6. Context Retention logic
             if len(self.messages) > 20:
-                q_vec = embed(user_input)
-
-                start = 2
-                end = max(start, len(self.messages) - 5)
-
-                always_keep = [self.messages[0], self.messages[1]]
-                recent = self.messages[end:]
-                candidates = self.messages[start:end]
-
-                scored = []
-                for idx, m in enumerate(candidates):
-                    content = m.get("content", "")
-                    if not content:
-                        continue
-                    try:
-                        m_vec = embed(content)
-                    except Exception:
-                        scored.append((0.0, m))
-                        continue
-                    sim = cosine_similarity(q_vec, m_vec)
-                    scored.append((sim, m))
-
-                scored.sort(key=lambda x: x[0], reverse=True)
-                top_semantic = [m for _, m in scored[:max(0, 18 - len(recent) - len(always_keep))]]
-                context_messages = always_keep + top_semantic + recent
+                context_messages = [self.messages[0], self.messages[1]] + self.messages[-18:]
             else:
                 context_messages = [m.copy() for m in self.messages]
 
@@ -488,9 +464,12 @@ Return JSON:
                     result = tool_func(**tool.function.arguments) if tool_func else "Tool not found."
                 except Exception as e: result = f"Error: {str(e)}"
                 
-                tool_msg = {'role': 'tool', 'content': str(result), 'name': tool.function.name}
+                result_str = str(result)
+                if len(result_str) > 2000:
+                    result_str = result_str[:2000] + f"\n... (truncated, {len(result_str)} chars total)"
+                tool_msg = {'role': 'tool', 'content': result_str, 'name': tool.function.name}
                 self.messages.append(tool_msg)
-                self.db.add_message(self.session_id, "tool", str(result))
+                self.db.add_message(self.session_id, "tool", result_str)
                 yield {"type": "tool_end", "name": tool.function.name, "result": str(result)}
 
         if iteration_count >= max_iterations:
