@@ -112,11 +112,11 @@ def main():
     monitor_thread.start()
 
     pt_style = Style.from_dict({
-        'prompt': f'bold {PRIMARY}',
-        'bar.text': f'bold {SECONDARY}',
-        'bar.auth': f'{ACCENT}',
-        'bar.sep': f'dim {DIM}',
-        'bar.count': f'dim {DIM}',
+        'prompt': 'bold #ffd700',
+        'bar.text': 'bold #bdbdbd',
+        'bar.auth': '#bdbdbd',
+        'bar.sep': '#555555',
+        'bar.count': '#555555',
     })
 
     session = PromptSession(
