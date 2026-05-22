@@ -362,39 +362,29 @@ class Architect:
         self.use_deepseek = os.getenv("ARCHITECT_PROVIDER", "ollama") == "deepseek"
         self.messages: List[Dict] = [{
             "role": "system",
-            "content": """You are the **Architect** — a planner that decomposes tasks and routes work to specialized agents.
+            "content": """You are the **Architect** — a senior systems designer and orchestrator. Your job is to maintain the global state of the conversation and route specific tasks to specialized agents.
 
-## Agents
-All agents have access to ALL tools (shell, files, web, memory, skills). Route based on their specialized expertise:
+## Your Responsibilities:
+1. **Context Tracking**: Always consider the ## Conversation History. Understand if the current request is a follow-up, a correction, or a new task.
+2. **State Management**: Track what has already been done in the current session. Do not repeat failed steps without a new strategy.
+3. **Decomposition**: Break complex requests into concrete, numbered plans.
+4. **Validation**: Review results from specialized agents to decide if the task is truly complete or needs further refinement.
 
-| Agent | Expertise | Use When |
-|-------|-----------|----------|
-| executor | Action-oriented | Local actions, code changes, system ops |
-| researcher | Information gathering | Research, docs, web APIs, data synthesis |
-| debugger | Root-cause analysis | Analyzing logs/errors AFTER context is gathered |
-| general | Conversation | Greetings, general advice, personal context |
+## Agents:
+All agents have access to ALL tools. Route based on their expertise:
+- **executor**: File edits, shell commands, code implementation, memory management.
+- **researcher**: Web searching, documentation gathering, information synthesis.
+- **debugger**: Root-cause analysis of errors found during execution.
+- **general**: Conversational responses, greetings, simple advice.
 
-## Pipelines (multi-step patterns)
-- **Debug**: executor(gather context) → debugger(analyze) → executor(fix)
-- **Research+Act**: researcher(investigate) → executor(implement)
-- **Direct Action**: executor(execute)
-- **Chat**: general(respond)
+## Completion Rules:
+- Set `complete:true` ONLY when the user's FULL original intent is satisfied.
+- If an agent failed but provided a partial answer that is sufficient for the user, you may complete.
+- If more steps are needed to verify a fix or polish a result, keep `complete:false`.
 
-## Plan Quality Rules
-- Plans MUST be numbered concrete steps with file paths, commands, or specific actions
-- BAD: "Fix the bug" / "Look into it"
-- GOOD: "1. Read src/main.py lines 40-60  2. Run pytest  3. Fix the logic error"
-- If previous step gave output, reference findings in the next plan
-
-## Completion Rules
-- Set complete:true ONLY when the user's FULL original request is satisfied
-- NEVER complete after debugger output — route fix to executor first
-- NEVER complete after errors — re-route or escalate
-- If an agent produced useful output that answers the user, complete
-
-## Response Format
+## Response Format:
 Return ONLY valid JSON:
-{"category": "technical|research|chat", "reasoning": "1-2 sentences", "recommended_agent": "executor|general|researcher|debugger", "plan": "numbered steps", "complete": false}""",
+{"category": "technical|research|chat", "reasoning": "Internal logic for this routing choice", "recommended_agent": "executor|general|researcher|debugger", "plan": "Numbered steps for the agent", "complete": false}""",
         }]
 
     def _prune_messages(self):
@@ -430,9 +420,9 @@ Return ONLY valid JSON:
         )
         return resp["message"]["content"].strip()
 
-    def analyze(self, task_context: str, memory_block: str = "", skills_block: str = "", experiences_block: str = "", routing_block: str = "") -> Dict[str, Any]:
+    def analyze(self, task_context: str, memory_block: str = "", skills_block: str = "", experiences_block: str = "", routing_block: str = "", history_block: str = "") -> Dict[str, Any]:
         max_prompt_len = 12000
-        blocks = [task_context, memory_block, skills_block, experiences_block, routing_block]
+        blocks = [task_context, memory_block, skills_block, experiences_block, routing_block, history_block]
         total = sum(len(b) for b in blocks)
         if total > max_prompt_len:
             overflow = total - max_prompt_len
@@ -453,6 +443,7 @@ Return ONLY valid JSON:
 
         prompt = f"""## Current State: {situation}
 
+{history_block}
 {task_context}
 {memory_block}{skills_block}{experiences_block}{routing_block}
 
@@ -460,7 +451,7 @@ Return ONLY valid JSON:
 Analyze the state above and decide the NEXT action.
 
 Routing logic:
-- {situation} == "initial": Route based on what the user asked.
+- {situation} == "initial": Route based on what the user asked, considering past turns.
 - {situation} == "error_detected": Route to debugger with the error context.
 - {situation} == "debugger_done": Route to executor to apply the debugger's fix.
 - {situation} == "mid_pipeline": Check if the user's request is fully handled. If yes, complete. If no, plan next step.
@@ -541,11 +532,15 @@ class MultiAgentSystem:
     def _format_history(self) -> str:
         if not self._conversation_history:
             return ""
-        lines = []
+        lines = ["## Conversation History"]
         for turn in self._conversation_history[-5:]:
-            lines.append(f"User: {turn['user']}")
+            lines.append(f"- User: {turn['user']}")
             if turn.get('assistant'):
-                lines.append(f"You: {turn['assistant'][:500]}")
+                # Truncate long responses but keep the core meaning
+                resp = turn['assistant']
+                if len(resp) > 500:
+                    resp = resp[:400] + "... [truncated]"
+                lines.append(f"  Assistant: {resp}")
         return "\n".join(lines) + "\n"
 
     def clear_session_history(self):
@@ -645,7 +640,7 @@ class MultiAgentSystem:
             routing_block = self._format_routing_priors(routing_priors)
 
             self._prune_architect()
-            intent = self.architect.analyze(task_context, memory_block, skills_block, routing_block=routing_block)
+            intent = self.architect.analyze(task_context, memory_block, skills_block, routing_block=routing_block, history_block=history_block)
 
             if intent.get("complete") and agent_has_responded:
                 yield {"type": "status", "content": "Done.\n"}
