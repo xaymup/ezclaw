@@ -29,15 +29,27 @@ def load_skills() -> List[Dict[str, str]]:
     return skills
 
 def match_skills(user_input: str, skills: List[Dict[str, str]]) -> List[Dict[str, str]]:
-    """Check if any skill is relevant to the user's input."""
-    matched = []
-    user_lower = user_input.lower()
-    for skill in skills:
-        skill_lower = skill['content'].lower()
-        skill_words = set(re.findall(r'\b[a-z]{4,}\b', skill_lower))
-        if any(word in user_lower for word in skill_words):
-            matched.append(skill)
-    return matched
+    """Find relevant skills using embedding similarity, fallback to keyword matching."""
+    if not skills:
+        return []
+    from embed import rank_by_similarity
+    skill_texts = [f"{s['name']}: {s['content'][:500]}" for s in skills]
+    ranked_texts = rank_by_similarity(user_input, skill_texts, top_n=3)
+    matched_names = set()
+    for rt in ranked_texts:
+        name = rt.split(":")[0]
+        matched_names.add(name)
+
+    # Fallback: keyword match if embeddings returned nothing
+    if not matched_names:
+        user_lower = user_input.lower()
+        for skill in skills:
+            skill_lower = skill['content'].lower()
+            skill_words = set(re.findall(r'\b[a-z]{4,}\b', skill_lower))
+            if any(word in user_lower for word in skill_words):
+                matched_names.add(skill['name'])
+
+    return [s for s in skills if s['name'] in matched_names]
 
 def format_skills_block(skills: List[Dict[str, str]]) -> str:
     """Format matched skills into a context block."""

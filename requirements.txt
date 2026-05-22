@@ -3,3 +3,4 @@ rich
 prompt_toolkit
 python-dotenv
 httpx
+numpy
