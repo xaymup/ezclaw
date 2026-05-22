@@ -369,27 +369,23 @@ Return valid JSON with these exact keys: category, reasoning, recommended_agent,
             intent.setdefault("reasoning", "")
             intent.setdefault("complete", False)
 
-            # Use embedding classifier for agent selection (more reliable than model's JSON)
-            from embed import classify_intent
-            embedding_agent = classify_intent(task_context)
-            intent["recommended_agent"] = embedding_agent
+            # Validate recommended_agent, fall back to executor
+            valid_agents = {"executor", "general", "researcher", "debugger"}
+            if intent.get("recommended_agent") not in valid_agents:
+                intent["recommended_agent"] = "executor"
 
             # Context-prep override: route debugger requests to executor FIRST
-            if embedding_agent == "debugger" and "--- Step" not in task_context:
+            if intent["recommended_agent"] == "debugger" and "--- Step" not in task_context:
                 intent["recommended_agent"] = "executor"
-                intent["plan"] = f"1. Read the relevant files and gather context\n2. Pass context to debugger for analysis\n\nDebug task: {task_context[:200]}"
+                intent["plan"] = f"1. Read the relevant files and gather context\n2. Pass context to debugger for analysis"
 
             self.messages.append({"role": "assistant", "content": json.dumps(intent)})
             return intent
         except Exception:
-            from embed import classify_intent
-            agent = classify_intent(task_context)
-            if agent == "debugger" and "--- Step" not in task_context:
-                agent = "executor"
             return {
                 "category": "technical",
                 "reasoning": "Continuing execution...",
-                "recommended_agent": agent,
+                "recommended_agent": "executor",
                 "plan": "",
                 "complete": False,
             }
@@ -445,8 +441,9 @@ class MultiAgentSystem:
         for step in range(1, max_steps + 1):
             yield {"type": "status", "content": f"🧠 [Architect] Step {step}: Planning...\n"}
 
-            key_facts = self.db.get_key_facts()
-            memory_block = f"\n[Known Facts]: {key_facts}\n" if key_facts else ""
+            # Search memory for facts relevant to the current conversation
+            memory_facts = self.db.search_memories(task_context[:2000])
+            memory_block = f"\n[Relevant Memories]: {memory_facts}\n" if memory_facts else ""
             matched_skills = match_skills(task_context, self.skills)
             skills_block = format_skills_block(matched_skills)
 
