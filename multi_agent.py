@@ -318,6 +318,7 @@ Based on the current state, what is the next action?
 - recommended_agent must be one of: executor, general, researcher, debugger.
 - If the user needs web info (fetch, search, lookup, research, news): use "researcher".
 - If the user wants to DO something locally (check, run, install, create, edit): use "executor".
+- If the user encountered an error, exception, bug, or needs code analysis/debugging: use "debugger".
 - If the user just chats or asks questions with no action needed: use "general".
 - ALWAYS delegate to an agent on every step. Never set complete: true unless a previous agent has already produced a response and no more work is needed.
 
@@ -459,7 +460,11 @@ class MultiAgentSystem:
 
             task_context += f"\n\n--- Step {step} ({agent_key}) ---\n{step_context}"
 
+            is_error = any(w in step_context.lower() for w in ["error", "exception", "traceback", "failed", "exit code", "not found"])
             if step_output.strip() or step_tool_results:
+                if is_error and agent_key != "debugger":
+                    yield {"type": "status", "content": "⚠️ Error detected. Re-routing to debugger.\n"}
+                    continue
                 yield {"type": "status", "content": "✅ Task complete.\n"}
                 break
 
