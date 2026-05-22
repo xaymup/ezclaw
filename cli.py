@@ -134,7 +134,7 @@ def main():
             ("\nMode: ", "bold"), (f"{'Multi-Agent' if ENABLE_MULTI_AGENT else 'Single-Agent'}", f"{SECONDARY}"),
             ("\nWorkspace: ", "bold"), ("./workspace", f"{SECONDARY}"),
             ("\n\nCommands: ", "bold"),
-            ("/diagnose, /clear, /thinking, /settings, /authorize", f"{DIM}"),
+            ("/help, /diagnose, /clear, /thinking, /settings, /authorize", f"{DIM}"),
         ),
         box=ROUNDED, padding=(1, 2), border_style=PRIMARY,
         title="[bold]EzClaw[/bold]",
@@ -167,6 +167,26 @@ def main():
                         f"**History Size:** `{history}` messages"
                     )
                     console.print(Panel(Markdown(info), title="[bold]System Settings[/bold]", border_style=SECONDARY))
+                elif cmd == "/help":
+                    help_text = (
+                        "## Commands\n\n"
+                        "| Command | Description |\n"
+                        "|---------|-------------|\n"
+                        "| `/help` | Show this help message |\n"
+                        "| `/diagnose` | Run GPU and Ollama diagnostics |\n"
+                        "| `/clear` | Clear current session history |\n"
+                        "| `/thinking [on|off]` | Toggle thinking visualization |\n"
+                        "| `/settings` | Show system settings |\n"
+                        "| `/authorize` | Toggle session-wide tool authorization |\n"
+                        "| `/last` | View last tool's full output in pager |\n"
+                        "| `exit` / `quit` | Exit EzClaw |\n\n"
+                        "## Tips\n\n"
+                        "- Type naturally — the agent routes to the right tools automatically\n"
+                        "- Use memory naturally (\"remember my location is...\" or \"what's my...\")\n"
+                        "- Skills in `skills/` are auto-loaded and matched to your requests\n"
+                        "- Scheduled tasks in `heartbeat.md` are checked every 30s"
+                    )
+                    console.print(Panel(Markdown(help_text), title="[bold]EzClaw Help[/bold]", border_style=PRIMARY))
                 elif cmd == "/diagnose":
                     run_diagnostics()
                 elif cmd == "/clear":
