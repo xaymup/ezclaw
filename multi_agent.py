@@ -429,9 +429,10 @@ class MultiAgentSystem:
                 yield {"type": "status", "content": "✅ Task complete.\n"}
                 break
 
+            plan = intent.get("plan") or intent.get("reasoning", "") or "Executing task..."
             yield {
                 "type": "reasoning",
-                "content": f"Plan: {intent.get('plan', 'N/A')}\nDelegating to: {agent_key} ({agent.model})\n",
+                "content": f"Plan: {plan}\nDelegating to: {agent_key} ({agent.model})\n",
             }
             yield {"type": "status", "content": f"🚀 [{agent_key}]\n"}
 
