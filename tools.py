@@ -304,4 +304,14 @@ def create_memory_tools(db: Any):
         if not deleted: return f"No memories found matching '{query}' to forget."
         return "Deleted memories:\n- " + "\n- ".join(deleted)
 
-    return remember, recall, forget
+@registry.register
+def delegate(agent_key: str, instruction: str) -> str:
+    """
+    Delegate a task to another agent. Use when you need capabilities outside your scope.
+    agent_key: one of executor, researcher, debugger, general
+    instruction: exactly what the target agent should do
+    """
+    allowed = ("executor", "researcher", "debugger", "general")
+    if agent_key not in allowed:
+        return f"Error: agent_key must be one of {allowed}"
+    return f"[DELEGATE:{agent_key}]{instruction}[/DELEGATE]"

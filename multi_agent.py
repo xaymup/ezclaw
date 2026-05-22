@@ -23,12 +23,15 @@ Rules:
 - For greetings or simple chat, just respond directly without tools.
 - Use relative paths for file operations.
 - Use web_fetch for news, web searches, documentation lookups, and online information.
-- Use interactive=True ONLY for editors/REPLs/ssh (vim, python, etc).""",
+- Use interactive=True ONLY for editors/REPLs/ssh (vim, python, etc).
+- **Proactive fixing**: When the debugger or architect provides a fix plan, implement it immediately using write_file, run_shell, etc. Do NOT ask the user for permission — just do it.
+- **File analysis**: Read files first to understand their content before making changes. Use read_file to verify the current state, then write_file to apply targeted edits.""",
         "tools": [
             "run_shell", "read_file", "write_file", "list_dir",
             "web_fetch", "schedule_task",
             "learn_skill", "get_skill", "list_skills",
             "remember", "recall", "forget",
+            "delegate",
         ],
     },
     "researcher": {
@@ -43,6 +46,7 @@ Rules:
             "web_fetch", "schedule_task",
             "list_skills", "get_skill",
             "remember", "recall", "forget",
+            "delegate",
         ],
     },
     "debugger": {
@@ -53,11 +57,13 @@ Rules:
 - Respond in plain natural text. NEVER output JSON.
 - Use read_file to examine code, run_shell to reproduce errors and test fixes.
 - Explain root causes clearly before proposing fixes.
-- Suggest minimal, targeted fixes.""",
+- Suggest minimal, targeted fixes.
+- Use delegate() to request another agent execute tasks outside your scope (e.g. delegate to executor to apply a fix, or delegate to researcher to look up documentation).""",
         "tools": [
             "run_shell", "read_file", "write_file", "list_dir",
             "web_fetch",
             "remember", "recall", "forget",
+            "delegate",
         ],
     },
     "general": {
@@ -296,15 +302,22 @@ Agents:
 - debugger: Code analysis, bug finding, logic verification, reviewing code for errors.
 - general: Conversation, greetings, chitchat, opinions, Q&A. ONLY for pure talk with no action needed.
 
+Pipeline rules:
+- Context Prep → Debugger: Before debugging, route to executor FIRST to read files, run diagnostics, and prepare context. The executor can use tools — the debugger cannot.
+- Debugger → Executor: After the debugger produces a fix, route to executor to apply it.
+- Never mark complete after the debugger — send its fix to executor for implementation.
+- **plan field**: Must contain concrete step-by-step actions the next agent should take (e.g. "1. Read file X 2. Add constant 3. Apply fix to line Y").
+
 Decision rules (in order):
 1. Does the user want info from the web (fetch, search, lookup, research, news)? → use researcher.
-2. Code analysis, debugging, finding bugs? → use debugger.
-3. Does the user want to DO something locally (check, run, install, create, edit, get, send, weather)? → use executor.
-4. Is it pure conversation (hello, how are you, opinions, thanks)? → use general.
-5. Otherwise: is there an action to take? If yes → executor. If no → general.
+2. Code analysis, debugging, finding bugs? → use executor FIRST (read files, gather context). The debugger will analyze afterward.
+3. After debugger output, apply its fix? → use executor.
+4. Does the user want to DO something locally (check, run, install, create, edit, get, send, weather)? → use executor.
+5. Is it pure conversation (hello, how are you, opinions, thanks)? → use general.
+6. Otherwise: is there an action to take? If yes → executor. If no → general.
 - You will receive [Known Facts] from memory and <available_skills> with procedures. Use them to decide the best plan.
 - recommended_agent must be one of: executor, general, researcher, debugger.
-- Set complete: true only after an agent has produced a response and no more work is needed.
+- Set complete: true only after all work is done and no more agents need to run.
 - Respond in JSON with these exact keys: category, reasoning, recommended_agent, plan, complete""",
         }]
         self.options = {
@@ -322,12 +335,15 @@ Based on the current state, what is the next action?
 - recommended_agent must be one of: executor, general, researcher, debugger.
 - If the user needs web info (fetch, search, lookup, research, news): use "researcher".
 - If the user wants to DO something locally (check, run, install, create, edit): use "executor".
-- If the user encountered an error, exception, bug, or needs code analysis/debugging: use "debugger".
+- If the user encountered an error, exception, bug, or needs code analysis/debugging: use "executor" FIRST to gather context (read files, run diagnostics). The debugger will analyze afterward.
+- DEBUGGER→EXECUTOR PIPELINE: If the debugger just produced a fix or analysis suggesting code changes, ALWAYS route to executor next to apply that fix.
+- Never set complete: true after the debugger — its output needs to be implemented by the executor.
+- When routing to executor, the `plan` field MUST contain concrete step-by-step actions (e.g. "1. Read file 2. Add missing constant 3. Apply edit to line X").
 - If the user just chats or asks questions with no action needed: use "general".
-- ALWAYS delegate to an agent on every step. Never set complete: true unless a previous agent has already produced a response and no more work is needed.
+- ALWAYS delegate to an agent on every step. Never set complete: true unless no more work is needed.
 
 Return valid JSON with these exact keys: category, reasoning, recommended_agent, plan, complete
-{{"category": "technical|research|creative|chat", "reasoning": "why", "recommended_agent": "executor|general|researcher|debugger", "plan": "description of next action", "complete": false}}"""
+{{"category": "technical|research|creative|chat", "reasoning": "why you chose this agent", "recommended_agent": "executor|general|researcher|debugger", "plan": "concrete step-by-step actions for the agent", "complete": false}}"""
         try:
             response = self.client.chat(
                 model=self.model,
@@ -413,6 +429,7 @@ class MultiAgentSystem:
         max_steps = 5
         loop_hashes = set()
         agent_has_responded = False
+        needs_debug = any(w in user_input.lower() for w in ["debug", "bug", "error", "fix", "analyze", "crash"])
 
         for step in range(1, max_steps + 1):
             yield {"type": "status", "content": f"🧠 [Architect] Step {step}: Planning...\n"}
@@ -441,7 +458,7 @@ class MultiAgentSystem:
             }
             yield {"type": "status", "content": f"🚀 [{agent_key}]\n"}
 
-            instruction = intent.get("reasoning", "Execute the next step.")
+            instruction = intent.get("plan") or intent.get("reasoning", "Execute the next step.")
             matched_skills = match_skills(f"{instruction} {task_context}", self.skills)
             skills_block = format_skills_block(matched_skills)
 
@@ -456,6 +473,32 @@ class MultiAgentSystem:
                     step_tool_results.append(f"  [{chunk['name']}]: {str(chunk['result'])[:500]}")
                 yield chunk
 
+            # Check for delegation request in tool results
+            delegate_match = None
+            for r in step_tool_results:
+                m = re.search(r'\[DELEGATE:(\w+)\](.*?)\[/DELEGATE\]', r)
+                if m:
+                    delegate_match = (m.group(1), m.group(2))
+                    break
+
+            if delegate_match:
+                target_key, delegate_instruction = delegate_match
+                target_agent = self.agents.get(target_key)
+                if target_agent:
+                    yield {"type": "status", "content": f"🔄 {agent_key} delegated to {target_key}\n"}
+                    task_context += f"\n\n--- Delegation: {agent_key} → {target_key} ---\n{delegate_instruction}"
+                    step_output = ""
+                    step_tool_results = []
+                    for chunk in target_agent.chat_stream(
+                        f"{skills_block}{delegate_instruction}\n\nContext: {task_context}"
+                    ):
+                        if chunk["type"] == "content":
+                            step_output += chunk["content"]
+                        elif chunk["type"] == "tool_end":
+                            step_tool_results.append(f"  [{chunk['name']}]: {str(chunk['result'])[:500]}")
+                        yield chunk
+                    agent_key = target_key
+
             agent_has_responded = bool(step_output.strip() or step_tool_results)
 
             step_context = step_output[:4000]
@@ -464,10 +507,19 @@ class MultiAgentSystem:
 
             task_context += f"\n\n--- Step {step} ({agent_key}) ---\n{step_context}"
 
+            is_debugger_output = agent_key == "debugger" and step_output.strip()
             is_error = any(w in step_context.lower() for w in ["error", "exception", "traceback", "failed", "exit code", "not found"])
+            debugger_has_run = "--- Step" in task_context and "debugger" in task_context[task_context.rfind("--- Step"):]
+            is_context_prep = needs_debug and not debugger_has_run and agent_key == "executor" and step_output.strip()
             if step_output.strip() or step_tool_results:
                 if is_error and agent_key != "debugger":
                     yield {"type": "status", "content": "⚠️ Error detected. Re-routing to debugger.\n"}
+                    continue
+                if is_debugger_output:
+                    yield {"type": "status", "content": "🔧 Debugger produced a fix. Routing to executor to apply...\n"}
+                    continue
+                if is_context_prep:
+                    yield {"type": "status", "content": "📄 Context prepared. Routing to debugger for analysis...\n"}
                     continue
                 yield {"type": "status", "content": "✅ Task complete.\n"}
                 break
