@@ -64,11 +64,11 @@ class Database:
             conn.commit()
 
     def search_memories(self, query: str) -> List[str]:
-        """Simple and robust keyword-based memory search."""
-        # Only filter out very common short words
-        stop_words = {'what', 'when', 'is', 'the', 'how', 'many', 'of', 'a', 'an', 'and', 'for', 'with'}
-        words = [w.strip().lower() for w in query.replace('?', '').replace('.', '').split() 
-                 if w.lower() not in stop_words and len(w) >= 2]
+        """Refined keyword-based memory search with relevance filtering."""
+        stop_words = {'what', 'when', 'is', 'the', 'how', 'many', 'of', 'a', 'an', 'and', 'for', 'with', 'about', 'tell', 'me', 'you', 'your', 'my'}
+        # Filter and normalize keywords
+        words = [w.strip().lower() for w in query.replace('?', '').replace('.', '').replace(',', '').split() 
+                 if w.lower() not in stop_words and len(w) >= 3]
         
         if not words:
             return []
@@ -76,38 +76,50 @@ class Database:
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
             
-            # Search for each word and collect matches
-            all_matches = []
+            fact_scores = {}
             for word in words:
+                # Search for word and award points based on match type
                 cursor.execute("SELECT fact FROM memories WHERE fact LIKE ? OR tags LIKE ?", (f"%{word}%", f"%{word}%"))
-                all_matches.extend([row[0] for row in cursor.fetchall()])
+                for (fact,) in cursor.fetchall():
+                    # Higher score for facts that match multiple keywords
+                    fact_scores[fact] = fact_scores.get(fact, 0) + 1
             
-            if not all_matches:
+            if not fact_scores:
                 return []
             
-            # Score by frequency of keyword matches
-            fact_counts = {}
-            for fact in all_matches:
-                fact_counts[fact] = fact_counts.get(fact, 0) + 1
+            # RELEVANCE FILTERING:
+            # For queries with 3+ keywords, require at least 2 matches to be considered "relevant"
+            min_score = 2 if len(words) >= 3 else 1
             
-            # Sort by frequency (most matches first) and deduplicate
-            sorted_facts = sorted(fact_counts.items(), key=lambda x: x[1], reverse=True)
-            return [f[0] for f in sorted_facts[:10]]
+            filtered_facts = [
+                (fact, score) for fact, score in fact_scores.items() 
+                if score >= min_score
+            ]
+            
+            if not filtered_facts:
+                # Fallback to top match if everything was filtered out but we had potential matches
+                filtered_facts = sorted(fact_scores.items(), key=lambda x: x[1], reverse=True)[:1]
+
+            # Sort by score (descending) and then by length (shorter facts often more precise)
+            sorted_facts = sorted(filtered_facts, key=lambda x: (-x[1], len(x[0])))
+            
+            return [f[0] for f in sorted_facts[:5]] # Limit to top 5 for higher signal
 
     def get_key_facts(self) -> List[str]:
-        """Retrieve most important and recent facts to provide context baseline."""
+        """Retrieve a focused baseline of critical context."""
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
-            # Combine specifically tagged 'important' facts and the 15 most recent ones
+            # Restore location as a high-value fact
             cursor.execute("""
                 SELECT fact FROM memories 
-                WHERE tags LIKE '%key%' OR tags LIKE '%important%' OR tags LIKE '%location%' 
+                WHERE tags LIKE '%key%' OR tags LIKE '%important%' 
                 OR tags LIKE '%user_name%' OR tags LIKE '%birthday%'
+                OR tags LIKE '%location%' OR tags LIKE '%city%'
                 UNION
-                SELECT fact FROM (SELECT fact FROM memories ORDER BY created_at DESC LIMIT 15)
+                SELECT fact FROM (SELECT fact FROM memories ORDER BY created_at DESC LIMIT 5)
             """)
             results = [row[0] for row in cursor.fetchall()]
-            return list(set(results))[:15]
+            return list(set(results))[:10] # Slightly increase to 10 for better baseline
 
     def delete_memory(self, query: str) -> List[str]:
         """Delete memories matching the query keywords. Returns list of deleted facts."""

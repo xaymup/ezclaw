@@ -22,6 +22,51 @@ class ToolRegistry:
         self.tools[func.__name__] = func
         return func
 
+    def get_tool_definitions(self) -> List[Dict[str, Any]]:
+        """
+        Generate Ollama-compatible tool definitions for all registered tools.
+        """
+        definitions = []
+        for name, func in self.tools.items():
+            sig = inspect.signature(func)
+            doc = func.__doc__.strip() if func.__doc__ else "No description provided."
+            
+            # Simple docstring parsing: use first line as description
+            description = doc.split("\n")[0].strip()
+            
+            parameters = {
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+            
+            for param_name, param in sig.parameters.items():
+                # Map Python types to JSON Schema types
+                p_type = "string"
+                if param.annotation == int: p_type = "integer"
+                elif param.annotation == bool: p_type = "boolean"
+                elif param.annotation == float: p_type = "number"
+                elif param.annotation == list: p_type = "array"
+                elif param.annotation == dict: p_type = "object"
+                
+                parameters["properties"][param_name] = {
+                    "type": p_type,
+                    "description": f"Parameter {param_name}"
+                }
+                
+                if param.default is inspect.Parameter.empty:
+                    parameters["required"].append(param_name)
+            
+            definitions.append({
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": description,
+                    "parameters": parameters
+                }
+            })
+        return definitions
+
     def get_tool_functions(self) -> List[Callable]:
         return list(self.tools.values())
 
@@ -41,24 +86,72 @@ def clean_html(html: str) -> str:
     return text
 
 def get_workspace_path(path: str) -> str:
-    """Ensure path is within the workspace directory."""
-    # Prevent directory traversal
-    safe_path = path.lstrip("./").lstrip("/")
-    return os.path.join(WORKSPACE_DIR, safe_path)
+    """Ensure path is within the workspace directory and prevent escapes."""
+    # Convert to absolute path for the workspace
+    base_dir = os.path.abspath(WORKSPACE_DIR)
+    
+    # If the model provides a path already containing the workspace dir, strip it
+    # This fixes double-prefixing like workspace/workspace/file.py
+    norm_path = os.path.normpath(path)
+    
+    # If it's an absolute path that starts with our base_dir, it's already "safe"
+    # but we should still normalize it.
+    if os.path.isabs(norm_path):
+        if norm_path.startswith(base_dir):
+            return norm_path
+        # If it's an absolute path outside workspace, strip the root to make it relative
+        norm_path = norm_path.lstrip(os.path.sep)
+    
+    # Remove any redundant workspace prefix from the relative path
+    rel_parts = norm_path.split(os.path.sep)
+    if rel_parts and rel_parts[0] == WORKSPACE_DIR:
+        norm_path = os.path.sep.join(rel_parts[1:])
+    
+    # Join and ensure final path is within base_dir
+    final_path = os.path.abspath(os.path.join(base_dir, norm_path))
+    
+    if not final_path.startswith(base_dir):
+        # Fallback to just the filename if something went wrong or traversal was attempted
+        return os.path.join(base_dir, os.path.basename(norm_path))
+        
+    return final_path
 
 @registry.register(auth_required=True)
 def run_shell(command: str, interactive: bool = False) -> str:
     """
     Execute a shell command. 
-    Set interactive=True for commands that need user input (e.g. ssh, apt, manual confirmation).
+    Use interactive=True ONLY for commands that require user input (like 'vim', 'ssh', 'python' repl) or are full-screen apps (like 'top').
+    For 'ls', 'grep', 'cat', etc., keep interactive=False for faster, cleaner output.
     """
     try:
-        if interactive:
-            # Run in foreground, using same stdin/out
-            result = subprocess.run(command, shell=True, capture_output=False, text=True)
-            return f"Interactive command '{command}' completed."
+        if interactive and os.name != 'nt':
+            import pty
+            import sys
+            
+            output_data = []
+            def read(fd):
+                data = os.read(fd, 1024)
+                if data:
+                    os.write(sys.stdout.fileno(), data)
+                output_data.append(data)
+                return data
+
+            # Use pty.spawn to maintain a real terminal for interactive apps
+            pty.spawn(['/bin/sh', '-c', command], read)
+            
+            full_output = b"".join(output_data).decode('utf-8', errors='ignore')
+            # Strip common terminal escape sequences
+            clean_output = re.sub(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])', '', full_output)
+            return clean_output or "Command completed with no output."
         
-        result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=60)
+        # Fallback for non-interactive or Windows
+        result = subprocess.run(
+            command, 
+            shell=True, 
+            capture_output=True, 
+            text=True, 
+            timeout=120 if interactive else 60
+        )
         output = result.stdout
         if result.stderr:
             output += f"\nErrors:\n{result.stderr}"

@@ -16,6 +16,7 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.styles import Style
 from agent import ChatAgent
+from multi_agent import MultiAgentSystem
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -24,6 +25,7 @@ console = Console()
 
 # Global state
 SHOW_THINKING = os.getenv("SHOW_THINKING", "true").lower() == "true"
+ENABLE_MULTI_AGENT = os.getenv("ENABLE_MULTI_AGENT", "false").lower() == "true"
 
 def heartbeat_monitor():
     """Background thread for scheduled tasks."""
@@ -79,7 +81,7 @@ def main():
 
     style = Style.from_dict({'prompt': 'bold magenta'})
     session = PromptSession(history=FileHistory(os.path.expanduser("~/.ezclaw_history")), style=style)
-    agent = ChatAgent()
+    agent = MultiAgentSystem() if ENABLE_MULTI_AGENT else ChatAgent()
     tool_executions = []
     
     console.print(Panel(

@@ -33,11 +33,8 @@ def match_skills(user_input: str, skills: List[Dict[str, str]]) -> List[Dict[str
     matched = []
     user_lower = user_input.lower()
     for skill in skills:
-        # Check if skill description or procedure keywords match the input
         skill_lower = skill['content'].lower()
-        # Extract key terms from skill (words that aren't common stop words)
         skill_words = set(re.findall(r'\b[a-z]{4,}\b', skill_lower))
-        # Check if any significant skill words appear in user input
         if any(word in user_lower for word in skill_words):
             matched.append(skill)
     return matched
@@ -68,7 +65,7 @@ class ChatAgent:
         }
         
         create_memory_tools(self.db)
-        self.tools = registry.get_tool_functions()
+        self.tools = registry.get_tool_definitions()
         self.skills = load_skills()
         self.skill_descriptions = "\n".join([f"- {s['name']}: {s['content'].split('## Description')[1].split('##')[0].strip() if '## Description' in s['content'] else 'No description'}" for s in self.skills])
         
@@ -96,55 +93,119 @@ class ChatAgent:
 
     def _process_intent(self, user_input: str) -> Dict[str, Any]:
         """
-        Context Augmentor: Uses deep reasoning to identify what personal context 
-        is missing OR relevant from the prompt to fulfill the user's intent,
-        and if a web search is required for accuracy or clarification.
+        Context Augmentor: Unifies persona, capabilities, and memory retrieval.
+        Uses robust extraction to work with any model (reasoning, markdown, etc.).
         """
         key_facts = self.db.get_key_facts()
         
-        prompt = f"""You are a Context Augmentor. Your goal is to identify if the user's input can be "improved" by using information from their long-term memory OR if it requires a web search for current accuracy, debugging, or clarification.
+        tool_info = []
+        for t in self.tools:
+            name = t['function']['name']
+            desc = t['function']['description']
+            tool_info.append(f"- {name}: {desc}")
+        tool_str = "\n".join(tool_info)
 
-[Key Facts already in mind]: {key_facts}
+        prompt = f"""You are analyzing a user request as part of your persona's "Search-First Analysis Protocol".
+Your goal is to identify if the request can be "improved", personalized, or successfully executed by retrieving context from your long-term memory or using tools.
+
+[Known Facts]: {key_facts}
+
+[Available Tools]:
+{tool_str}
+
+[Available Skills]:
+{self.skill_descriptions}
 
 User Input: "{user_input}"
 
-Instructions:
-1. Memory: If a fact from memory is RELEVANT, set "memory": true.
-2. Search: If the prompt contains a technical error, a software bug, an obscure term, or a dynamic topic (news, versions), set "search": true and provide a "search_q".
-3. Clarification: If the prompt is vague but could be clarified by a quick web search (e.g., unfamiliar acronyms or products), set "search": true.
+Your priority is to determine if you have ALL the information needed to answer the user perfectly. 
+If the user mentions names, locations, past projects, preferences, or specific tasks that imply previous context (e.g., "my website", "the draft we made", "my favorite X"), you MUST trigger a memory recall.
 
-Return a valid JSON object:
-- "reasoning": Your analysis.
-- "memory": bool, true if memory context should be used.
-- "memory_q": search query for memory or null.
-- "search": bool, true if a web search is RECOMMENDED or MANDATORY.
-- "search_q": search query for web_fetch or null.
-- "facts": list of new facts to store.
-- "skill": skill name or null.
+Instructions:
+1. Intent: Identify the core goal. Does it require a tool?
+   - For `run_shell`: Only set `interactive: true` for commands that NEED it (vim, ssh). For `ls`, `cat`, etc., use `interactive: false`.
+   - For file tools (`read_file`, `write_file`, etc.): ALWAYS use relative paths. Do NOT prefix paths with 'workspace/' or use absolute paths.
+2. Gap Analysis: Compare the request against [Known Facts]. Is there a missing piece of context that might be in your long-term memory?
+3. Memory Trigger: Set "memory": true if there is ANY chance that past interactions or stored facts could help provide a better, more personalized response.
+4. Semantic Query: If "memory" is true, write a query optimized for finding the MISSING context (e.g., if you need a city for weather, query "user location or city"). Do NOT just repeat the user's prompt.
+
+Return ONLY a valid JSON object. 
+Example: {{"reasoning": "User asked for weather but city is missing from [Known Facts]. Searching memory for location.", "memory": true, "memory_q": "user city and location", "facts": [], "skill": null}}
 
 JSON:"""
-        try:
-            response = self.client.chat(
-                model=self.model,
-                messages=[{"role": "user", "content": prompt}],
-                format="json",
-                options={"temperature": 0.0, "num_ctx": 4096, "num_predict": 200}
-            )
-            intent = json.loads(response["message"]["content"].strip())
-            
-            if intent.get("memory") and not intent.get("memory_q"):
-                intent["memory_q"] = user_input
+        
+        # Self-Correction Loop for Intent Analysis
+        for attempt in range(2):
+            try:
+                response = self.client.chat(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": self.system_prompt},
+                        {"role": "user", "content": prompt if attempt == 0 else prompt + "\n\nCRITICAL: Your previous response was not valid JSON. Return ONLY the JSON object."}
+                    ],
+                    format="json",
+                    options={"temperature": 0.0, "num_ctx": 4096, "num_predict": 300}
+                )
+                content = response["message"]["content"].strip()
                 
-            return intent
+                # ROBUST EXTRACTION:
+                # 1. Strip reasoning/thinking tags (even unclosed ones)
+                content = re.sub(r'<(think|thought|reasoning)\b[^>]*>.*?(</\1>|$)', '', content, flags=re.DOTALL | re.IGNORECASE)
+                
+                # 2. Extract content between first { and last }
+                match = re.search(r'(\{.*\})', content, re.DOTALL)
+                if match:
+                    content = match.group(1)
+                
+                # 3. Clean up common LLM JSON hallucinations
+                content = re.sub(r',\s*\}', '}', content) 
+                content = re.sub(r',\s*\]', ']', content)
+                
+                intent = json.loads(content)
+                
+                # Ensure memory_q exists if memory is triggered
+                if intent.get("memory") and not intent.get("memory_q"):
+                    intent["memory_q"] = user_input
+                    
+                return intent
+            except Exception:
+                if attempt == 1:
+                    # Final fallback if even self-correction fails
+                    return {"memory": False, "memory_q": None, "facts": [], "skill": None}
+                continue
+
+    def _judge_response(self, user_input: str, response: str, reasoning: str) -> Dict[str, Any]:
+        prompt = f"""Evaluate the quality of this response.
+
+User Request: "{user_input}"
+
+Agent's Response: "{response}"
+
+Agent's Reasoning: "{reasoning[:500] if reasoning else 'N/A'}"
+
+Criteria:
+1. Completeness: Does it fully address the request?
+2. Correctness: Is the information accurate?
+3. Clarity: Is it well-structured?
+4. Actionability: Does it provide concrete help?
+
+Return JSON:
+{{"score": 1-10, "needs_improvement": bool, "feedback": "what to improve"}}"""
+        try:
+            res = self.client.chat(model=self.model, messages=[{"role": "user", "content": prompt}], format="json", options={"temperature": 0.0, "num_ctx": 4096, "num_predict": 300})
+            content = res["message"]["content"].strip()
+            match = re.search(r'(\{.*\})', content, re.DOTALL)
+            if match: content = match.group(1)
+            return json.loads(content)
         except Exception:
-            return {"memory": False, "memory_q": None, "search": False, "search_q": None, "facts": [], "skill": None}
+            return {"score": 10, "needs_improvement": False, "feedback": ""}
 
     def clear_session_history(self):
         """Restores the chat history to just the system prompt."""
         self.messages = [{"role": "system", "content": self.system_prompt}]
 
     def chat_stream(self, user_input: str) -> Iterator[Dict[str, Any]]:
-        # 1. Fast consolidated intent analysis
+        # 1. Consolidated intent analysis with full agent context
         intent = self._process_intent(user_input)
 
         # 2. Process extracted facts immediately
@@ -153,45 +214,7 @@ JSON:"""
                 self.db.add_memory(fact)
                 yield {"type": "memory_stored", "fact": fact}
 
-        # 3. Reasoning Supervisor (The Architect)
-        # Use phi4-reasoning to plan the approach based on global context
-        supervisor_model = "phi4-reasoning:plus"
-        yield {"type": "content", "content": f"🧠 [Supervisor: Architect ({supervisor_model})]\n"}
-        
-        # Prepare context for the supervisor
-        if len(self.messages) > 20:
-            context_messages = [self.messages[0], self.messages[1]] + self.messages[-18:]
-        else:
-            context_messages = [m.copy() for m in self.messages]
-
-        # 4. Supervisor creates a Plan/Context for the specialized agent
-        planning_messages = context_messages + [{"role": "user", "content": f"You are the Supervisor. Provide a concise execution plan for this request: {user_input}"}]
-        
-        supervisor_plan = ""
-        try:
-            plan_response = self.client.chat(model=supervisor_model, messages=planning_messages, options={"temperature": 0.0, "num_predict": 300})
-            supervisor_plan = plan_response["message"]["content"]
-            yield {"type": "reasoning", "content": f"Supervisor Plan: {supervisor_plan}\n"}
-        except Exception as e:
-            supervisor_plan = f"Proceed with standard execution. Error in supervisor: {str(e)}"
-
-        # 5. Dynamic Model Selection (Sub-Agents)
-        selected_model = self.model
-        agent_label = "Generalist"
-        
-        if intent.get("search"):
-            selected_model = "qwen3.5:9b"
-            agent_label = "Researcher"
-        elif "error" in user_input.lower() or "bug" in user_input.lower() or "fix" in user_input.lower():
-            selected_model = "deepseek-r1:14b"
-            agent_label = "Debugger"
-        elif "code" in user_input.lower() or "script" in user_input.lower():
-            selected_model = "qwen2.5-coder:14b"
-            agent_label = "Coder"
-            
-        yield {"type": "content", "content": f"🛠️ [Executing: {agent_label} ({selected_model})]\n"}
-
-        # 6. Memory recall & Context Augmentation
+        # 3. Memory recall & Context Augmentation
         memory_block = ""
         if intent.get("memory"):
             query = intent.get("memory_q") or user_input
@@ -200,16 +223,7 @@ JSON:"""
                 memory_block = f"\n[Background Context retrieved from Memory for this request]:\n" + "\n".join([f"- {m}" for m in memories]) + "\n"
                 yield {"type": "context_augmented", "memories": memories}
 
-        # 7. Search recommendation
-        search_nudge = ""
-        if intent.get("search"):
-            sq = intent.get("search_q") or user_input
-            search_nudge = f"\n[Proactive Search Recommended]: Use `web_fetch` to research: '{sq}'. This is flagged for current accuracy or clarification.\n"
-
-        # 8. Supervisor Context Injection
-        supervisor_block = f"\n[Supervisor's Execution Plan]:\n{supervisor_plan}\n"
-
-        # 9. Skill matching
+        # 4. Skill matching
         skill_name = intent.get("skill")
         matched_skills = []
         if skill_name:
@@ -220,13 +234,13 @@ JSON:"""
         
         skills_block = format_skills_block(matched_skills)
 
-        # 10. History & Augmentation
+        # 5. History & Augmentation
         self.messages.append({"role": "user", "content": user_input})
         self.db.add_message(self.session_id, "user", user_input)
         
-        # Nudge the model to follow the CoT protocol from agents.md
+        # Nudge the model to follow the CoT protocol
         cot_nudge = "\n[System Reminder]: Follow the MANDATORY CHAIN OF THOUGHT protocol using <think> tags as defined in your persona."
-        user_msg_augmented_content = f"{memory_block}{skills_block}{search_nudge}{supervisor_block}{cot_nudge}\n[User Prompt]: {user_input}"
+        augment_prefix = f"{memory_block}{skills_block}{cot_nudge}\n[User Prompt]: "
 
         iteration_count = 0
         max_iterations = 15 
@@ -243,16 +257,31 @@ JSON:"""
             else:
                 context_messages = [m.copy() for m in self.messages]
             
-            # Find the LAST user message and augment it
+            # Augment the current request message (prepend augment block)
             for i in range(len(context_messages) - 1, -1, -1):
                 if context_messages[i]["role"] == "user":
-                    context_messages[i]["content"] = user_msg_augmented_content
+                    if not context_messages[i]["content"].startswith(augment_prefix):
+                        context_messages[i]["content"] = augment_prefix + context_messages[i]["content"]
                     break
 
-            stream = self.client.chat(model=selected_model, messages=context_messages, tools=self.tools, options=self.options, keep_alive=self.keep_alive, stream=True)
+            try:
+                stream = self.client.chat(model=self.model, messages=context_messages, tools=self.tools, options=self.options, keep_alive=self.keep_alive, stream=True)
+                # Test first chunk to see if it works
+                first_chunk = next(stream)
+            except Exception as e:
+                # If tool calling is not supported, fallback to standard chat
+                if "does not support tools" in str(e).lower() or "400" in str(e):
+                    stream = self.client.chat(model=self.model, messages=context_messages, options=self.options, keep_alive=self.keep_alive, stream=True)
+                    first_chunk = next(stream)
+                else:
+                    raise e
 
-            for chunk in stream:
-                # Handle dedicated reasoning field (e.g. DeepSeek-R1)
+            def stream_with_first(s, f):
+                yield f
+                for c in s:
+                    yield c
+
+            for chunk in stream_with_first(stream, first_chunk):
                 reasoning = getattr(chunk.message, 'reasoning', None) or (chunk.message.get('reasoning') if isinstance(chunk.message, dict) else None)
                 if reasoning:
                     full_reasoning += reasoning
@@ -263,7 +292,6 @@ JSON:"""
                     
                     while True:
                         if not in_thinking:
-                            # Permissive search for opening tag
                             match = re.search(r'<(think|thought|reasoning)\b[^>]*>', raw_buffer, re.IGNORECASE)
                             if match:
                                 pre = raw_buffer[:match.start()]
@@ -274,7 +302,6 @@ JSON:"""
                                 raw_buffer = raw_buffer[match.end():]
                                 continue
                             
-                            # Check for partial tag start
                             if '<' in raw_buffer:
                                 last_bracket = raw_buffer.rfind('<')
                                 if any(tag.startswith(raw_buffer[last_bracket:].lower()) for tag in ["<think", "<thought", "<reasoning"]):
@@ -296,7 +323,6 @@ JSON:"""
                                     raw_buffer = ""
                                 break
                         else:
-                            # Search for closing tag
                             match = re.search(r'</(think|thought|reasoning)\s*>', raw_buffer, re.IGNORECASE)
                             if match:
                                 pre = raw_buffer[:match.start()]
@@ -309,7 +335,7 @@ JSON:"""
                             
                             if '</' in raw_buffer:
                                 last_bracket = raw_buffer.rfind('</')
-                                if any(tag.startswith(raw_buffer[last_bracket:].lower()) for tag in ["</think", "</thought", "</reasoning"]):
+                                if any(tag.startswith(raw_buffer[last_bracket:].lower()) for tag in ["</think>", "</thought>", "</reasoning"]):
                                     pre = raw_buffer[:last_bracket]
                                     if pre:
                                         full_reasoning += pre
@@ -330,7 +356,6 @@ JSON:"""
                 
                 if chunk.message.tool_calls: tool_calls.extend(chunk.message.tool_calls)
 
-            # Flush any remaining buffer at the end of stream
             if raw_buffer:
                 if in_thinking:
                     full_reasoning += raw_buffer
@@ -340,7 +365,6 @@ JSON:"""
                     yield {"type": "content", "content": raw_buffer}
                 raw_buffer = ""
 
-            # 7. Repeat Checker
             current_hash = hash(str([(t.function.name, t.function.arguments) for t in tool_calls]))
             if tool_calls and current_hash == last_tool_hash:
                 yield {"type": "content", "content": "\n[System: Loop detected. Stopping.]"}
@@ -348,23 +372,16 @@ JSON:"""
             last_tool_hash = current_hash
 
             if not tool_calls:
-                # If we have content, we're done.
                 if full_response.strip() or full_reasoning.strip():
                     msg = {"role": "assistant", "content": full_response}
                     if full_reasoning: msg["reasoning"] = full_reasoning
                     self.messages.append(msg)
                     self.db.add_message(self.session_id, "assistant", full_response)
                     break
-                
-                # If it's a follow-up turn and we have NO content and NO tools, the model might be stuck.
-                # We nudge it to finish.
-                if iteration_count > 1:
-                    self.messages.append({"role": "user", "content": "(continue)"})
-                    continue
-                else:
-                    break
+                yield {"type": "content", "content": "[System: No response generated. Retrying...]"}
+                self.messages.append({"role": "user", "content": "(continue)"})
+                continue
 
-            # 8. Process Tools
             self.messages.append({"role": "assistant", "content": full_response, "tool_calls": [{"function": {"name": t.function.name, "arguments": t.function.arguments}} for t in tool_calls]})
             self.db.add_message(self.session_id, "assistant", full_response, tool_calls=[{"function": {"name": t.function.name, "arguments": t.function.arguments}} for t in tool_calls])
 
