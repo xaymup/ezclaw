@@ -1,5 +1,12 @@
+#!/usr/bin/env python3
 import os
 import sys
+
+_venv = os.path.join(os.path.dirname(os.path.abspath(__file__)), "venv")
+if os.path.isdir(_venv) and not sys.prefix.startswith(_venv):
+    _python = os.path.join(_venv, "bin", "python3")
+    os.execv(_python, [_python] + sys.argv)
+
 import time
 import threading
 import subprocess
@@ -204,15 +211,55 @@ def main():
                         console.print(f"[{WARN}]No recent tool output to display.[/{WARN}]")
                 continue
 
-            current_reasoning = ""
-            current_content = ""
+            reasoning_chunks = []
+            content_chunks = []
             tool_executions.clear()
             side_messages = []
+            last_update = 0.0
+            UPDATE_INTERVAL = 0.05
+
+            def _needs_update():
+                nonlocal last_update
+                now = time.monotonic()
+                if now - last_update >= UPDATE_INTERVAL:
+                    last_update = now
+                    return True
+                return False
+
+            def _build_tool_panel(tool):
+                tool_name = tool["name"]
+                args = tool.get("args", {})
+                result = tool.get("result")
+                header = Text.assemble(
+                    ("▸ ", f"bold {WARN}"),
+                    (tool_name, f"bold"),
+                )
+                tool_parts = []
+                if args:
+                    arg_str = "\n".join([f"[bold]{k}:[/bold] {v}" for k, v in args.items()])
+                    tool_parts.append(Panel(truncate_text(arg_str, max_lines=5), title="args", border_style=f"dim {DIM}"))
+                if result:
+                    renderable_result = str(result)
+                    if tool_name == "write_file" and "Diff:" in renderable_result:
+                        parts_of_result = renderable_result.split("Diff:\n", 1)
+                        if len(parts_of_result) > 1:
+                            tool_parts.append(Text(parts_of_result[0]))
+                            tool_parts.append(Syntax(truncate_text(parts_of_result[1], 20), "diff", theme="monokai", background_color="default"))
+                        else:
+                            tool_parts.append(Panel(truncate_text(renderable_result), title="output", border_style=DIM))
+                    elif tool_name == "read_file":
+                        tool_parts.append(Syntax(truncate_text(renderable_result, 25), "python", theme="monokai", background_color="default"))
+                    else:
+                        tool_parts.append(Panel(truncate_text(renderable_result), title="output", border_style=DIM))
+                else:
+                    tool_parts.append(Text("running...", style=f"dim {DIM}"))
+                return Panel(Group(*tool_parts), title=header, border_style=DIM, box=ROUNDED)
 
             def get_renderable():
                 parts = []
                 for msg in side_messages:
                     parts.append(Text(msg, style=f"dim {DIM} italic"))
+                current_reasoning = "".join(reasoning_chunks)
                 if SHOW_THINKING and current_reasoning:
                     parts.append(Panel(
                         Text(current_reasoning, style=f"italic {DIM}"),
@@ -220,51 +267,30 @@ def main():
                         border_style=DIM, box=ROUNDED,
                     ))
                 for tool in tool_executions:
-                    tool_name = tool["name"]
-                    args = tool.get("args", {})
-                    result = tool.get("result")
-                    header = Text.assemble(
-                        ("▸ ", f"bold {WARN}"),
-                        (tool_name, f"bold"),
-                    )
-                    tool_parts = []
-                    if args:
-                        arg_str = "\n".join([f"[bold]{k}:[/bold] {v}" for k, v in args.items()])
-                        tool_parts.append(Panel(truncate_text(arg_str, max_lines=5), title="args", border_style=f"dim {DIM}"))
-                    if result:
-                        renderable_result = str(result)
-                        if tool_name == "write_file" and "Diff:" in renderable_result:
-                            parts_of_result = renderable_result.split("Diff:\n", 1)
-                            if len(parts_of_result) > 1:
-                                tool_parts.append(Text(parts_of_result[0]))
-                                tool_parts.append(Syntax(truncate_text(parts_of_result[1], 20), "diff", theme="monokai", background_color="default"))
-                            else:
-                                tool_parts.append(Panel(truncate_text(renderable_result), title="output", border_style=DIM))
-                        elif tool_name == "read_file":
-                            tool_parts.append(Syntax(truncate_text(renderable_result, 25), "python", theme="monokai", background_color="default"))
-                        else:
-                            tool_parts.append(Panel(truncate_text(renderable_result), title="output", border_style=DIM))
-                    else:
-                        tool_parts.append(Text("running...", style=f"dim {DIM}"))
-                    parts.append(Panel(Group(*tool_parts), title=header, border_style=DIM, box=ROUNDED))
+                    parts.append(_build_tool_panel(tool))
+                current_content = "".join(content_chunks)
                 if current_content:
-                    parts.append(Markdown(current_content))
+                    parts.append(Text(current_content))
                 if not parts:
                     return Spinner("dots", text=f"[dim {DIM}]connecting...[/dim {DIM}]")
                 return Group(*parts)
 
-            with Live(get_renderable(), refresh_per_second=10, console=console) as live:
+            def _flush_live(live, force=False):
+                if force or _needs_update():
+                    live.update(get_renderable())
+
+            with Live(get_renderable(), refresh_per_second=8, console=console, vertical_overflow="visible") as live:
                 gen = agent.chat_stream(user_input)
                 try:
                     chunk = next(gen)
                     while True:
                         if chunk["type"] == "reasoning":
-                            current_reasoning += chunk["content"]
+                            reasoning_chunks.append(chunk["content"])
                             if SHOW_THINKING:
-                                live.update(get_renderable())
+                                _flush_live(live)
                         elif chunk["type"] == "content":
-                            current_content += chunk["content"]
-                            live.update(get_renderable())
+                            content_chunks.append(chunk["content"])
+                            _flush_live(live)
                         elif chunk["type"] == "auth_required":
                             live.stop()
                             console.print(Panel(
@@ -289,11 +315,11 @@ def main():
                             continue
                         elif chunk["type"] == "memory_stored":
                             side_messages.append(f"📝 {chunk['fact']}")
-                            live.update(get_renderable())
+                            _flush_live(live, force=True)
                         elif chunk["type"] == "context_augmented":
                             for m in chunk["memories"]:
                                 side_messages.append(f"📎 {m}")
-                            live.update(get_renderable())
+                            _flush_live(live, force=True)
                         elif chunk["type"] == "tool_start":
                             is_int = chunk.get("interactive", False)
                             tool_executions.append({"name": chunk["name"], "args": chunk["arguments"], "result": None, "interactive": is_int})
@@ -304,7 +330,7 @@ def main():
                                     border_style=WARN,
                                 ))
                             else:
-                                live.update(get_renderable())
+                                _flush_live(live, force=True)
                         elif chunk["type"] == "tool_end":
                             for tool in reversed(tool_executions):
                                 if tool["name"] == chunk["name"] and tool["result"] is None:
@@ -316,10 +342,18 @@ def main():
                                         ))
                                         live.start()
                                     break
-                            live.update(get_renderable())
+                            _flush_live(live, force=True)
                         chunk = next(gen)
                 except StopIteration:
-                    pass
+                    _flush_live(live, force=True)
+
+            final_content = "".join(content_chunks)
+            if final_content.strip():
+                console.print()
+                console.print(Markdown(final_content))
+            for tool in tool_executions:
+                if tool.get("result"):
+                    console.print(_build_tool_panel(tool))
         except KeyboardInterrupt:
             continue
         except EOFError:

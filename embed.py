@@ -9,9 +9,8 @@ _client = ollama.Client(host=OLLAMA_HOST, timeout=int(os.getenv("OLLAMA_TIMEOUT"
 
 
 def embed(text: str) -> List[float]:
-    # Truncate to avoid exceeding embedding model context length (~512 tokens ≈ 2000 chars)
-    if len(text) > 2000:
-        text = text[:2000]
+    if len(text) > 1000:
+        text = text[:1000]
     result = _client.embeddings(model=EMBED_MODEL, prompt=text)
     return result["embedding"]
 

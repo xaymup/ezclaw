@@ -7,6 +7,7 @@ from memory import Database
 from tools import registry, create_memory_tools
 from agent import load_skills, match_skills, format_skills_block
 from embed import embed, cosine_similarity, classify_by_similarity
+from model_client import build_architect_client, build_agent_client, extract_json
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -16,24 +17,27 @@ OLLAMA_HOST = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 AGENT_DEFS = {
     "executor": {
         "model": os.getenv("OLLAMA_MODEL", "qwen3:14b"),
-        "system_prompt": """You are EzClaw's **Executor** — a precise, autonomous assistant that gets things done.
+        "system_prompt": """You are EzClaw's **Executor** — execute instructions precisely using tools.
 
 Rules:
-- Respond in plain text. No JSON, no markdown wrappers around text.
-- Lead with the answer, not preambles. No "Sure!" or "I'll help you with that."
-- Use tools when action is needed. For chat, just respond directly.
+- Respond in plain text. Lead with the answer, no preambles.
+- The user message contains an instruction or plan — follow it step by step.
+- If the instruction says read a file, do it. If it says create a skill, do it.
+- Do NOT ask "how can I help" or "what would you like" — just execute.
 
 Tool selection:
+- `read_file` to examine code before editing.
+- `write_file` for creating/updating files (skills, code, etc).
 - `run_shell` for commands. interactive=True ONLY for vim/ssh/REPLs.
-- `read_file` before editing files. `write_file` with targeted changes.
-- `web_fetch` for news, docs, research, version lookups.
-- `remember` when user shares personal info or preferences.
-- `recall` when user asks about themselves or past context.
+- `web_fetch` for news, docs, research.
+- `remember`/`recall` for memory.
+- `learn_skill` to save a reusable skill from what you just did.
 
-Execution:
-- When given a fix plan, implement it. Don't ask permission.
-- If a tool fails, try once with adjusted input, then report the issue.
-- For multi-step tasks, think through the order before the first tool call.
+Execution rules:
+- Read files first to understand them, then act.
+- After a tool returns, continue the plan — don't repeat the same tool.
+- If the instruction says "create a new skill", call learn_skill with the extracted knowledge.
+- If a tool fails, try once with adjusted input, then report.
 - Keep outputs concise: show diffs, not full files; show summaries, not raw output.""",
         "tools": [
             "run_shell", "read_file", "write_file", "list_dir",
@@ -132,15 +136,16 @@ class SpecializedAgent:
 
     def __init__(self, name: str, config: dict, db: Database):
         self.name = name
-        self.client = ollama.Client(host=OLLAMA_HOST, timeout=int(os.getenv("OLLAMA_TIMEOUT", 300)))
+        self.client = build_agent_client()
         self.model = config["model"]
         self.system_prompt = config["system_prompt"]
         self.tools = filter_tools(config["tools"])
         self.db = db
         self.messages: List[Dict] = [{"role": "system", "content": self.system_prompt}]
+        self.num_ctx = int(os.getenv("OLLAMA_NUM_CTX", 16384))
         self.options = {
             "temperature": 0.0,
-            "num_ctx": int(os.getenv("OLLAMA_NUM_CTX", 16384)),
+            "num_ctx": self.num_ctx,
             "top_p": 0.9,
             "num_gpu": int(os.getenv("OLLAMA_NUM_GPU", 999)),
         }
@@ -182,17 +187,20 @@ class SpecializedAgent:
         # Truncate user input to prevent context overflow
         if len(user_input) > 4000:
             user_input = user_input[:4000] + "\n... (truncated)"
-        self.messages.append({"role": "user", "content": user_input})
 
-        # Enforce total char limit on messages
+        # Proactive pruning: if agent already has a long history, trim before appending
         total_chars = sum(len(m.get("content", "")) for m in self.messages)
-        if total_chars > 20000 or len(self.messages) > 12:
+        max_chars = int(self.num_ctx * 2.5)
+        if total_chars > max_chars or len(self.messages) > 12:
             self.messages = [self.messages[0]] + self.messages[-10:]
 
+        self.messages.append({"role": "user", "content": user_input})
+
         last_tool_hash = None
-        last_tool_vec = None
 
         selected_tools = self._select_relevant_tools(user_input, top_n=10)
+
+        max_messages = max(6, int(self.num_ctx / 2048))  # scale with context size
 
         for _ in range(10):
             full_response, full_reasoning, tool_calls = "", "", []
@@ -200,9 +208,16 @@ class SpecializedAgent:
 
             # Re-check total context length before each LLM call
             total_chars = sum(len(m.get("content", "")) for m in self.messages)
-            if total_chars > 18000:
-                yield {"type": "content", "content": "[System: Context limit reached, ending conversation turn.]"}
-                break
+            if total_chars > max_chars:
+                if len(self.messages) > max_messages:
+                    self.messages = [self.messages[0]] + self.messages[-(max_messages - 1):]
+                else:
+                    # Can't trim by count — truncate individual message content instead
+                    for m in self.messages:
+                        if m["role"] == "system":
+                            continue
+                        if len(m.get("content", "")) > 1500:
+                            m["content"] = m["content"][:1500] + "\n... (truncated)"
 
             try:
                 stream = self.client.chat(
@@ -329,24 +344,6 @@ class SpecializedAgent:
                 break
             last_tool_hash = current_hash
 
-            if tool_calls and last_tool_vec is not None:
-                tool_summary = " ".join(f"{t.function.name}:{json.dumps(t.function.arguments, sort_keys=True)}" for t in tool_calls)
-                try:
-                    current_vec = embed(tool_summary)
-                    sim = cosine_similarity(current_vec, last_tool_vec)
-                    if sim > 0.95:
-                        yield {"type": "content", "content": "\n[Semantic loop detected. Stopping.]"}
-                        break
-                    last_tool_vec = current_vec
-                except Exception:
-                    pass
-            elif tool_calls:
-                try:
-                    tool_summary = " ".join(f"{t.function.name}:{json.dumps(t.function.arguments, sort_keys=True)}" for t in tool_calls)
-                    last_tool_vec = embed(tool_summary)
-                except Exception:
-                    pass
-
             self.messages.append({
                 "role": "assistant", "content": full_response,
                 "tool_calls": [
@@ -387,8 +384,8 @@ class SpecializedAgent:
                     result = f"Error: {str(e)}"
 
                 result_str = str(result)
-                if len(result_str) > 2000:
-                    result_str = result_str[:2000] + f"\n... (truncated, {len(result_str)} chars total)"
+                if len(result_str) > 8000:
+                    result_str = result_str[:8000] + f"\n... (truncated, {len(result_str)} chars total)"
                 self.messages.append({
                     "role": "tool", "content": result_str, "name": tool_call.function.name,
                 })
@@ -399,9 +396,10 @@ class Architect:
     """Routes tasks to specialized agents and tracks the plan."""
 
     def __init__(self, db: Database):
-        self.client = ollama.Client(host=OLLAMA_HOST, timeout=int(os.getenv("OLLAMA_TIMEOUT", 300)))
-        self.model = os.getenv("OLLAMA_ARCHITECT_MODEL", "phi4-reasoning:plus")
+        self.client, self.model = build_architect_client()
         self.db = db
+        self.num_ctx = int(os.getenv("OLLAMA_NUM_CTX", 16384))
+        self.use_deepseek = os.getenv("ARCHITECT_PROVIDER", "ollama") == "deepseek"
         self.messages: List[Dict] = [{
             "role": "system",
             "content": """You are the **Architect** — a planner that routes work to the right agent and tracks progress.
@@ -426,20 +424,45 @@ Rules:
 - Use [Known Facts] and <available_skills> to make better plans.
 - Respond in JSON: category, reasoning, recommended_agent, plan, complete""",
         }]
-        self.options = {
-            "temperature": 0.0,
-            "num_ctx": int(os.getenv("OLLAMA_NUM_CTX", 16384)),
-            "top_p": 0.9,
-            "num_gpu": int(os.getenv("OLLAMA_NUM_GPU", 999)),
-        }
+
+    def _prune_messages(self):
+        """Keep architect history bounded — system prompt + last 3 turns."""
+        if len(self.messages) > 7:
+            self.messages = [self.messages[0]] + self.messages[-6:]
+
+    def _chat(self, prompt: str) -> str:
+        self._prune_messages()
+        # Truncate prompt if it alone would overflow
+        max_prompt_chars = int(self.num_ctx * 3) - sum(len(m.get("content", "")) for m in self.messages)
+        if max_prompt_chars < 500:
+            self._prune_messages()
+            self.messages = self.messages[:1]
+            max_prompt_chars = int(self.num_ctx * 3) - sum(len(m.get("content", "")) for m in self.messages)
+        if len(prompt) > max_prompt_chars:
+            prompt = prompt[:max(500, max_prompt_chars)] + "\n... (truncated)"
+
+        if self.use_deepseek:
+            import openai
+            resp = self.client.chat.completions.create(
+                model=self.model,
+                messages=self.messages + [{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"},
+                temperature=0.0,
+            )
+            return resp.choices[0].message.content or ""
+        resp = self.client.chat(
+            model=self.model,
+            messages=self.messages + [{"role": "user", "content": prompt}],
+            format="json",
+            options={"temperature": 0.0, "num_ctx": self.num_ctx},
+        )
+        return resp["message"]["content"].strip()
 
     def analyze(self, task_context: str, memory_block: str = "", skills_block: str = "", experiences_block: str = "", routing_block: str = "") -> Dict[str, Any]:
-        # Ensure total context stays under 12000 chars to avoid context overflow
         max_prompt_len = 12000
         blocks = [task_context, memory_block, skills_block, experiences_block, routing_block]
         total = sum(len(b) for b in blocks)
         if total > max_prompt_len:
-            # Truncate task_context first, then other blocks
             overflow = total - max_prompt_len
             if overflow > 0 and len(task_context) > overflow + 500:
                 task_context = task_context[:-(overflow + 100)] + "\n... (truncated)"
@@ -465,41 +488,36 @@ Complete: Set complete: true ONLY when the original user request has been fully 
 
 Return JSON: category, reasoning, recommended_agent, plan, complete
 {{"category": "technical|research|chat", "reasoning": "why this agent", "recommended_agent": "executor|general|researcher|debugger", "plan": "steps for the agent", "complete": false}}"""
-        try:
-            response = self.client.chat(
-                model=self.model,
-                messages=self.messages + [{"role": "user", "content": prompt}],
-                format="json",
-            )
-            content = response["message"]["content"].strip()
-            match = re.search(r"(\{.*\})", content, re.DOTALL)
-            if match:
-                content = match.group(1)
-            intent = json.loads(content)
-            intent.setdefault("plan", "")
-            intent.setdefault("reasoning", "")
-            intent.setdefault("complete", False)
 
-            # Validate recommended_agent, fall back to executor
-            valid_agents = {"executor", "general", "researcher", "debugger"}
-            if intent.get("recommended_agent") not in valid_agents:
-                intent["recommended_agent"] = "executor"
+        for attempt in range(2):
+            try:
+                content = self._chat(prompt if attempt == 0 else prompt + "\n\nCRITICAL: Previous response was not valid JSON. Return ONLY valid JSON with keys: category, reasoning, recommended_agent, plan, complete.")
+                content = extract_json(content)
+                intent = content
+                intent.setdefault("plan", "")
+                intent.setdefault("reasoning", "")
+                intent.setdefault("complete", False)
 
-            # Context-prep override: route debugger requests to executor FIRST
-            if intent["recommended_agent"] == "debugger" and "--- Step" not in task_context:
-                intent["recommended_agent"] = "executor"
-                intent["plan"] = f"1. Read the relevant files and gather context\n2. Pass context to debugger for analysis"
+                valid_agents = {"executor", "general", "researcher", "debugger"}
+                if intent.get("recommended_agent") not in valid_agents:
+                    intent["recommended_agent"] = "executor"
 
-            self.messages.append({"role": "assistant", "content": json.dumps(intent)})
-            return intent
-        except Exception:
-            return {
-                "category": "technical",
-                "reasoning": "Continuing execution...",
-                "recommended_agent": "executor",
-                "plan": "",
-                "complete": False,
-            }
+                if intent["recommended_agent"] == "debugger" and "--- Step" not in task_context:
+                    intent["recommended_agent"] = "executor"
+                    intent["plan"] = f"1. Read the relevant files and gather context\n2. Pass context to debugger for analysis"
+
+                self.messages.append({"role": "assistant", "content": json.dumps(intent)})
+                return intent
+            except Exception:
+                if attempt == 1:
+                    return {
+                        "category": "technical",
+                        "reasoning": "Continuing execution...",
+                        "recommended_agent": "executor",
+                        "plan": "",
+                        "complete": False,
+                    }
+                continue
 
 
 class MultiAgentSystem:
@@ -578,6 +596,9 @@ class MultiAgentSystem:
     # ── Orchestration ──────────────────────────────────────────
 
     def run(self, user_input: str) -> Iterator[Dict[str, Any]]:
+        # Truncate long user input to prevent context overflow
+        if len(user_input) > 4000:
+            user_input = user_input[:4000] + "\n... (truncated)"
         task_context = f"User Request: {user_input}"
         max_steps = 5
         loop_hashes = set()
@@ -657,7 +678,7 @@ class MultiAgentSystem:
 
             step_output = ""
             step_tool_results = []
-            agent_context = f"{agent_memory_block}{skills_block}{instruction}\n\nContext: {task_context}"
+            agent_context = f"## Task\n{instruction}\n\n## Original Request\n{user_input}\n\n## Context So Far\n{task_context}"
             for chunk in agent.chat_stream(agent_context):
                 if chunk["type"] == "content":
                     step_output += chunk["content"]

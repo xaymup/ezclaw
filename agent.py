@@ -6,6 +6,7 @@ from typing import List, Dict, Any, Optional, Callable, Iterator
 from memory import Database
 from tools import registry, create_memory_tools
 from embed import embed, cosine_similarity
+from model_client import build_agent_client
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -64,15 +65,16 @@ def format_skills_block(skills: List[Dict[str, str]]) -> str:
 
 class ChatAgent:
     def __init__(self, session_id: Optional[int] = None):
-        self.client = ollama.Client(host=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"), timeout=int(os.getenv("OLLAMA_TIMEOUT", 300)))
+        self.client = build_agent_client()
         self.db = Database(os.getenv("DATABASE_PATH", "ezclaw.db"))
         self.model = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:14b")
         
         self.keep_alive = os.getenv("OLLAMA_KEEP_ALIVE", "60m")
         
+        self.num_ctx = int(os.getenv("OLLAMA_NUM_CTX", 32768))
         self.options = {
             "temperature": 0.0,
-            "num_ctx": 32768, 
+            "num_ctx": self.num_ctx,
             "top_p": 0.9,
             "num_gpu": int(os.getenv("OLLAMA_NUM_GPU", 999)),
         }
@@ -178,7 +180,7 @@ Return ONLY valid JSON:
                         {"role": "user", "content": prompt if attempt == 0 else prompt + "\n\nCRITICAL: Your previous response was not valid JSON. Return ONLY the JSON object."}
                     ],
                     format="json",
-                    options={"temperature": 0.0, "num_ctx": 4096, "num_predict": 300}
+                    options={"temperature": 0.0, "num_ctx": min(self.num_ctx, 8192), "num_predict": 300}
                 )
                 content = response["message"]["content"].strip()
                 
@@ -237,6 +239,10 @@ Return JSON:
         self.messages = [{"role": "system", "content": self.system_prompt}]
 
     def chat_stream(self, user_input: str) -> Iterator[Dict[str, Any]]:
+        # Truncate long user input to prevent context overflow
+        if len(user_input) > 4000:
+            user_input = user_input[:4000] + "\n... (truncated)"
+
         # 1. Consolidated intent analysis with full agent context
         intent = self._process_intent(user_input)
 
@@ -276,14 +282,13 @@ Return JSON:
         iteration_count = 0
         max_iterations = 8 
         last_tool_hash = None
-        last_tool_vec = None
 
         # Tool pre-selection: only pass tools relevant to the current query
         selected_tools = self._select_relevant_tools(user_input, top_n=12) if len(self.tools) > 12 else self.tools
 
         while iteration_count < max_iterations:
             iteration_count += 1
-            full_response, full_reasoning, tool_calls = "", "", []
+            response_parts, reasoning_parts, tool_calls = [], [], []
             in_thinking, raw_buffer = False, ""
 
             # 6. Context Retention logic
@@ -298,6 +303,22 @@ Return JSON:
                     if not context_messages[i]["content"].startswith(augment_prefix):
                         context_messages[i]["content"] = augment_prefix + context_messages[i]["content"]
                     break
+
+            # Total content length pruning: keep within ~75% of num_ctx (chars ≈ tokens * 3)
+            max_chars = int(self.num_ctx * 2.5)
+            total_chars = sum(len(m.get("content", "")) for m in context_messages)
+            if total_chars > max_chars:
+                # Prune oldest messages (keep system + last N within limit)
+                while total_chars > max_chars and len(context_messages) > 6:
+                    removed = context_messages.pop(1)  # remove oldest non-system
+                    total_chars -= len(removed.get("content", ""))
+                # If still over, truncate individual message content
+                if total_chars > max_chars:
+                    for m in context_messages:
+                        if m["role"] == "system":
+                            continue
+                        if len(m.get("content", "")) > 2000:
+                            m["content"] = m["content"][:2000] + "\n... (truncated)"
 
             try:
                 stream = self.client.chat(model=self.model, messages=context_messages, tools=selected_tools, options=self.options, keep_alive=self.keep_alive, stream=True)
@@ -319,7 +340,7 @@ Return JSON:
             for chunk in stream_with_first(stream, first_chunk):
                 reasoning = getattr(chunk.message, 'reasoning', None) or (chunk.message.get('reasoning') if isinstance(chunk.message, dict) else None)
                 if reasoning:
-                    full_reasoning += reasoning
+                    reasoning_parts.append(reasoning)
                     yield {"type": "reasoning", "content": reasoning}
                 
                 if chunk.message.content:
@@ -331,7 +352,7 @@ Return JSON:
                             if match:
                                 pre = raw_buffer[:match.start()]
                                 if pre:
-                                    full_response += pre
+                                    response_parts.append(pre)
                                     yield {"type": "content", "content": pre}
                                 in_thinking = True
                                 raw_buffer = raw_buffer[match.end():]
@@ -342,18 +363,18 @@ Return JSON:
                                 if any(tag.startswith(raw_buffer[last_bracket:].lower()) for tag in ["<think", "<thought", "<reasoning"]):
                                     pre = raw_buffer[:last_bracket]
                                     if pre:
-                                        full_response += pre
+                                        response_parts.append(pre)
                                         yield {"type": "content", "content": pre}
                                     raw_buffer = raw_buffer[last_bracket:]
                                     break
                                 else:
-                                    full_response += raw_buffer
+                                    response_parts.append(raw_buffer)
                                     yield {"type": "content", "content": raw_buffer}
                                     raw_buffer = ""
                                     break
                             else:
                                 if raw_buffer:
-                                    full_response += raw_buffer
+                                    response_parts.append(raw_buffer)
                                     yield {"type": "content", "content": raw_buffer}
                                     raw_buffer = ""
                                 break
@@ -362,7 +383,7 @@ Return JSON:
                             if match:
                                 pre = raw_buffer[:match.start()]
                                 if pre:
-                                    full_reasoning += pre
+                                    reasoning_parts.append(pre)
                                     yield {"type": "reasoning", "content": pre}
                                 in_thinking = False
                                 raw_buffer = raw_buffer[match.end():]
@@ -373,18 +394,18 @@ Return JSON:
                                 if any(tag.startswith(raw_buffer[last_bracket:].lower()) for tag in ["</think>", "</thought>", "</reasoning"]):
                                     pre = raw_buffer[:last_bracket]
                                     if pre:
-                                        full_reasoning += pre
+                                        reasoning_parts.append(pre)
                                         yield {"type": "reasoning", "content": pre}
                                     raw_buffer = raw_buffer[last_bracket:]
                                     break
                                 else:
-                                    full_reasoning += raw_buffer
+                                    reasoning_parts.append(raw_buffer)
                                     yield {"type": "reasoning", "content": raw_buffer}
                                     raw_buffer = ""
                                     break
                             else:
                                 if raw_buffer:
-                                    full_reasoning += raw_buffer
+                                    reasoning_parts.append(raw_buffer)
                                     yield {"type": "reasoning", "content": raw_buffer}
                                     raw_buffer = ""
                                 break
@@ -393,36 +414,21 @@ Return JSON:
 
             if raw_buffer:
                 if in_thinking:
-                    full_reasoning += raw_buffer
+                    reasoning_parts.append(raw_buffer)
                     yield {"type": "reasoning", "content": raw_buffer}
                 else:
-                    full_response += raw_buffer
+                    response_parts.append(raw_buffer)
                     yield {"type": "content", "content": raw_buffer}
                 raw_buffer = ""
+
+            full_response = "".join(response_parts)
+            full_reasoning = "".join(reasoning_parts)
 
             current_hash = hash(str([(t.function.name, t.function.arguments) for t in tool_calls]))
             if tool_calls and current_hash == last_tool_hash:
                 yield {"type": "content", "content": "\n[System: Loop detected. Stopping.]"}
                 break
             last_tool_hash = current_hash
-
-            if tool_calls and last_tool_vec is not None:
-                tool_summary = " ".join(f"{t.function.name}:{json.dumps(t.function.arguments, sort_keys=True)}" for t in tool_calls)
-                try:
-                    current_vec = embed(tool_summary)
-                    sim = cosine_similarity(current_vec, last_tool_vec)
-                    if sim > 0.95:
-                        yield {"type": "content", "content": "\n[Semantic loop detected. Stopping.]"}
-                        break
-                    last_tool_vec = current_vec
-                except Exception:
-                    pass
-            elif tool_calls:
-                try:
-                    tool_summary = " ".join(f"{t.function.name}:{json.dumps(t.function.arguments, sort_keys=True)}" for t in tool_calls)
-                    last_tool_vec = embed(tool_summary)
-                except Exception:
-                    pass
 
             if not tool_calls:
                 if full_response.strip() or full_reasoning.strip():
@@ -457,8 +463,8 @@ Return JSON:
                 except Exception as e: result = f"Error: {str(e)}"
                 
                 result_str = str(result)
-                if len(result_str) > 2000:
-                    result_str = result_str[:2000] + f"\n... (truncated, {len(result_str)} chars total)"
+                if len(result_str) > 8000:
+                    result_str = result_str[:8000] + f"\n... (truncated, {len(result_str)} chars total)"
                 tool_msg = {'role': 'tool', 'content': result_str, 'name': tool.function.name}
                 self.messages.append(tool_msg)
                 self.db.add_message(self.session_id, "tool", result_str)
