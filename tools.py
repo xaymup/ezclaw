@@ -382,6 +382,7 @@ def _run_shell_interactive(
     sandbox_env: dict,
     on_output=None,
     input_provider=None,
+    on_proc_spawn=None,
 ) -> str:
     """Interactive shell via a pty pair, with the same sandboxing as the
     non-interactive path. The parent's cwd is NEVER mutated — cwd flows
@@ -420,6 +421,14 @@ def _run_shell_interactive(
             preexec_fn=_apply_sandbox_rlimits,
             close_fds=True,
         )
+        # Expose the spawned proc to the caller (cli wrapper) so it can
+        # forward signals — Ctrl+C in the TUI sends SIGINT to the
+        # subprocess group instead of killing ezclaw.
+        if on_proc_spawn is not None:
+            try:
+                on_proc_spawn(proc)
+            except Exception:
+                pass
         # Close the slave in the parent — the child owns it now.
         os.close(slave_fd)
         slave_fd = -1

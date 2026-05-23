@@ -271,13 +271,23 @@ class ChatUI:
                 "input_queue": input_q,
                 "tool": tool_dict,
                 "command": command,
-                # Tracks when the subprocess last emitted output. The tool
-                # panel render uses this to detect "subprocess is waiting
-                # for input" (no output for ~1.5s while still alive) and
-                # promote the panel to a high-attention state.
                 "last_output_at": time.time(),
                 "notified_waiting": False,
+                # The subprocess handle, filled in by on_proc_spawn once
+                # _run_shell_interactive starts it. Ctrl+C and SIGINT
+                # forwarding use this.
+                "proc": None,
+                # Input routing toggle. False → keystrokes go to the
+                # subprocess via input_queue (default for new interactive
+                # sessions). True → keystrokes go to ezclaw's chat handler
+                # (slash commands work; plain messages get a hint).
+                # Esc toggles this while a session is active.
+                "chat_mode": False,
             }
+
+            def on_proc_spawn(proc):
+                if self._interactive_session is not None:
+                    self._interactive_session["proc"] = proc
 
             def on_output(data: bytes):
                 # Cap the in-memory buffer so a runaway subprocess can't
@@ -323,6 +333,7 @@ class ChatUI:
                     sandbox_env=_build_sandbox_env(),
                     on_output=on_output,
                     input_provider=input_provider,
+                    on_proc_spawn=on_proc_spawn,
                 )
             except Exception as exc:
                 # Defensive: any failure during the embedded interactive
@@ -347,10 +358,53 @@ class ChatUI:
     def _setup_keybindings(self):
         @self.kb.add('c-c')
         def _(event):
+            """Ctrl+C is repurposed away from "exit ezclaw":
+               - Interactive shell active → forward SIGINT to the subprocess
+                 process group (Ctrl+C in their shell, the way you'd expect)
+               - Generating → cancel the current run (sets is_generating
+                 False; the worker observes it on the next chunk)
+               - Idle → no-op with a side hint. Exit is via the literal
+                 'exit' / 'quit' commands.
+            """
+            session = self._interactive_session
+            if session is not None and session.get("proc") is not None:
+                import signal
+                proc = session["proc"]
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGINT)
+                except (ProcessLookupError, PermissionError, OSError):
+                    pass
+                self.side_messages.append("↯ SIGINT sent to subprocess")
+                self._update_ui()
+                return
             if self.is_generating:
                 self.is_generating = False
-            else:
-                event.app.exit()
+                self.side_messages.append("↯ generation cancelled")
+                self._update_ui()
+                return
+            self.side_messages.append("↯ press is harmless — type 'exit' to leave ezclaw")
+            self._update_ui()
+
+        @self.kb.add('escape', eager=True)
+        def _(event):
+            """Toggle input routing during an interactive session.
+
+            When a subprocess is live, the default is to send keystrokes
+            to it via input_queue. Press Esc to flip into "chat mode":
+            keystrokes go to ezclaw's normal chat handler (slash commands
+            work; plain messages get a hint that the agent is busy).
+            Press Esc again to flip back to subprocess.
+
+            Outside of an interactive session, Esc is a no-op.
+            """
+            session = self._interactive_session
+            if session is None:
+                return
+            session["chat_mode"] = not session.get("chat_mode", False)
+            mode = "ezclaw chat" if session["chat_mode"] else "subprocess input"
+            self.side_messages.append(f"↻ input now routed to: {mode}")
+            self._update_ui()
+            event.app.invalidate()
 
         @self.kb.add('tab')
         def _(event):
@@ -569,8 +623,19 @@ class ChatUI:
             segments.append(divider)
             segments.append((BG + "bold #7fd070", "⊞ FULL TOOLS"))
 
+        # Interactive shell routing indicator — tells the user where
+        # their keystrokes are going. Critical to see at a glance during
+        # an interactive session.
+        if self._interactive_session is not None:
+            chat_mode = self._interactive_session.get("chat_mode", False)
+            segments.append(divider)
+            if chat_mode:
+                segments.append((BG + "bold #7fd070", "↳ KEYS→CHAT (Esc:subproc)"))
+            else:
+                segments.append((BG + "bold #ffd166", "↳ KEYS→SUBPROC (Esc:chat)"))
+
         segments.append((BG + "#5a4a3a", "  │  "))
-        segments.append((BG + "#a89884", "[F1] help  [^C] exit  [F2] copy  [F3] strategy  [F4] tools"))
+        segments.append((BG + "#a89884", "[F1] help  [F2] copy  [F3] strategy  [F4] tools  [^C] cancel"))
         return segments
 
     def _spinner_for(self, role):
@@ -1010,6 +1075,7 @@ class ChatUI:
                         pass
 
                 head = self._one_line_tool_head(tool_kind, tool_name, args, index)
+                chat_mode = session.get("chat_mode", False)
                 if waiting:
                     # Bright attention-grabbing label, animated pulse on
                     # the ✋ glyph so the eye finds it immediately.
@@ -1021,11 +1087,18 @@ class ChatUI:
                         f"AWAITING INPUT  ({idle:.0f}s idle) — type below",
                         style=f"bold {WARN}",
                     )
-                    border = WARN  # full saturation — not dim
+                    border = WARN
                 else:
                     head.append(f"   ⏳ live{elapsed_str}", style=f"bold {WARN}")
-                    head.append("   (type to send input to subprocess)", style=f"{SECONDARY} italic")
                     border = f"dim {WARN}"
+                # Mode indicator — tells the user where their keystrokes
+                # are going. Esc toggles between the two.
+                if chat_mode:
+                    head.append("   ↳ keys → ezclaw chat", style=f"bold #7fd070")
+                    head.append("  (Esc to send to subprocess)", style=f"{SECONDARY} italic")
+                else:
+                    head.append("   ↳ keys → subprocess", style=f"bold {WARN}")
+                    head.append("  (Esc to chat, Ctrl+C to interrupt)", style=f"{SECONDARY} italic")
 
                 # Decode the streaming bytes and strip ANSI; keep the last
                 # ~40 lines so the panel doesn't grow indefinitely on a
@@ -1186,20 +1259,35 @@ class ChatUI:
             self.app.exit()
             return
 
-        # An embedded interactive shell session is active — every keystroke
-        # the user types goes to the subprocess via the session's input
-        # queue (with a trailing newline so subprocesses like `sudo` see
-        # a complete line). The agent loop stays paused for the duration.
-        if self._interactive_session is not None:
+        # An embedded interactive shell session is active. Routing depends
+        # on the chat_mode toggle (flipped via Esc):
+        #   chat_mode=False (default) → keystroke → subprocess input_queue
+        #   chat_mode=True           → keystroke → normal chat handling,
+        #     but slash commands are the only thing that does anything
+        #     useful (the agent worker is blocked on the subprocess).
+        if self._interactive_session is not None and not self._interactive_session.get("chat_mode"):
             try:
                 self._interactive_session["input_queue"].put((text + "\n").encode())
             except Exception:
                 pass
             self.history_ansi.append(render_to_ansi(
-                Text(f"→ {text}", style=f"italic dim {DIM}")
+                Text(f"→ {text}", style=f"italic {SECONDARY}")
             ))
             self._update_ui()
             return
+
+        # In chat_mode during an interactive session: slash commands fall
+        # through to _handle_command below; plain text gets a friendly
+        # note instead of being silently dropped or sent to a blocked
+        # agent worker.
+        if self._interactive_session is not None and self._interactive_session.get("chat_mode"):
+            if not text.startswith("/") and text.lower() not in ("exit", "quit"):
+                self.side_messages.append(
+                    "agent is busy in an interactive shell — Esc to send input to subprocess, "
+                    "or use a slash command (/help)"
+                )
+                self._update_ui()
+                return
 
         if text.startswith("/"):
             self._handle_command(text)
