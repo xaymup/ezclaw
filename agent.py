@@ -37,30 +37,38 @@ def load_skills() -> List[Dict[str, str]]:
             skills.append({'name': name, 'content': content, 'filename': filename})
     return skills
 
-def match_skills(user_input: str, skills: List[Dict[str, str]], top_n: int = 5) -> List[Dict[str, str]]:
+def match_skills(user_input: str, skills: List[Dict[str, str]], top_n: int = 5, threshold: float = 0.4) -> List[Dict[str, str]]:
     """Find relevant skills using embedding similarity, fallback to keyword
-    matching. Returns up to `top_n` skills sorted by relevance.
+    matching. Returns skills whose embedding similarity to the query
+    exceeds `threshold`, capped at `top_n` and sorted by relevance.
 
-    The agent prompt block then surfaces these for the architect to apply
-    — see the `Use available skills` section in the system prompt for the
-    contract."""
+    The threshold matters: previously this returned the top-N regardless
+    of relevance, so an unrelated query like "is blex_os done?" still
+    pulled in skills like `create_image_generation_skill` and
+    `spotify_cli_control` because they share common English words. The
+    architect prompt then told the model to "use available skills" — and
+    the model dutifully tried to apply irrelevant procedures. With a
+    similarity floor, the skills_block is non-empty ONLY when there's a
+    genuinely related skill to surface."""
     if not skills:
         return []
     from embed import rank_by_similarity
     skill_texts = [f"{s['name']}: {s['content'][:500]}" for s in skills]
-    ranked_texts = rank_by_similarity(user_input, skill_texts, top_n=top_n)
-    matched_names = []  # preserve rank order
+    ranked_texts = rank_by_similarity(user_input, skill_texts, top_n=top_n, threshold=threshold)
+    matched_names = []
     for rt in ranked_texts:
         name = rt.split(":")[0]
         if name not in matched_names:
             matched_names.append(name)
 
-    # Fallback: keyword match if embeddings returned nothing
+    # Fallback: tight keyword match if embeddings returned nothing —
+    # requires a 6+ char content word to appear in the user input. The
+    # old fallback used 4+ chars which matched too much noise.
     if not matched_names:
         user_lower = user_input.lower()
         for skill in skills:
             skill_lower = skill['content'].lower()
-            skill_words = set(re.findall(r'\b[a-z]{4,}\b', skill_lower))
+            skill_words = set(re.findall(r'\b[a-z]{6,}\b', skill_lower))
             if any(word in user_lower for word in skill_words):
                 matched_names.append(skill['name'])
 
