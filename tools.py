@@ -168,6 +168,27 @@ def get_workspace_path(path: str) -> str:
     return final_path
 
 @registry.register
+def current_datetime() -> str:
+    """Get the current local date and time, formatted multiple ways for
+    easy reasoning. Useful for scheduling tasks (compute "tomorrow at 9am"
+    from the current moment), for timestamping notes, and for any
+    request that involves relative time expressions ("in 2 hours",
+    "next Monday", etc.).
+    """
+    from datetime import datetime, timezone
+    now = datetime.now()
+    now_utc = datetime.now(timezone.utc)
+    tz_offset = now.astimezone().strftime("%z") or "+0000"
+    return (
+        f"Local date:  {now.strftime('%Y-%m-%d')} ({now.strftime('%A')})\n"
+        f"Local time:  {now.strftime('%H:%M:%S')}\n"
+        f"Timezone:    UTC{tz_offset[:3]}:{tz_offset[3:]}\n"
+        f"ISO format:  {now.strftime('%Y-%m-%dT%H:%M:%S')}\n"
+        f"For scheduling (schedule_task format): {now.strftime('%Y-%m-%d %H:%M')}"
+    )
+
+
+@registry.register
 def get_system_info() -> str:
     """
     Get information about the current system (OS, shell, user, package manager).

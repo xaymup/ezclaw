@@ -51,6 +51,7 @@ def test_notify_calls_notify_send_on_linux(monkeypatch):
     """On Linux with notify-send available, notify should invoke it
     with the title, message, urgency, and app name."""
     monkeypatch.setenv("EZCLAW_NOTIFY", "1")
+    monkeypatch.setenv("EZCLAW_NOTIFY_SOUND", "")  # silence sound for this test
     monkeypatch.setattr("notifications.sys.platform", "linux")
     fake_popen = MagicMock()
     with patch("notifications.shutil.which", return_value="/usr/bin/notify-send"):
@@ -65,11 +66,68 @@ def test_notify_calls_notify_send_on_linux(monkeypatch):
     assert "World" in args
 
 
+def test_sound_disabled_when_notify_disabled(monkeypatch):
+    """When EZCLAW_NOTIFY=0, sound is also off — no Popen call for audio."""
+    from notifications import _sound_enabled
+    monkeypatch.setenv("EZCLAW_NOTIFY", "0")
+    assert _sound_enabled() is False
+
+
+def test_sound_can_be_disabled_independently(monkeypatch):
+    """EZCLAW_NOTIFY_SOUND='' silences sound but keeps visuals."""
+    from notifications import _sound_enabled, _enabled
+    monkeypatch.setenv("EZCLAW_NOTIFY", "1")
+    monkeypatch.setenv("EZCLAW_NOTIFY_SOUND", "")
+    assert _enabled() is True
+    assert _sound_enabled() is False
+
+
+def test_sound_enabled_default(monkeypatch):
+    monkeypatch.delenv("EZCLAW_NOTIFY_SOUND", raising=False)
+    monkeypatch.setenv("EZCLAW_NOTIFY", "1")
+    from notifications import _sound_enabled
+    assert _sound_enabled() is True
+
+
+def test_play_sound_invokes_player_when_file_exists(monkeypatch, tmp_path):
+    """Sound playback is best-effort: when a player and a file exist,
+    we Popen the player; missing either is a silent no-op."""
+    from notifications import _play_sound, URGENCY_NORMAL
+    monkeypatch.setenv("EZCLAW_NOTIFY", "1")
+    monkeypatch.delenv("EZCLAW_NOTIFY_SOUND", raising=False)
+
+    fake_sound = tmp_path / "fake.oga"
+    fake_sound.write_bytes(b"")
+    monkeypatch.setenv("EZCLAW_NOTIFY_SOUND", str(fake_sound))
+
+    fake_popen = MagicMock()
+    with patch("notifications.shutil.which", return_value="/usr/bin/paplay"):
+        with patch("notifications.subprocess.Popen", fake_popen):
+            _play_sound(URGENCY_NORMAL)
+    assert fake_popen.called
+    args = fake_popen.call_args[0][0]
+    assert args[0] == "/usr/bin/paplay"
+    assert args[1] == str(fake_sound)
+
+
+def test_play_sound_skips_when_file_missing(monkeypatch):
+    """If the configured sound file doesn't exist on disk, no player
+    process gets started — silent no-op."""
+    from notifications import _play_sound, URGENCY_NORMAL
+    monkeypatch.setenv("EZCLAW_NOTIFY", "1")
+    monkeypatch.setenv("EZCLAW_NOTIFY_SOUND", "/nonexistent/path.oga")
+    fake_popen = MagicMock()
+    with patch("notifications.subprocess.Popen", fake_popen):
+        _play_sound(URGENCY_NORMAL)
+    assert not fake_popen.called
+
+
 def test_notify_omits_message_when_empty(monkeypatch):
     """One-line alerts pass only the title; notify-send treats the second
     positional arg as body, so passing an empty string would render an
     empty body line."""
     monkeypatch.setenv("EZCLAW_NOTIFY", "1")
+    monkeypatch.setenv("EZCLAW_NOTIFY_SOUND", "")  # silence sound for this test
     monkeypatch.setattr("notifications.sys.platform", "linux")
     fake_popen = MagicMock()
     with patch("notifications.shutil.which", return_value="/usr/bin/notify-send"):
