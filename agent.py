@@ -588,6 +588,8 @@ Respond with JSON only:
         if iteration_count >= max_iterations:
             yield {"type": "content", "content": (
                 f"\n[System: agent ran {max_iterations} tool-call iterations "
-                f"— pausing here. If the goal still needs more work, ask me to "
-                f"continue, or bump EZCLAW_MAX_ITERATIONS in your env.]"
+                f"— pausing here. Type \"continue\" (or one of: go on / keep "
+                f"going / more / next) to extend this response, or send a new "
+                f"prompt to start fresh.]"
             )}
+            yield {"type": "halt", "reason": "iteration_cap"}
