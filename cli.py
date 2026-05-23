@@ -315,7 +315,14 @@ class ChatUI:
         mode = "⚡" if ENABLE_MULTI_AGENT else "●"
         model_info = self.agent.model.split(",")[0][:45] if "," in self.agent.model else self.agent.model[:45]
         msg_count = len(self.agent.messages) if hasattr(self.agent, 'messages') and self.agent.messages else 0
-        return f"  {auth_icon}  {mode} {model_info}  ·  {msg_count} msgs  |  [Ctrl+C] Exit  [Arrows/Wheel] Scroll"
+
+        live = ""
+        if self.is_generating:
+            n_tools = len(self.tool_executions)
+            elapsed = time.time() - self.generation_start_time if self.generation_start_time else 0
+            live = f"  ·  ⚙ {n_tools} tool{'s' if n_tools != 1 else ''}  ·  {elapsed:.1f}s"
+
+        return f"  {auth_icon}  {mode} {model_info}  ·  {msg_count} msgs{live}  |  [Ctrl+C] Exit  [Arrows/Wheel] Scroll"
 
     def _get_current_renderable_ansi(self):
 
@@ -412,20 +419,45 @@ class ChatUI:
         self.r_console.print(renderable)
         return self.r_console.file.getvalue()
 
+    _ROLE_COLOR = {
+        "executor": "#5fafff",   # blue
+        "researcher": "#5fd75f", # green
+        "debugger":   "#ff6f6f", # red
+        "general":    "#d75fd7", # magenta
+        "architect":  "#ffd700", # gold (matches PRIMARY)
+    }
+
     def _get_welcome_panel(self):
+        body = Text()
+        body.append("EzClaw ", style=f"bold {PRIMARY}")
+        body.append("v2.2 (Full TUI)\n", style=f"dim {DIM}")
+        body.append("\n", "")
+
+        if ENABLE_MULTI_AGENT and hasattr(self.agent, "agents"):
+            # Multi-agent: enumerate each role with its model.
+            body.append("⚡ Multi-agent\n", style=f"bold {PRIMARY}")
+            arch_model = getattr(self.agent.architect, "model", "?") if hasattr(self.agent, "architect") else "?"
+            color = self._ROLE_COLOR.get("architect", PRIMARY)
+            body.append(f"  architect   ", style=f"bold {color}")
+            body.append(f"{arch_model}\n", style=SECONDARY)
+            for role, sub_agent in self.agent.agents.items():
+                color = self._ROLE_COLOR.get(role, SECONDARY)
+                body.append(f"  {role:<11} ", style=f"bold {color}")
+                body.append(f"{sub_agent.model}\n", style=SECONDARY)
+        else:
+            body.append("● Single-agent\n", style=f"bold {PRIMARY}")
+            body.append(f"  model       ", style=f"bold {SECONDARY}")
+            body.append(f"{self.agent.model}\n", style=SECONDARY)
+
+        body.append("\n", "")
+        body.append(f"  workspace   ", style=f"bold {DIM}")
+        body.append(f"./workspace\n", style=f"dim {DIM}")
+        body.append("\n", "")
+        body.append("Commands: ", style="bold")
+        body.append("/help  /diagnose  /clear  /thinking  /settings  /authorize  /expand  /collapse",
+                    style=f"dim {DIM}")
         return Panel(
-            Text.assemble(
-                ("EzClaw ", f"bold {PRIMARY}"),
-                ("v2.2 (Full TUI)", f"dim {DIM}"),
-                ("\n\n", ""),
-                (f"{'⚡' if ENABLE_MULTI_AGENT else '●'} ", ""),
-                (f"{self.agent.model}", f"{SECONDARY}"),
-                ("\n", ""),
-                (f"./workspace", f"dim {DIM}"),
-                ("\n\n", ""),
-                ("Commands: ", "bold"),
-                ("/help · /diagnose · /clear · /thinking · /settings · /authorize", f"dim {DIM}"),
-            ),
+            body,
             box=ROUNDED, padding=(1, 2), border_style=DIM,
             title=f"[bold {PRIMARY}]EzClaw[/bold {PRIMARY}]",
         )
