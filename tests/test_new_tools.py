@@ -128,6 +128,158 @@ def test_apply_diff_missing_file(tmp_path, monkeypatch):
     assert "Error" in out and "does not exist" in out
 
 
+# ── apply_diff: fuzzy / robustness fixes ────────────────────────────────────
+
+def test_apply_diff_recovers_when_line_numbers_are_wrong(tmp_path, monkeypatch):
+    """LLM diffs frequently have hallucinated @@ -N line numbers. As long
+    as the pre-image context is unique somewhere in the file, the applier
+    should locate it and apply anyway."""
+    monkeypatch.setattr(tools, "WORKSPACE_DIR", str(tmp_path))
+    fpath = tmp_path / "f.txt"
+    fpath.write_text("alpha\nbeta\ngamma\ndelta\nepsilon\n")
+    bad_lineno = textwrap.dedent("""\
+        @@ -42,3 +42,4 @@
+         alpha
+         beta
+        +inserted
+         gamma
+    """)
+    out = tools.apply_diff("f.txt", bad_lineno)
+    assert "Applied 1 hunk" in out
+    assert fpath.read_text() == "alpha\nbeta\ninserted\ngamma\ndelta\nepsilon\n"
+
+
+def test_apply_diff_tolerates_missing_leading_space_on_context(tmp_path, monkeypatch):
+    """If a context line lost its leading space (common LLM mistake when
+    output flows through markdown or copy-paste), still treat it as
+    context. The hunk must still apply."""
+    monkeypatch.setattr(tools, "WORKSPACE_DIR", str(tmp_path))
+    fpath = tmp_path / "f.txt"
+    fpath.write_text("alpha\nbeta\ngamma\ndelta\n")
+    broken_ctx = textwrap.dedent("""\
+        @@ -1,3 +1,4 @@
+        alpha
+         beta
+        +inserted
+         gamma
+    """)
+    out = tools.apply_diff("f.txt", broken_ctx)
+    assert "Applied 1 hunk" in out
+    assert fpath.read_text() == "alpha\nbeta\ninserted\ngamma\ndelta\n"
+
+
+def test_apply_diff_picks_nearest_match_when_multiple_candidates(tmp_path, monkeypatch):
+    """A pre-image of just ` foo` could match many lines. The applier
+    should prefer the match closest to the header-claimed offset rather
+    than always picking the first one."""
+    monkeypatch.setattr(tools, "WORKSPACE_DIR", str(tmp_path))
+    fpath = tmp_path / "f.txt"
+    # Three "foo" lines at lines 1, 5, 9
+    fpath.write_text("foo\na\nb\nc\nfoo\nx\ny\nz\nfoo\n")
+    # Header says line 5 — should target the middle foo
+    diff = textwrap.dedent("""\
+        @@ -5,1 +5,2 @@
+         foo
+        +inserted-after-middle
+    """)
+    out = tools.apply_diff("f.txt", diff)
+    assert "Applied 1 hunk" in out
+    after = fpath.read_text().splitlines()
+    # Middle "foo" should have inserted line right after it
+    assert after.index("inserted-after-middle") == 5  # 0-indexed
+    # First and last foo untouched
+    assert after[0] == "foo"
+    assert after[-1] == "foo"
+
+
+def test_apply_diff_error_message_shows_expected_vs_actual(tmp_path, monkeypatch):
+    """When a hunk truly can't apply (e.g. indentation mismatch), the
+    error message must show the agent what it expected and what was
+    actually in the file at that position."""
+    monkeypatch.setattr(tools, "WORKSPACE_DIR", str(tmp_path))
+    fpath = tmp_path / "f.py"
+    # File uses TABS for indentation
+    fpath.write_text("def foo():\n\treturn 1\n")
+    # Diff uses 4 SPACES — indentation matters in Python so this should fail
+    diff = textwrap.dedent("""\
+        @@ -1,2 +1,3 @@
+         def foo():
+        +    print('hi')
+             return 1
+    """)
+    out = tools.apply_diff("f.py", diff)
+    assert "Hunk #1" in out
+    assert "Expected (pre-image)" in out
+    assert "Found at that position" in out
+    # The actual tab-indented "return 1" should appear in the "Found" block
+    assert "\treturn 1" in out
+
+
+def test_apply_diff_multiple_hunks_with_shifting_offsets(tmp_path, monkeypatch):
+    """When hunk 1 inserts lines, hunk 2's pre-image position shifts —
+    the applier must account for the cumulative offset. The fuzzy
+    search makes this robust even when the LLM didn't account for it."""
+    monkeypatch.setattr(tools, "WORKSPACE_DIR", str(tmp_path))
+    fpath = tmp_path / "f.txt"
+    fpath.write_text("alpha\nbeta\ngamma\ndelta\nepsilon\n")
+    multi = textwrap.dedent("""\
+        @@ -1,2 +1,3 @@
+         alpha
+        +top
+         beta
+        @@ -4,2 +5,3 @@
+         delta
+        +bottom
+         epsilon
+    """)
+    out = tools.apply_diff("f.txt", multi)
+    assert "Applied 2 hunk" in out
+    assert fpath.read_text() == (
+        "alpha\ntop\nbeta\ngamma\ndelta\nbottom\nepsilon\n"
+    )
+
+
+def test_apply_diff_pure_insertion_with_empty_pre_image(tmp_path, monkeypatch):
+    """A hunk that only adds lines (no -/space context) should insert
+    at the header offset rather than be rejected as 'pre-image empty'."""
+    monkeypatch.setattr(tools, "WORKSPACE_DIR", str(tmp_path))
+    fpath = tmp_path / "f.txt"
+    fpath.write_text("line1\nline2\n")
+    diff = textwrap.dedent("""\
+        @@ -2,0 +3,1 @@
+        +inserted
+    """)
+    out = tools.apply_diff("f.txt", diff)
+    assert "Applied 1 hunk" in out
+    # Inserted at index 2 (header said line 3 in the new file)
+    text = fpath.read_text()
+    assert "inserted" in text
+
+
+def test_apply_diff_partial_apply_reports_only_failed_hunks(tmp_path, monkeypatch):
+    """When some hunks succeed and some fail, the file is left unchanged
+    overall (atomicity) and the error message lists only the failing
+    hunks with their diagnostic context."""
+    monkeypatch.setattr(tools, "WORKSPACE_DIR", str(tmp_path))
+    fpath = tmp_path / "f.txt"
+    fpath.write_text("alpha\nbeta\ngamma\n")
+    mixed = textwrap.dedent("""\
+        @@ -1,2 +1,3 @@
+         alpha
+        +ok-insert
+         beta
+        @@ -10,1 +10,2 @@
+         this-line-doesnt-exist
+        +never-applied
+    """)
+    out = tools.apply_diff("f.txt", mixed)
+    # The second hunk should fail
+    assert "Hunk #2" in out
+    assert "this-line-doesnt-exist" in out
+    # The error message lists the failing hunks specifically
+    assert "1 hunk(s) failed" in out
+
+
 # ── grep_codebase ───────────────────────────────────────────────────────────
 
 def test_grep_codebase_finds_matches(tmp_path, monkeypatch):

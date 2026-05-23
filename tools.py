@@ -1312,8 +1312,24 @@ def apply_diff(path: str, diff: str) -> str:
         +added line 2
          context line
 
-    Header lines (`--- a/...`, `+++ b/...`) are tolerated but ignored —
-    only the hunks matter. The file at `path` is patched in-place.
+    Tolerances (what the applier corrects for you):
+    - Line numbers in `@@ -N,n +M,m @@` may be wrong — the applier
+      fuzzy-searches the file for the pre-image and lands on the
+      closest match to the header hint.
+    - Context lines missing their leading space are still treated as
+      context (e.g. `alpha` instead of ` alpha`).
+    - Trailing whitespace and CRLF/LF differences are ignored.
+
+    Hard requirements (you MUST get these right):
+    - Removed (`-`) and context lines must match the file character-
+      for-character on the meaningful content (indentation included
+      — tabs vs spaces is a real difference).
+    - At least one context or `-` line per hunk (no zero-pre-image
+      hunks except pure insertions).
+
+    On failure, the error lists each rejected hunk with its expected
+    pre-image and the actual file content at that position so you can
+    self-correct without re-reading the whole file.
     """
     try:
         full_path = get_workspace_path(path)
@@ -1328,14 +1344,9 @@ def apply_diff(path: str, diff: str) -> str:
     except Exception as e:
         return f"Error reading {path}: {e}"
 
-    new_content, applied, rejected = _apply_unified_diff(original, diff)
-    if rejected:
-        return (
-            f"Error: {rejected} hunk(s) failed to apply to {path}. "
-            "The diff's context lines don't match the current file. "
-            "Either fetch the latest content with read_file and regenerate "
-            "the diff, or use write_file."
-        )
+    new_content, applied, rejections = _apply_unified_diff(original, diff)
+    if rejections:
+        return _format_rejections(rejections, path)
     try:
         with open(full_path, "w", encoding="utf-8") as f:
             f.write("".join(new_content))
@@ -1346,19 +1357,28 @@ def apply_diff(path: str, diff: str) -> str:
 
 
 def _apply_unified_diff(original_lines, diff_text):
-    """Minimal unified-diff applier. Returns (new_lines, applied_count,
-    rejected_count). Each hunk is matched by its `@@ -N,n +M,m @@` header
-    and then replayed line-by-line."""
+    """Unified-diff applier with fuzzy line-number recovery.
+
+    Returns (new_lines, applied_count, rejections). `rejections` is a
+    list of dicts describing each failed hunk so the caller can build
+    a diagnostic error message — empty list means everything applied.
+
+    Each hunk is parsed into pre-image + post-image then matched
+    against the file. We try the header-claimed offset first, and if
+    that fails (LLMs frequently hallucinate line numbers), we scan
+    the whole file for a unique position whose pre-image matches.
+    """
     lines = diff_text.splitlines()
     new_content = list(original_lines)
     applied = 0
-    rejected = 0
+    rejections: list = []
     i = 0
     # Track cumulative offset from prior hunks so later hunks land at
     # the right line numbers after additions/deletions.
     offset = 0
     hunk_header = re.compile(r"^@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s+@@")
 
+    hunk_idx = 0
     while i < len(lines):
         line = lines[i]
         m = hunk_header.match(line)
@@ -1366,8 +1386,9 @@ def _apply_unified_diff(original_lines, diff_text):
             i += 1
             continue
 
+        hunk_idx += 1
         old_start = int(m.group(1))
-        new_start = int(m.group(3))
+        header_text = line
         # Collect hunk body until next @@ or end
         body = []
         i += 1
@@ -1375,53 +1396,146 @@ def _apply_unified_diff(original_lines, diff_text):
             body.append(lines[i])
             i += 1
 
-        # Apply this hunk
-        # Compute the index in new_content where the hunk starts (1-based to 0-based)
-        idx = old_start - 1 + offset
-        if old_start == 0:  # special case: empty file pre-image
-            idx = 0
-        ok, replacement = _apply_hunk(new_content, idx, body)
-        if not ok:
-            rejected += 1
+        pre, post = _parse_hunk_body(body)
+
+        # Pure-insertion hunk (no pre-image): insert at the header offset.
+        if not pre:
+            idx = max(0, old_start - 1 + offset) if old_start else 0
+            new_content[idx:idx] = post
+            offset += len(post)
+            applied += 1
             continue
-        # `replacement` is (delete_count, insert_lines)
-        del_count, insert_lines = replacement
-        new_content[idx:idx + del_count] = insert_lines
-        offset += len(insert_lines) - del_count
-        applied += 1
 
-    return new_content, applied, rejected
+        # Try the header-claimed offset first.
+        idx = old_start - 1 + offset if old_start else 0
+        if _pre_image_matches_at(new_content, idx, pre):
+            new_content[idx:idx + len(pre)] = post
+            offset += len(post) - len(pre)
+            applied += 1
+            continue
+
+        # Fuzzy: scan the whole file for a position whose pre-image
+        # matches. Prefer the position closest to the header hint.
+        found = _scan_for_pre_image(new_content, pre, prefer_near=idx)
+        if found is not None:
+            new_content[found:found + len(pre)] = post
+            offset += len(post) - len(pre) + (found - idx)
+            applied += 1
+            continue
+
+        rejections.append({
+            "index": hunk_idx,
+            "header": header_text,
+            "expected": [p.rstrip("\n") for p in pre],
+            "found_near": _peek_window(new_content, idx, len(pre)),
+        })
+
+    return new_content, applied, rejections
 
 
-def _apply_hunk(content_lines, start_idx, body):
-    """Replay a single hunk's body at start_idx. Returns
-    (ok, (delete_count, insert_lines))."""
-    # Build the expected pre-image and the post-image from the hunk body
-    pre = []
-    post = []
+def _parse_hunk_body(body):
+    """Split a hunk body into pre-image / post-image lists, each ending
+    with `\\n` so we can splice straight into the file content list."""
+    pre, post = [], []
     for bl in body:
-        if bl.startswith("-"):
-            pre.append(bl[1:] + "\n" if not bl.endswith("\n") else bl[1:])
-        elif bl.startswith("+"):
-            post.append(bl[1:] + "\n" if not bl.endswith("\n") else bl[1:])
-        elif bl.startswith(" ") or bl == "":
-            pre.append((bl[1:] if bl.startswith(" ") else bl) + ("\n" if not bl.endswith("\n") else ""))
-            post.append((bl[1:] if bl.startswith(" ") else bl) + ("\n" if not bl.endswith("\n") else ""))
-        elif bl.startswith("\\"):
-            # "\ No newline at end of file" — strip the trailing newline
-            # from the previous line in pre/post.
+        if not bl:
+            # Truly empty body line = a context line for an empty
+            # line in the file.
+            pre.append("\n")
+            post.append("\n")
+            continue
+        tag, rest = bl[0], bl[1:]
+        # Restore the trailing newline so the line matches lines read
+        # with splitlines(keepends=True).
+        line_with_nl = rest if rest.endswith("\n") else rest + "\n"
+        if tag == "-":
+            pre.append(line_with_nl)
+        elif tag == "+":
+            post.append(line_with_nl)
+        elif tag == " ":
+            pre.append(line_with_nl)
+            post.append(line_with_nl)
+        elif tag == "\\":
+            # "\ No newline at end of file" — drop the trailing newline
+            # from the most recently appended line in each arr.
             for arr in (pre, post):
                 if arr and arr[-1].endswith("\n"):
                     arr[-1] = arr[-1][:-1]
-    # Verify pre-image matches the file at start_idx
-    if start_idx < 0 or start_idx + len(pre) > len(content_lines):
-        return False, (0, [])
+        else:
+            # Tolerate prefix-less context lines (an LLM mistake where
+            # the leading space got eaten). Treat as context.
+            line_with_nl = bl if bl.endswith("\n") else bl + "\n"
+            pre.append(line_with_nl)
+            post.append(line_with_nl)
+    return pre, post
+
+
+def _pre_image_matches_at(content, start_idx, pre):
+    """True iff `pre` lines match `content[start_idx:]` line-for-line
+    using rstrip-aware equality (tolerates trailing whitespace and
+    CRLF/LF differences)."""
+    if start_idx < 0 or start_idx + len(pre) > len(content):
+        return False
     for j, expected in enumerate(pre):
-        actual = content_lines[start_idx + j]
-        # Be lenient about trailing whitespace differences
-        if actual.rstrip() != expected.rstrip():
-            return False, (0, [])
-    return True, (len(pre), post)
+        if content[start_idx + j].rstrip() != expected.rstrip():
+            return False
+    return True
+
+
+def _scan_for_pre_image(content, pre, prefer_near=0):
+    """Find an offset where `pre` matches the file. When multiple
+    matches exist, pick the one closest to `prefer_near` (the
+    header-claimed offset)."""
+    if not pre:
+        return None
+    matches = []
+    max_start = len(content) - len(pre)
+    for start in range(0, max_start + 1):
+        if _pre_image_matches_at(content, start, pre):
+            matches.append(start)
+    if not matches:
+        return None
+    # Closest-to-hint wins; ties broken by lower index.
+    matches.sort(key=lambda s: (abs(s - prefer_near), s))
+    return matches[0]
+
+
+def _peek_window(content, idx, length):
+    """Return a small slice of the file around `idx` for error messages."""
+    if not content:
+        return []
+    lo = max(0, idx)
+    hi = min(len(content), idx + max(length, 3))
+    return [content[j].rstrip("\n") for j in range(lo, hi)]
+
+
+def _format_rejections(rejections, path):
+    """Build a human-readable error block when one or more hunks fail.
+    Designed for the agent to read and self-correct, not the user."""
+    parts = [
+        f"Error: {len(rejections)} hunk(s) failed to apply to {path}.",
+        "",
+    ]
+    for rej in rejections:
+        parts.append(f"── Hunk #{rej['index']}  {rej['header']}")
+        parts.append("  Expected (pre-image):")
+        for line in rej["expected"][:8]:
+            parts.append(f"    │ {line}")
+        if len(rej["expected"]) > 8:
+            parts.append(f"    │ … ({len(rej['expected']) - 8} more lines)")
+        parts.append("  Found at that position in the file:")
+        if rej["found_near"]:
+            for line in rej["found_near"][:8]:
+                parts.append(f"    │ {line}")
+        else:
+            parts.append("    (past end of file)")
+        parts.append("")
+    parts.append(
+        "The hunk's context lines don't match the file. Re-read the file "
+        "with read_file to get the exact lines, then regenerate the diff. "
+        "If the change is small, write_file is simpler."
+    )
+    return "\n".join(parts)
 
 
 # ── Codebase grep ──────────────────────────────────────────────────────────
