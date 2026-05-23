@@ -33,6 +33,43 @@ def _has_learning_signal(recent_history: str) -> bool:
         return False
     text = recent_history.lower()
     return any(cue in text for cue in _LEARNING_CUES)
+
+
+PREFLIGHT_KIND_THRESHOLD = 3  # >= this many distinct tool kinds → architect
+
+_KNOWN_TOOL_NAMES = frozenset({
+    "apply_diff", "write_file", "run_shell", "read_file", "list_dir",
+    "grep_codebase", "web_search", "web_fetch", "recall", "code_outline",
+    "git_diff", "git_log", "git_blame", "run_tests", "python_eval",
+    "schedule_task", "unschedule_task", "ask_user", "current_datetime",
+    "get_system_info",
+})
+
+
+def _parse_tool_lines(text: str) -> set:
+    """Extract known tool names from a newline-separated LLM response.
+
+    Lowercases, strips leading list markers (`-`, `*`, digits, `.`, `)`,
+    `(`, `[`, `]`), strips whitespace, filters to _KNOWN_TOOL_NAMES,
+    returns the unique set. Tolerates simple list formats. Rejects prose
+    (lines whose normalized form is not exactly a known tool name).
+    """
+    result: set = set()
+    if not text:
+        return result
+    for raw_line in text.splitlines():
+        token = raw_line.strip().lower()
+        if not token:
+            continue
+        # Strip leading list markers / punctuation.
+        token = token.lstrip("-*().[] \t0123456789")
+        # Strip trailing punctuation.
+        token = token.rstrip(" \t.,;:)]")
+        if token in _KNOWN_TOOL_NAMES:
+            result.add(token)
+    return result
+
+
 from dotenv import load_dotenv
 
 load_dotenv()
