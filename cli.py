@@ -460,6 +460,10 @@ class ChatUI:
                  padding=(1, 2)
              ))
 
+        plan_panel = self._render_plan_panel()
+        if plan_panel is not None:
+            parts.append(plan_panel)
+
         if self.architect_intent:
             parts.append(self._render_architect_intent(self.architect_intent))
 
@@ -498,6 +502,39 @@ class ChatUI:
         if not s or s.lower() in ("n/a", "none", "null"):
             return ""
         return s
+
+    def _render_plan_panel(self):
+        """Render the active plan as a sticky panel. Returns None when no plan."""
+        if self.current_plan is None or not self.current_plan.tasks:
+            return None
+        from theme import TASK_STATE_STYLE, TASK_STATE_FLASH
+
+        plan = self.current_plan
+        done, total = plan.progress()
+        now = time.time()
+
+        body_lines = []
+        for task in plan.tasks:
+            icon, color = TASK_STATE_STYLE.get(task.status, ("•", DIM))
+            flashing = now < self._task_flash_until.get(task.id, 0.0)
+            line_color = TASK_STATE_FLASH.get(task.status, color) if flashing else color
+
+            # Bold for in_progress so the eye finds it immediately.
+            weight = "bold " if task.status == "in_progress" else ""
+            line_text = Text()
+            line_text.append(f"  {icon} ", style=f"{weight}{line_color}")
+            line_text.append(f"{task.id}. ", style=f"dim {DIM}")
+            line_text.append(task.description, style=f"{weight}{line_color}")
+            body_lines.append(line_text)
+
+        title = f"Plan: {plan.title}  ·  {done}/{total}"
+        return Panel(
+            Group(*body_lines),
+            title=f"[bold {PRIMARY}]{title}[/bold {PRIMARY}]",
+            border_style=f"dim {PRIMARY}",
+            box=ROUNDED,
+            padding=(0, 1),
+        )
 
     def _render_architect_intent(self, intent):
         agent = intent.get("agent") or "?"
