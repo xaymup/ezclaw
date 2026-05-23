@@ -31,11 +31,15 @@ class Plan:
         return next((t for t in self.tasks if t.id == task_id), None)
 
     def advance(self, task_id: int, status: str) -> None:
-        """Transition a task to a new status. Invalid status or unknown id is a no-op."""
+        """Transition a task to a new status. Invalid status or unknown id is a no-op.
+        Already-finished tasks (done/skipped) cannot be regressed to in_progress."""
         if status not in TASK_STATUSES:
             return
         task = self.get_task(task_id)
         if task is None:
+            return
+        # Don't regress completed work
+        if task.status in ("done", "skipped") and status == "in_progress":
             return
         task.status = status
         if status == "in_progress":

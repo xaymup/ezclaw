@@ -123,3 +123,19 @@ def test_task_statuses_constant():
     assert "done" in TASK_STATUSES
     assert "failed" in TASK_STATUSES
     assert "skipped" in TASK_STATUSES
+
+
+def test_advance_cannot_regress_done_task_to_in_progress():
+    p = make_plan(3)
+    p.advance(1, "done")
+    p.advance(1, "in_progress")  # should be no-op
+    assert p.get_task(1).status == "done"
+    assert p.current_task_id is None
+
+
+def test_advance_cannot_regress_skipped_task_to_in_progress():
+    p = make_plan(3)
+    p.advance(1, "skipped")
+    p.advance(1, "in_progress")  # should be no-op
+    assert p.get_task(1).status == "skipped"
+    assert p.current_task_id is None

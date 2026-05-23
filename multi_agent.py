@@ -779,6 +779,23 @@ class MultiAgentSystem:
         labels = [lb for _, lb in self.ROUTING_EXAMPLES]
         return classify_by_similarity(user_input, examples, labels, threshold=0.6)
 
+    def _apply_intent_to_plan(self, intent):
+        """Apply task_updates / new_tasks / current_task_id from an execute()
+        intent to self.current_plan. Yields a plan_update chunk if a plan is
+        active. This is a generator helper — callers iterate."""
+        if self.current_plan is None:
+            return
+        for upd in intent.get("task_updates", []) or []:
+            if isinstance(upd, dict) and "id" in upd and "status" in upd:
+                self.current_plan.advance(upd["id"], upd["status"])
+        for new in intent.get("new_tasks", []) or []:
+            if isinstance(new, dict) and "after_id" in new and "description" in new:
+                self.current_plan.insert(new["after_id"], new["description"])
+        current_id = intent.get("current_task_id")
+        if current_id and self.current_plan.get_task(current_id):
+            self.current_plan.advance(current_id, "in_progress")
+        yield {"type": "plan_update", "plan": self.current_plan}
+
     def _format_routing_priors(self, priors: List[Dict]) -> str:
         if not priors:
             return ""
@@ -900,6 +917,8 @@ No fluff. No "In this task...". Just facts."""
             [f"- Task: {e['task']}\n  Result: {e['trace']}" for e in experiences]
         ) + "\n" if experiences else ""
 
+        skills_block = ""  # populated per-step below; planning pass uses empty initial value
+
         # Planning pass: produce a structured task list, or None for single-step.
         self.current_plan = self.architect.plan(
             user_input,
@@ -927,17 +946,7 @@ No fluff. No "In this task...". Just facts."""
             )
             
             # Apply plan mutations from the execute intent
-            if self.current_plan is not None:
-                for upd in intent.get("task_updates", []) or []:
-                    if isinstance(upd, dict) and "id" in upd and "status" in upd:
-                        self.current_plan.advance(upd["id"], upd["status"])
-                for new in intent.get("new_tasks", []) or []:
-                    if isinstance(new, dict) and "after_id" in new and "description" in new:
-                        self.current_plan.insert(new["after_id"], new["description"])
-                current_id = intent.get("current_task_id")
-                if current_id and self.current_plan.get_task(current_id):
-                    self.current_plan.advance(current_id, "in_progress")
-                yield {"type": "plan_update", "plan": self.current_plan}
+            yield from self._apply_intent_to_plan(intent)
 
             # Yield the full intent for UI display (Reflection + Plan)
             yield {
@@ -999,6 +1008,7 @@ No fluff. No "In this task...". Just facts."""
                         map_block=map_block, experiences_block=exp_block,
                         temperature=0.7, pivot_hint=hint,
                     )
+                    yield from self._apply_intent_to_plan(intent)
                     yield {
                         "type": "intent",
                         "reflection": intent.get("reflection"),
