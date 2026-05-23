@@ -221,6 +221,12 @@ class ChatUI:
         # so identical consecutive statuses don't fire twice.
         self._last_notified_status = None
 
+        # Resolved display name for the user bubble. Cached so the memory
+        # lookup doesn't run on every turn — invalidated whenever the
+        # agent stores a new memory (a `remember` tool call could be
+        # depositing a name).
+        self.user_name = self._resolve_user_name()
+
     def _wrap_tools(self):
         from tools import registry
         original_run_shell = registry.tools.get('run_shell')
@@ -1047,7 +1053,9 @@ class ChatUI:
         # scrolled up while reading older history.
         self._force_scroll_next_update = True
         self._last_notified_status = None  # fresh turn, allow notifications again
-        self.history_ansi.append(render_to_ansi(Panel(text, title="User", border_style=PRIMARY)))
+        self.history_ansi.append(render_to_ansi(Panel(
+            text, title=self.user_name, border_style=PRIMARY,
+        )))
         self.is_generating = True
         self.current_response_parts = []
         self.reasoning_chunks = []
@@ -1314,6 +1322,12 @@ class ChatUI:
                     continue
                 elif chunk["type"] == "memory_stored":
                     self.side_messages.append(f"📝 {chunk['fact']}")
+                    # The agent might have just stored "my name is X" via
+                    # the remember tool — re-resolve the bubble title so
+                    # subsequent turns pick up the new name.
+                    fact_text = str(chunk.get("fact", "")).lower()
+                    if any(k in fact_text for k in ("name is", "i am ", "i'm ", "name:")):
+                        self.user_name = self._resolve_user_name()
                 elif chunk["type"] == "context_augmented":
                     for m in chunk["memories"]:
                         self.side_messages.append(f"📎 {m}")
@@ -1342,6 +1356,53 @@ class ChatUI:
         self.tool_executions = []
         self.side_messages = []
         self._update_ui()
+
+    def _resolve_user_name(self) -> str:
+        """Decide what to put on the user-message bubble title.
+
+        Priority:
+          1. EZCLAW_USER (or EZCLAW_USER_NAME) env var — explicit override
+          2. The agent's memory — search for "my name is X" / "I am X" /
+             "user's name is X" facts (the `remember` tool may have stored
+             one in a past session)
+          3. System login name from getpass.getuser(), capitalized
+          4. The literal string "User" if even getpass fails
+
+        Cached on self.user_name; re-resolved on memory_stored chunks so a
+        live `remember("my name is …")` updates the bubble immediately.
+        """
+        explicit = os.environ.get("EZCLAW_USER") or os.environ.get("EZCLAW_USER_NAME")
+        if explicit and explicit.strip():
+            return explicit.strip()
+
+        try:
+            memories = self.agent.db.search_memories_hybrid(
+                "my name is", alpha=0.6, threshold=0.3
+            )
+            pat = re.compile(
+                r"(?:my name is|i am|i'm|user'?s? name is|name:|user:)\s+"
+                r"([A-Za-z][A-Za-z\-]{0,30})",
+                re.IGNORECASE,
+            )
+            for m in memories or []:
+                match = pat.search(str(m))
+                if match:
+                    name = match.group(1).strip()
+                    if name and name.lower() not in (
+                        "the", "a", "an", "ezclaw", "user", "trying", "going",
+                    ):
+                        return name.capitalize()
+        except Exception:
+            pass
+
+        try:
+            import getpass
+            login = getpass.getuser()
+            if login:
+                return login.capitalize()
+        except Exception:
+            pass
+        return "User"
 
     def _maybe_notify_from_status(self, status: str) -> None:
         """Send a desktop notification when a status string signals that
