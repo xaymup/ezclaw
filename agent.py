@@ -302,6 +302,12 @@ Respond with JSON only:
         iteration_count = 0
         max_iterations = 15
         last_tool_hash = None
+        repeat_count = 0
+        # Allow up to this many *consecutive* identical tool batches before
+        # halting. Re-reading a file after a write, or re-running `make` to
+        # verify a fix, are legit repeats — only a third identical call
+        # signals a truly stuck loop.
+        REPEAT_LIMIT = 3
 
         # Tool pre-selection: only pass tools relevant to the current query
         selected_tools = self._select_relevant_tools(user_input, top_n=20) if len(self.tools) > 20 else self.tools
@@ -388,8 +394,15 @@ Respond with JSON only:
 
             current_hash = hash(str([(t.function.name, t.function.arguments) for t in tool_calls]))
             if tool_calls and current_hash == last_tool_hash:
-                yield {"type": "content", "content": "\n[System: Loop detected. Stopping.]"}
-                break
+                repeat_count += 1
+                if repeat_count >= REPEAT_LIMIT:
+                    yield {
+                        "type": "content",
+                        "content": f"\n[System: same tool call repeated {repeat_count + 1}× — stopping.]",
+                    }
+                    break
+            else:
+                repeat_count = 0
             last_tool_hash = current_hash
 
             if not tool_calls:
