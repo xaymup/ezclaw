@@ -2173,6 +2173,11 @@ class ChatUI:
         
         # Finish generating
         self.is_generating = False
+        # Inline-save pass: parse tagged code blocks, save them, rewrite
+        # the joined content with badges. Skipped if halted (the turn will
+        # resume; saves wait until the user truly ends the turn).
+        if not self.halted and self.current_response_parts:
+            self._process_inline_saves()
         if not self.halted:
             final_renderable = self._get_current_renderable_ansi()
             self.history_ansi.append(final_renderable)
@@ -2228,6 +2233,125 @@ class ChatUI:
         except Exception:
             pass
         return "User"
+
+    def _process_inline_saves(self) -> None:
+        """End-of-turn pass: parse tagged code blocks from the response,
+        save them, rewrite the joined content with badges. Best-effort —
+        any exception is logged to stderr and swallowed."""
+        try:
+            from inline_code_saver import parse_tagged_blocks, plan_saves, apply_save, SaveResult
+            joined = "".join(self.current_response_parts)
+            blocks = parse_tagged_blocks(joined)
+            if not blocks:
+                return
+            plans = plan_saves(blocks, workspace_root="workspace")
+            results = []
+            for plan in plans:
+                if plan.error is not None:
+                    results.append(SaveResult(plan=plan, status="rejected", final_path=None))
+                    continue
+                if plan.exists:
+                    choice = self._ask_save_collision(plan)
+                    results.append(apply_save(plan, choice))
+                else:
+                    results.append(apply_save(plan, "write"))
+            rewritten = self._rewrite_with_badges(joined, results)
+            self.current_response_parts = [rewritten]
+            for r in results:
+                if r.status in ("succeeded", "renamed"):
+                    self._record_inline_save_action(r)
+        except Exception as e:
+            import sys
+            print(f"[inline-save] pass failed: {e}", file=sys.stderr)
+
+    def _rewrite_with_badges(self, joined: str, results: list) -> str:
+        """Replace each tagged opening fence with a plain `lang` fence
+        and prepend a blockquote badge indicating save status."""
+        import os as _os
+        out = joined
+        # Apply in reverse offset order so earlier offsets stay valid.
+        for r in sorted(results, key=lambda x: x.plan.block.start, reverse=True):
+            block = r.plan.block
+            if r.status == "succeeded":
+                badge = f"> 💾 **saved →** `workspace/{block.path}`\n\n"
+                new_fence = f"```{block.lang}" if block.lang else "```"
+            elif r.status == "renamed":
+                final_rel = _os.path.relpath(
+                    r.final_path, _os.path.abspath("workspace"),
+                )
+                badge = f"> 💾 **saved →** `workspace/{final_rel}` (renamed; original existed)\n\n"
+                new_fence = f"```{block.lang}" if block.lang else "```"
+            elif r.status == "skipped":
+                badge = f"> ⊘ **skipped →** `workspace/{block.path}` (existed)\n\n"
+                new_fence = f"```{block.lang}" if block.lang else "```"
+            elif r.status == "rejected":
+                err_msg = r.plan.error or "rejected"
+                badge = f"> ⚠ **rejected →** `{block.plan.path if hasattr(block, 'plan') else block.path}` ({err_msg}; kept inline)\n\n"
+                new_fence = f"```{block.lang}" if block.lang else "```"
+            else:
+                continue
+            opener_len = len(block.raw_open_fence)
+            opener_end = block.start + opener_len
+            out = out[:block.start] + badge + new_fence + out[opener_end:]
+        return out
+
+    def _ask_save_collision(self, plan) -> str:
+        """Block on user input for a collision. Returns 'write', 'skip',
+        or 'rename'. Defaults to 'rename' (safe non-destructive) on UI
+        failure or timeout. For v1, the CLI's keystroke wiring isn't yet
+        extended to recognize O/S/R while a collision is pending; until
+        that exists, this method falls back to 'rename' immediately to
+        guarantee non-destructive behavior."""
+        try:
+            self.side_messages.append(
+                f"💾 collision on {plan.block.path} — auto-renamed to next free suffix "
+                f"(extend cli to enable O/S/R keystrokes)"
+            )
+            self._update_ui()
+            return "rename"
+        except Exception:
+            return "rename"
+
+    def _record_inline_save_action(self, result) -> None:
+        """Record a successful inline-save as an action row."""
+        try:
+            import os as _os
+            import json as _json
+            import pickle as _pickle
+            from tools import get_session_context
+            from embed import embed as _embed
+            session_id = get_session_context()
+            if session_id is None:
+                return
+            db = getattr(self.agent, "db", None)
+            if db is None:
+                return
+            if result.status == "succeeded":
+                path = result.plan.block.path
+            else:
+                path = _os.path.relpath(
+                    result.final_path, _os.path.abspath("workspace"),
+                )
+            summary = f"saved {_os.path.basename(path)}"
+            outcome = "succeeded" if result.status == "succeeded" else "partial"
+            try:
+                vec = _embed(summary)
+                emb_blob = _pickle.dumps(vec)
+            except Exception:
+                emb_blob = None
+            db.add_action(
+                session_id=session_id,
+                tool="inline_save",
+                args_json=_json.dumps({"path": path}),
+                summary=summary,
+                why=None,
+                outcome=outcome,
+                error_excerpt=None,
+                embedding=emb_blob,
+            )
+        except Exception as e:
+            import sys
+            print(f"[inline-save] action record failed: {e}", file=sys.stderr)
 
     def _maybe_notify_from_status(self, status: str) -> None:
         """Send a desktop notification when a status string signals that
