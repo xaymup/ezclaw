@@ -186,6 +186,12 @@ class ChatUI:
         # can pick role-specific visuals.
         self.current_role: str | None = None
 
+        # When the routed role changes, render the chip in flash_color for
+        # one tick of ~150ms to signal the handoff. `_chip_flash_until`
+        # is a monotonic timestamp; the chip checks `time.time() < x`.
+        self._last_chip_role: str | None = None
+        self._chip_flash_until: float = 0.0
+
         # Cache one Spinner per role — rich's Spinner derives its current
         # frame from (now - start_time) / interval, so re-creating a fresh
         # spinner each tick would always reset start_time and freeze the
@@ -498,12 +504,15 @@ class ChatUI:
         if not self.show_architect:
             # Compact: dim one-liner — keeps routing context visible without
             # the screen-eating panels. F3 expands.
+            rs = THEME.role(agent)
+            flashing = time.time() < self._chip_flash_until
+            chip_color = rs.flash_color if flashing else rs.color
             headline = goal or (plan.splitlines()[0] if plan else reasoning) or "thinking…"
             if len(headline) > 110:
                 headline = headline[:107] + "…"
             line = Text()
-            line.append("→ ", style=f"dim {DIM}")
-            line.append(agent, style=f"bold {role_color}")
+            line.append(f"{rs.icon} ", style=f"bold {chip_color}")
+            line.append(agent, style=f"bold {chip_color}")
             line.append(" · ", style=f"dim {DIM}")
             line.append(headline, style=f"italic {DIM}")
             line.append("   [F3] expand", style=f"dim {DIM}")
@@ -723,6 +732,8 @@ class ChatUI:
         self.side_messages = []
         self.architect_intent = None
         self.current_role = None
+        self._last_chip_role = None
+        self._chip_flash_until = 0.0
         self.current_status = "connecting..."
         self.generation_start_time = time.time()
         self.last_chunk_time = time.time()
@@ -921,6 +932,9 @@ class ChatUI:
                     self.architect_intent = chunk
                     new_role = chunk.get("agent")
                     if new_role:
+                        if self._last_chip_role and new_role != self._last_chip_role:
+                            self._chip_flash_until = time.time() + 0.15
+                        self._last_chip_role = new_role
                         self.current_role = new_role
                 elif chunk["type"] == "reasoning":
                     self.reasoning_chunks.append(chunk["content"])
