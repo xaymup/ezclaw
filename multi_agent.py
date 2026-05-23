@@ -105,7 +105,8 @@ Rules:
 - When user shares personal info ("my name is X", "I like Y"), use `remember` to store it.
 - When user asks about themselves ("what's my name", "do you know me"), use `recall` to check.
 - Use `forget` if the user asks you to delete something.
-- If recall returns nothing relevant, say so directly — don't fabricate.""",
+- If recall returns nothing relevant, say so directly — don't fabricate.
+- **For ANY question about workspace content** — a project, file, directory, build, "the code", "how to run X", "is X done" — your training data doesn't contain the user's workspace. Use `list_dir` to see what's there, `read_file` to inspect specific files, and `run_shell` (with `interactive=false`) to check things like `make -n` or `ls`. Don't fabricate answers from prior knowledge when the workspace has the actual data.""",
     },
 }
 
@@ -421,10 +422,12 @@ Rules for plans:
 **Single-step / conversational request** → return:
 {"kind": "single", "reason": "<one-line explanation>"}
 
-Return `kind: single` when the request is:
-- Conversational ("hi", "what does X do", "explain Y")
-- A single file read / lookup
-- Anything that genuinely doesn't decompose into 2+ meaningful steps
+Return `kind: single` ONLY when the request is purely workspace-independent:
+- Greetings, acknowledgments, social niceties ("hi", "thanks", "lol")
+- Definitions of general concepts ("what is recursion", "explain async/await")
+- Arithmetic, simple computations the model can do in its head
+
+**Anything that names something in the workspace requires inspection** — a project name (blex_os, the API server), a file (cli.py, README), a directory, "the build", "the tests", "this code", "the bug", "how to run X" where X is in `./workspace/` — return `kind: plan`. The executor needs `read_file` / `list_dir` / `run_shell` to actually look at what's there; the model's training data does NOT contain the user's workspace.
 
 ═══════════════════════════════════════════════════════════════
 ## Mode 2: EXECUTION REQUEST
@@ -461,8 +464,16 @@ Rules for execution:
 ## When no plan is active (single-step path)
 ═══════════════════════════════════════════════════════════════
 
-If the EXECUTION REQUEST says `Plan: (none — single-step request)`, the routed agent will respond once or twice. Set `current_task_id` to `0`, leave `task_updates` and `new_tasks` empty. For completion:
-- **Set `complete: true`** as soon as the routed agent has produced a reply that addresses the user's request (a chat reply, an answer, a successful one-shot tool use). Do not iterate further "just to verify" — there is no plan to verify against.
+If the EXECUTION REQUEST says `Plan: (none — single-step request)`, the routed agent will respond once or twice. Set `current_task_id` to `0`, leave `task_updates` and `new_tasks` empty.
+
+**Routing in single-step mode:**
+- `general` — pure chat ONLY (greetings, definitions of general concepts, arithmetic). The general agent uses no tools by default; route here only when there's nothing in the workspace to look at.
+- `executor` — anything that needs file/shell access. If the user mentions a workspace file, project, or "the code", route here even in single-step.
+- `researcher` — web/documentation lookup the executor can't do locally.
+- `debugger` — root-cause analysis of an unexpected error.
+
+For completion:
+- **Set `complete: true`** as soon as the routed agent has produced a reply that addresses the user's request.
 - **Keep `complete: false`** only if the agent errored out, returned obviously incomplete output, or the routing was wrong and you need to retry with a different agent.
 
 ## Persistence
