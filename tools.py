@@ -17,6 +17,7 @@ MUTATING_TOOLS = frozenset({
     "run_shell",
     "schedule_task",
     "unschedule_task",
+    "inline_save",
 })
 
 # Set by the agent at session start; read by recall_actions to scope its
