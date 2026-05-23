@@ -471,16 +471,63 @@ def web_fetch(url: str) -> str:
 @registry.register
 def schedule_task(scheduled_time: str, description: str) -> str:
     """
-    Schedule a task (YYYY-MM-DD HH:MM).
+    Schedule a task to run at a future time (YYYY-MM-DD HH:MM).
+
+    When the time arrives, ezclaw's heartbeat monitor will auto-execute
+    the description as if the user had typed it — the agent plans and
+    runs it autonomously. Returns the new task's stable ID, which can be
+    passed to unschedule_task() to cancel before it fires.
     """
+    from scheduler import Scheduler
     try:
-        datetime.strptime(scheduled_time, '%Y-%m-%d %H:%M')
-        row = f"| {scheduled_time} | {description} | Pending |\n"
-        with open("heartbeat.md", "a") as f:
-            f.write(row)
-        return f"Task scheduled: {description} at {scheduled_time}"
+        task = Scheduler().schedule(scheduled_time, description)
+        return f"Task scheduled [#{task.id}]: {task.description} at {task.time_str}"
     except ValueError:
         return "Error: Use 'YYYY-MM-DD HH:MM' format."
+    except Exception as e:
+        return f"Error scheduling task: {e}"
+
+
+@registry.register
+def unschedule_task(task_id: int) -> str:
+    """
+    Cancel a pending scheduled task by its ID.
+
+    Returns success or an explanation of why it couldn't be cancelled
+    (e.g. unknown ID, task already completed). Use list_scheduled_tasks
+    to see active IDs.
+    """
+    from scheduler import Scheduler
+    try:
+        task = Scheduler().unschedule(int(task_id))
+        if task is None:
+            return f"No pending task with ID {task_id} (already done, cancelled, or unknown)."
+        return f"Cancelled task [#{task.id}]: {task.description} (was scheduled for {task.time_str})"
+    except (TypeError, ValueError):
+        return f"Error: task_id must be an integer, got {task_id!r}"
+    except Exception as e:
+        return f"Error unscheduling task: {e}"
+
+
+@registry.register
+def list_scheduled_tasks() -> str:
+    """
+    List all active (Pending or Notified) scheduled tasks with their IDs.
+
+    Useful before calling unschedule_task or to remind the user what's
+    queued up.
+    """
+    from scheduler import Scheduler
+    try:
+        tasks = Scheduler().list_pending()
+        if not tasks:
+            return "No scheduled tasks pending."
+        lines = ["Active scheduled tasks:"]
+        for t in sorted(tasks, key=lambda x: x.time):
+            lines.append(f"  [#{t.id}] {t.time_str}  {t.status}  — {t.description}")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error listing tasks: {e}"
 
 @registry.register
 def generate_codebase_map(path: str = ".") -> str:

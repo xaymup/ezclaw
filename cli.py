@@ -1184,32 +1184,77 @@ class ChatUI:
         self.app.run()
 
     def _heartbeat_monitor(self):
+        """Poll the Scheduler every 30s for due tasks. When a task fires,
+        feed its description into the agent as if the user had typed it —
+        the architect plans, sub-agents execute. If the agent is already
+        busy on a user-driven turn, the firing is deferred to the next tick.
+        """
+        from scheduler import Scheduler
+        sched = Scheduler()
         while True:
             try:
-                if os.path.exists("heartbeat.md"):
-                    with open("heartbeat.md", "r") as f:
-                        lines = f.readlines()
-                    updated = False
-                    new_lines = []
-                    for line in lines:
-                        if "| Pending |" in line:
-                            parts = [p.strip() for p in line.split("|")]
-                            if len(parts) >= 4:
-                                try:
-                                    task_time = datetime.strptime(parts[1], '%Y-%m-%d %H:%M')
-                                    if task_time <= datetime.now():
-                                        msg = f"🔔 SCHEDULED TASK DUE: {parts[2]}"
-                                        self.history_ansi.append(render_to_ansi(Text(msg, style=WARN)))
-                                        self._update_ui()
-                                        line = line.replace("| Pending |", "| Notified |")
-                                        updated = True
-                                except: pass
-                        new_lines.append(line)
-                    if updated:
-                        with open("heartbeat.md", "w") as f:
-                            f.writelines(new_lines)
-            except Exception: pass
+                # Don't fire scheduled tasks while a user-driven turn is in
+                # flight — they'd collide in the same generator. Try again
+                # next tick.
+                if not self.is_generating:
+                    due = sched.find_due()
+                    for task in due:
+                        # Mark Notified immediately so a long-running auto-run
+                        # doesn't get re-fired on the next tick.
+                        sched.mark_status(task.id, "Notified")
+                        self._fire_scheduled_task(task, sched)
+                        # Only one auto-fire per tick — the agent is now busy
+                        # for this one; remaining due tasks wait.
+                        break
+            except Exception:
+                pass
             time.sleep(30)
+
+    def _fire_scheduled_task(self, task, sched):
+        """Show a scheduled-task banner and run the task description through
+        the agent as if it were a user prompt. Status moves Notified → Done
+        when the agent finishes, or Failed if it raises."""
+        from rich.panel import Panel as _Panel
+        banner = _Panel(
+            Text(f"🔔 [#{task.id}] {task.description}", style=f"bold {WARN}"),
+            title=f"[bold {WARN}]Scheduled task auto-running[/bold {WARN}]",
+            border_style=WARN,
+            box=ROUNDED,
+        )
+        self.history_ansi.append(render_to_ansi(banner))
+        self._force_scroll_next_update = True
+
+        # Reuse the same per-turn reset that handle_input does — clean
+        # plan state, fresh chip, etc.
+        self.is_generating = True
+        self.current_response_parts = []
+        self.reasoning_chunks = []
+        self.tool_executions = []
+        self.side_messages = []
+        self.architect_intent = None
+        self.current_role = None
+        self._last_chip_role = None
+        self._chip_flash_until = 0.0
+        self.current_plan = None
+        self._last_task_states = {}
+        self._task_flash_until = {}
+        self.current_status = "auto-running…"
+        self.generation_start_time = time.time()
+        self.last_chunk_time = time.time()
+
+        self._update_ui()
+        self._start_animation_loop()
+
+        def worker():
+            try:
+                self._agent_worker(task.description)
+                # Reach here only after the worker generator exhausts.
+                # _agent_worker handles its own is_generating reset.
+                sched.mark_status(task.id, "Done")
+            except Exception:
+                sched.mark_status(task.id, "Failed")
+
+        threading.Thread(target=worker, daemon=True).start()
 
 if __name__ == "__main__":
     ui = ChatUI()
