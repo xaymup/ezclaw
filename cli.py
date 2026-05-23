@@ -1602,7 +1602,10 @@ class ChatUI:
                 self.current_response_parts.append("\n\n*↳ continuing…*\n\n")
                 self._force_scroll_next_update = True
                 self.is_generating = True
-                self._agent_worker(text)
+                self._start_animation_loop()
+                threading.Thread(
+                    target=self._agent_worker, args=(text,), daemon=True
+                ).start()
                 return
             # Non-continuation: finalize the prior halted panel first.
             final_renderable = self._get_current_renderable_ansi()
