@@ -237,6 +237,14 @@ class ChatUI:
         # depositing a name).
         self.user_name = self._resolve_user_name()
 
+        # ask_user back-channel: when the agent calls the ask_user tool,
+        # _pending_user_question holds the question text and the worker
+        # thread blocks on _user_answer_queue.get() until handle_input
+        # forwards the user's typed reply.
+        self._pending_user_question: str | None = None
+        self._user_answer_queue: "queue.Queue[str]" = queue.Queue()
+        self._wire_tool_callbacks()
+
     def _wrap_tools(self):
         from tools import registry
         original_run_shell = registry.tools.get('run_shell')
@@ -354,6 +362,92 @@ class ChatUI:
             return result
 
         registry.tools['run_shell'] = wrapped_run_shell
+
+    def _wire_tool_callbacks(self):
+        """Register the runtime back-channels for ask_user and critique.
+
+        The tool functions themselves live in tools.py and call into
+        these callbacks when invoked by an agent. We register them once
+        at startup so they pick up changes to ChatUI state automatically.
+        """
+        import tools as _tools
+        _tools.set_ask_user_callback(self._on_ask_user_tool)
+        _tools.set_critique_callback(self._on_critique_tool)
+
+    def _on_ask_user_tool(self, question: str) -> str:
+        """Block the agent worker until the user types an answer.
+
+        Runs on the agent worker thread — NEVER call from the UI thread,
+        or the UI thread will deadlock waiting for itself.
+        """
+        # Drain any stale answer from a prior race
+        try:
+            while True:
+                self._user_answer_queue.get_nowait()
+        except queue.Empty:
+            pass
+
+        self._pending_user_question = question
+        self._update_ui()
+
+        # Surface a desktop notification so the user can come back from
+        # another window — same pattern as the auth prompt.
+        try:
+            from notifications import notify, URGENCY_NORMAL
+            notify(
+                "🦀 ezclaw has a question",
+                question[:140],
+                urgency=URGENCY_NORMAL,
+            )
+        except Exception:
+            pass
+
+        try:
+            answer = self._user_answer_queue.get()
+        finally:
+            self._pending_user_question = None
+            self._update_ui()
+        return answer or ""
+
+    def _on_critique_tool(self, draft: str, context: str) -> str:
+        """Run a quick adversarial critique using the architect's model.
+
+        Returns a short bulleted critique. Best-effort — on any failure
+        we return a string the tool wraps as the result so the calling
+        agent never sees a raw exception.
+        """
+        if not ENABLE_MULTI_AGENT:
+            return "[critique requires multi-agent mode]"
+        arch = getattr(self.agent, "architect", None)
+        if arch is None or arch.client is None:
+            return "[critique unavailable — no architect client]"
+
+        system_msg = (
+            "You are a careful adversarial reviewer. Read the draft and "
+            "identify weaknesses, missing edge cases, factual errors, and "
+            "unstated assumptions. Be specific and concrete. Return 3-6 "
+            "short bullet points, each starting with one of: MISSING, "
+            "WRONG, RISKY, UNSTATED. If the draft looks solid, say so "
+            "in one bullet and stop."
+        )
+        user_msg = f"DRAFT:\n{draft}\n"
+        if context:
+            user_msg += f"\nCONTEXT THE CRITIC SHOULD KNOW:\n{context}\n"
+
+        try:
+            resp = arch.client.chat(
+                model=arch.model,
+                messages=[
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": user_msg},
+                ],
+                stream=False,
+                options={"temperature": 0.4, "num_predict": 600},
+            )
+            text = (resp.get("message", {}) or {}).get("content", "")
+            return text.strip() or "[critique returned no content]"
+        except Exception as e:
+            return f"[critique failed: {type(e).__name__}: {e}]"
 
     def _setup_keybindings(self):
         @self.kb.add('c-c')
@@ -713,14 +807,20 @@ class ChatUI:
         if self.architect_intent:
             parts.append(self._render_architect_intent(self.architect_intent))
 
-        # 5. Tool execution panels (sit between chip and plan — so the
-        #    tools the agent is running are visually grouped under the
-        #    current step they belong to)
+        # 5. Tool execution panels.
+        #    Tools that ran inside a plan step are nested INSIDE the plan
+        #    panel (see _render_plan_panel) so they sit visually under
+        #    their step. Tools that ran outside any plan (no current
+        #    plan, or the architect hadn't picked a step yet) fall back
+        #    to the flat layout here so they're still visible.
         for idx, tool in enumerate(self.tool_executions, 1):
+            if self.current_plan is not None and tool.get("task_id") is not None:
+                continue
             parts.append(self._build_tool_panel(tool, idx))
 
-        # 6 / 7. Auth prompt replaces plan slot when active; otherwise
-        #        the plan panel anchors the bottom of the active area.
+        # 6 / 7. Auth prompt or ask_user question replaces the plan slot
+        #        when active; otherwise the plan panel anchors the bottom
+        #        of the active area.
         if self.auth_active and self.current_auth_chunk:
             parts.append(Panel(
                 Text.assemble(
@@ -735,6 +835,19 @@ class ChatUI:
                 border_style="red",
                 box=ROUNDED,
                 padding=(1, 2)
+            ))
+        elif self._pending_user_question is not None:
+            parts.append(Panel(
+                Text.assemble(
+                    ("The agent is asking:", f"bold {ACCENT}"),
+                    ("\n\n", ""),
+                    (self._pending_user_question, "bold"),
+                    ("\n\nType your answer below and press Enter.", f"dim {DIM}"),
+                ),
+                title=f"[bold {ACCENT}]Question for you[/bold {ACCENT}]",
+                border_style=ACCENT,
+                box=ROUNDED,
+                padding=(1, 2),
             ))
         else:
             plan_panel = self._render_plan_panel()
@@ -790,6 +903,15 @@ class ChatUI:
         done, total = plan.progress()
         now = time.time()
 
+        # Group tool executions by the plan task they ran under so each
+        # task row is followed by a nested list of the tools it spawned.
+        tools_by_task: dict = {}
+        for idx, tool in enumerate(self.tool_executions, 1):
+            tid = tool.get("task_id")
+            if tid is None:
+                continue
+            tools_by_task.setdefault(tid, []).append((idx, tool))
+
         body_lines = []
         for task in plan.tasks:
             icon, color = TASK_STATE_STYLE.get(task.status, ("•", DIM))
@@ -813,6 +935,13 @@ class ChatUI:
             line_text.append(task.description, style=f"{weight}{line_color}")
             body_lines.append(line_text)
 
+            # Tool rows nested under this task. Compact one-line summary
+            # per tool: indented branch glyph + kind icon + name + first
+            # arg + result status. Tools awaiting a result get a spinner
+            # dot; tools that errored get a red ✗.
+            for tidx, tool in tools_by_task.get(task.id, []):
+                body_lines.append(self._render_nested_tool_row(tidx, tool))
+
         # Title color shifts through the sunset palette every ~1.5s so the
         # plan panel reads as actively alive. Border breathes between dim
         # and full saturation at ~0.6Hz — slow enough to feel meditative.
@@ -827,6 +956,53 @@ class ChatUI:
             box=ROUNDED,
             padding=(0, 1),
         )
+
+    def _render_nested_tool_row(self, idx: int, tool: dict):
+        """One-line summary for a tool call rendered under its plan step.
+
+        Format: `    ├─ ⚡ run_shell  ls -la …  ✓` — branch glyph, kind
+        icon, name, first arg summary, status marker. Indented two extra
+        spaces from the task glyph so the hierarchy reads at a glance.
+        """
+        kind = THEME.tool_kind(tool.get("name", ""))
+        name = tool.get("name", "?")
+        args = tool.get("args", {}) or {}
+        result = tool.get("result")
+
+        # Pick the most identifying arg to show inline.
+        first_value = ""
+        if isinstance(args, dict) and args:
+            for key in ("command", "path", "file_path", "url", "query", "question", "draft"):
+                if key in args and args[key]:
+                    first_value = str(args[key]).splitlines()[0].strip()
+                    break
+            if not first_value:
+                # Fall back to first arg in declaration order.
+                k0 = next(iter(args))
+                v0 = args.get(k0)
+                if v0 is not None:
+                    first_value = str(v0).splitlines()[0].strip()
+        if len(first_value) > 50:
+            first_value = first_value[:47] + "…"
+
+        if result is None:
+            status_icon = "…"
+            status_color = WARN
+        elif isinstance(result, str) and result.lower().startswith("error"):
+            status_icon = "✗"
+            status_color = ERR
+        else:
+            status_icon = "✓"
+            status_color = ACCENT
+
+        line = Text()
+        line.append("     ├─ ", style=f"dim {DIM}")
+        line.append(f"{kind.icon} ", style=f"bold {kind.color}")
+        line.append(name, style=f"bold {kind.color}")
+        if first_value:
+            line.append(f"  {first_value}", style=f"italic {SECONDARY}")
+        line.append(f"  {status_icon}", style=f"bold {status_color}")
+        return line
 
     def _render_architect_intent(self, intent):
         agent = intent.get("agent") or "?"
@@ -1259,6 +1435,18 @@ class ChatUI:
             self.app.exit()
             return
 
+        # An ask_user tool call is pending — route this keystroke straight
+        # to the answer queue and unblock the agent worker. Slash commands
+        # still work (let them fall through to the dispatcher) so the user
+        # can /cancel out of a question.
+        if self._pending_user_question is not None and not text.startswith("/"):
+            self.history_ansi.append(render_to_ansi(Panel(
+                text, title=self.user_name, border_style=PRIMARY,
+            )))
+            self._user_answer_queue.put(text)
+            self._update_ui()
+            return
+
         # An embedded interactive shell session is active. Routing depends
         # on the chat_mode toggle (flipped via Esc):
         #   chat_mode=False (default) → keystroke → subprocess input_queue
@@ -1374,6 +1562,19 @@ class ChatUI:
             self.agent.session_authorized = not self.agent.session_authorized
             status = "ENABLED (Always Allow)" if self.agent.session_authorized else "DISABLED (Ask per tool)"
             self.history_ansi.append(render_to_ansi(Text(f"Session authorization: {status}", style=ACCENT)))
+        elif cmd == "/cancel":
+            # Escape hatch: unblock a pending ask_user so the user can
+            # abandon a question without typing an answer (the agent
+            # receives the empty-answer marker and decides what to do).
+            if self._pending_user_question is not None:
+                self._user_answer_queue.put("")
+                self.history_ansi.append(render_to_ansi(
+                    Text("Cancelled pending question.", style=DIM)
+                ))
+            else:
+                self.history_ansi.append(render_to_ansi(
+                    Text("Nothing to cancel.", style=DIM)
+                ))
         elif cmd == "/settings":
             self._show_settings()
         elif cmd == "/queue":
@@ -1747,7 +1948,28 @@ class ChatUI:
                         self.side_messages.append(f"📎 {m}")
                 elif chunk["type"] == "tool_start":
                     is_int = chunk.get("interactive", False)
-                    self.tool_executions.append({"name": chunk["name"], "args": chunk["arguments"], "result": None, "interactive": is_int, "start_time": time.time(), "expanded": False})
+                    # Tag the call with the plan step it belongs to so the
+                    # plan panel can render tools nested under their task.
+                    active_task_id = None
+                    if self.current_plan is not None:
+                        active_task_id = self.current_plan.current_task_id
+                        # Fall back to the first in_progress task — guards
+                        # against the architect having not yet called
+                        # advance() for the step it's currently working on.
+                        if active_task_id is None:
+                            for t in self.current_plan.tasks:
+                                if t.status == "in_progress":
+                                    active_task_id = t.id
+                                    break
+                    self.tool_executions.append({
+                        "name": chunk["name"],
+                        "args": chunk["arguments"],
+                        "result": None,
+                        "interactive": is_int,
+                        "start_time": time.time(),
+                        "expanded": False,
+                        "task_id": active_task_id,
+                    })
                 elif chunk["type"] == "tool_end":
                     for tool in reversed(self.tool_executions):
                         if tool["name"] == chunk["name"] and tool["result"] is None:

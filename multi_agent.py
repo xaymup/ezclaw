@@ -131,10 +131,26 @@ Rules:
 }
 
 
+class _SharedAuthState:
+    """One-bit shared state for "user pressed [A] = allow for session".
+
+    Each SpecializedAgent reads/writes session_authorized through this
+    shared object, so when ONE agent's user-prompt session is authorized,
+    ALL sibling agents see it immediately. Previously each agent kept its
+    own bool, so pressing [A] in an executor prompt only authorized the
+    executor; the next architect step to (say) the researcher would
+    re-prompt for auth, defeating the [A] key.
+    """
+    __slots__ = ("authorized",)
+
+    def __init__(self):
+        self.authorized = False
+
+
 class SpecializedAgent:
     """Self-contained agent with its own model, prompt, tools, and history."""
 
-    def __init__(self, name: str, config: dict, db: Database):
+    def __init__(self, name: str, config: dict, db: Database, auth_state: "_SharedAuthState" = None):
         self.name = name
         self.client = build_agent_client()
         self.model = config["model"]
@@ -151,8 +167,17 @@ class SpecializedAgent:
             "num_gpu": int(os.getenv("OLLAMA_NUM_GPU", 999)),
         }
         self.keep_alive = os.getenv("OLLAMA_KEEP_ALIVE", "60m")
-        self.session_authorized = False
+        # Shared with sibling agents — see _SharedAuthState docstring.
+        self._auth_state = auth_state if auth_state is not None else _SharedAuthState()
         self._pre_embed_tools()
+
+    @property
+    def session_authorized(self) -> bool:
+        return self._auth_state.authorized
+
+    @session_authorized.setter
+    def session_authorized(self, value: bool) -> None:
+        self._auth_state.authorized = bool(value)
 
     def _pre_embed_tools(self):
         self._tool_embeddings = {}
@@ -476,6 +501,7 @@ Rules for execution:
 - `current_task_id` must reference an existing task in the plan (not yet `done`/`failed`/`skipped`).
 - `task_updates` is for tasks finishing in the current step. Only mark `done` after a successful verification. Mark `failed` only after retries are exhausted. Mark `skipped` only when the task is genuinely no longer needed.
 - `new_tasks` is for genuinely-new work discovered during execution. Leave empty most of the time. Each entry's `after_id` must reference an existing task.
+- **After a `debugger` step:** the debugger returns a diagnosis plus a numbered "Proposed Fix". DO NOT re-narrate that diagnosis or paste its steps into `plan`. Convert each step of the Proposed Fix into a `new_tasks` entry (`after_id` = the debugger task's id, one entry per concrete step), mark the debugger task `done`, route the NEXT turn to the agent that should execute the first new step (usually `executor`). Keep `reflection.observation` to one short sentence — the actual fix steps belong in the plan, not in chat.
 - Set `complete: true` ONLY when every task in the plan is `done` or `skipped` AND the user's full original intent is verifiably satisfied. Premature completion is forbidden.
 - `plan` is the step-by-step instruction the routed agent will execute this turn. Make it concrete and actionable: "Read sse_handler.py, find the handle_disconnect function, add a `connection.cleanup()` call before the return." Not "Work on the leak."
 - `reflection.observation` is one short sentence describing what actually happened in the previous step. Skip if first step.
@@ -727,8 +753,11 @@ class MultiAgentSystem:
         create_memory_tools(self.db)
         self.skills = load_skills()
         self.architect = Architect(self.db)
+        # Shared auth state so pressing [A] in any sub-agent's prompt
+        # authorizes the entire session, not just that one role.
+        self._shared_auth = _SharedAuthState()
         self.agents = {
-            name: SpecializedAgent(name, cfg, self.db)
+            name: SpecializedAgent(name, cfg, self.db, auth_state=self._shared_auth)
             for name, cfg in AGENT_DEFS.items()
         }
         self._conversation_history: List[Dict[str, str]] = []
@@ -742,12 +771,12 @@ class MultiAgentSystem:
 
     @property
     def session_authorized(self):
-        return any(a.session_authorized for a in self.agents.values())
+        # Reads through the shared state — single source of truth.
+        return self._shared_auth.authorized
 
     @session_authorized.setter
     def session_authorized(self, value):
-        for a in self.agents.values():
-            a.session_authorized = value
+        self._shared_auth.authorized = bool(value)
 
     @property
     def model(self):

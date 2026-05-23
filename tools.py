@@ -1002,6 +1002,95 @@ def delegate(agent_key: str, instruction: str) -> str:
     return f"[DELEGATE:{agent_key}]{instruction}[/DELEGATE]"
 
 
+# ── ask_user / critique — wired to the UI at runtime ─────────────────────
+#
+# These tools require an interactive back-channel to either the human
+# user (ask_user) or a second LLM (critique). The hosting environment
+# registers a callable via the setters below; tools.py keeps the API
+# stable while cli.py provides the actual implementation.
+
+_ask_user_callback = None
+_critique_callback = None
+
+
+def set_ask_user_callback(cb):
+    """Register the callback used by the ask_user tool. cli.py calls
+    this at startup with a function that shows a prompt panel and blocks
+    on user input."""
+    global _ask_user_callback
+    _ask_user_callback = cb
+
+
+def set_critique_callback(cb):
+    """Register the callback used by the critique tool. cli.py wires
+    this to a second LLM call (architect model by default)."""
+    global _critique_callback
+    _critique_callback = cb
+
+
+@registry.register
+def ask_user(question: str) -> str:
+    """
+    Pause and ask the user a clarifying question instead of guessing.
+
+    Use when:
+      - the request is genuinely ambiguous (multiple files match,
+        conflicting interpretations, missing key parameter)
+      - you need a value only the user knows (server hostname, account
+        name, target version)
+      - you want explicit confirmation before a destructive action
+
+    DON'T use when:
+      - the answer is in the workspace (use read_file / grep_codebase)
+      - the answer is online (use web_search)
+      - you can reasonably guess and the cost of being wrong is low
+
+    Returns the user's answer as a plain string. The agent pauses
+    until the user types something.
+    """
+    q = (question or "").strip()
+    if not q:
+        return "Error: empty question."
+    if _ask_user_callback is None:
+        return (
+            f"[ask_user fallback — no UI handler registered] question was: {q}\n"
+            "Skip this question and continue with a reasonable default."
+        )
+    try:
+        answer = _ask_user_callback(q)
+        return answer.strip() if answer else "(user provided no answer)"
+    except Exception as e:
+        return f"Error: ask_user failed: {e}"
+
+
+@registry.register
+def critique(draft: str, context: str = "") -> str:
+    """
+    Get an adversarial second opinion on a draft answer, plan, or
+    decision. Returns weaknesses, missing considerations, and factual
+    issues the draft glossed over.
+
+    Use sparingly — burns an extra LLM call. Best for:
+      - high-stakes deliverables (a refactor plan, a debugging
+        diagnosis, a security-touching change)
+      - drafts that look "confident but wrong" smell-test wise
+      - long final answers where you want a fresh pair of eyes
+
+    `context` (optional): any relevant background — file content the
+    draft references, the original user request, prior turns — that
+    the critic should know to assess the draft fairly.
+    """
+    d = (draft or "").strip()
+    if not d:
+        return "Error: empty draft."
+    if _critique_callback is None:
+        return "[critique unavailable — no critic LLM registered in this environment]"
+    try:
+        return _critique_callback(d, context or "")
+    except Exception as e:
+        return f"Error: critique failed: {e}"
+
+
 # ── Code-intelligence tools ────────────────────────────────────────────────
 
 @registry.register
