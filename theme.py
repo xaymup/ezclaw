@@ -141,3 +141,24 @@ THEME = Theme(
     default_role=_DEFAULT_ROLE,
     default_tool_kind=_TOOL_KINDS["default"],
 )
+
+
+# Task-state styling for the plan panel. The state key matches Plan task
+# statuses (plan.TASK_STATUSES). Each entry is (icon_glyph, color_hex).
+TASK_STATE_STYLE: dict = {
+    "pending":     ("○", _PALETTE.dim),
+    "in_progress": ("▸", "#5fafff"),     # executor blue
+    "done":        ("●", "#5fd75f"),     # green
+    "failed":      ("✗", _PALETTE.err),
+    "skipped":     ("⊘", _PALETTE.dim),
+}
+
+# Brighter variant of each state's color, used for the one-tick flash
+# when a task transitions between statuses.
+TASK_STATE_FLASH: dict = {
+    "pending":     _PALETTE.secondary,
+    "in_progress": "#afd7ff",            # brighter executor blue
+    "done":        "#afffaf",            # brighter green
+    "failed":      "#ffafaf",            # brighter red
+    "skipped":     _PALETTE.secondary,
+}
