@@ -3,6 +3,7 @@ import subprocess
 import httpx
 import re
 import difflib
+import urllib.parse
 from datetime import datetime
 from typing import Callable, Dict, Any, List, Optional
 import inspect
@@ -648,6 +649,84 @@ def web_fetch(url: str) -> str:
         return f"Error fetching {url}: {str(e)}"
 
 
+_DDG_LITE_LINK_RE = re.compile(
+    r"""<a[^>]*?href=["']([^"']+)["'][^>]*?class=['"]result-link['"][^>]*>(.*?)</a>""",
+    re.S | re.I,
+)
+_DDG_LITE_SNIPPET_RE = re.compile(
+    r"""<td[^>]*class=['"]result-snippet['"][^>]*>(.*?)</td>""",
+    re.S | re.I,
+)
+_DDG_REDIRECT_RE = re.compile(r"uddg=([^&]+)")
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+_HTML_ENTITY_RE = re.compile(r"&(?:amp|quot|lt|gt|nbsp|#x?\w+);")
+_HTML_ENTITY_MAP = {
+    "&amp;": "&", "&quot;": '"', "&lt;": "<", "&gt;": ">", "&nbsp;": " ",
+    "&#39;": "'", "&#x27;": "'", "&#x2f;": "/", "&#x2F;": "/",
+}
+
+
+def _ddg_lite_strip(html_fragment: str) -> str:
+    """Remove HTML tags and decode the small handful of entities DDG emits."""
+    out = _HTML_TAG_RE.sub("", html_fragment)
+    out = _HTML_ENTITY_RE.sub(lambda m: _HTML_ENTITY_MAP.get(m.group(0), m.group(0)), out)
+    return out.strip()
+
+
+def _ddg_lite_unwrap(href: str) -> str:
+    """DDG wraps real URLs in //duckduckgo.com/l/?uddg=<encoded>&rut=... —
+    unwrap to the destination."""
+    m = _DDG_REDIRECT_RE.search(href)
+    if m:
+        return urllib.parse.unquote(m.group(1))
+    if href.startswith("//"):
+        return "https:" + href
+    return href
+
+
+def _search_ddg_lite(query: str, limit: int) -> list:
+    """DuckDuckGo Lite HTML — anti-bot tolerant general web search. The
+    /lite/ endpoint is designed for old browsers and returns a plain
+    table of results; it gates much less aggressively than the JSON
+    endpoint or html.duckduckgo.com.
+
+    No API key. Free. Real general-purpose results (the same engine
+    used by ddg.gg)."""
+    ua = (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120 Safari/537.36"
+    )
+    with httpx.Client(
+        timeout=15.0,
+        follow_redirects=True,
+        headers={"User-Agent": ua, "Accept-Language": "en-US,en;q=0.7"},
+    ) as client:
+        resp = client.get(
+            "https://lite.duckduckgo.com/lite/",
+            params={"q": query},
+        )
+        resp.raise_for_status()
+        html = resp.text
+
+    links = _DDG_LITE_LINK_RE.findall(html)
+    snippets = _DDG_LITE_SNIPPET_RE.findall(html)
+
+    results = []
+    for i, (href, raw_title) in enumerate(links[:limit]):
+        title = _ddg_lite_strip(raw_title)
+        if not title:
+            continue
+        url = _ddg_lite_unwrap(href)
+        snippet = _ddg_lite_strip(snippets[i]) if i < len(snippets) else ""
+        results.append({
+            "title": title[:200],
+            "url": url,
+            "snippet": snippet[:400],
+            "source": "ddg-lite",
+        })
+    return results
+
+
 def _search_brave(query: str, limit: int, api_key: str) -> list:
     """Brave Search API — real general-purpose search. Best results, but
     requires an API key (free tier 2000/mo at search.brave.com/app/api)."""
@@ -742,14 +821,16 @@ def web_search(query: str, limit: int = 5) -> str:
     framework concept, search for the exact phrase before diagnosing.
 
     Backend chain (best → fallback):
-      1. Brave Search API — if BRAVE_SEARCH_API_KEY env var is set
-         (free tier at search.brave.com/app/api, 2000 queries/month)
-      2. Wikipedia opensearch — free, covers documented APIs and concepts
-      3. DuckDuckGo Instant Answer — narrow, mostly Wikipedia-derived
+      1. Brave Search API — real search, requires BRAVE_SEARCH_API_KEY
+         (free tier 2000 queries/month at search.brave.com/app/api).
+      2. DuckDuckGo Lite (/lite/) — real general-purpose search via
+         the lite HTML endpoint, no key, anti-bot tolerant. This is
+         the default workhorse when no Brave key is set.
+      3. Wikipedia opensearch — encyclopedic backup for concept queries.
+      4. DuckDuckGo Instant Answer — narrow, mostly Wikipedia-derived.
 
     Returns markdown-formatted results so the agent can cite URLs in
-    its reasoning. If everything returns nothing, includes a note about
-    how to configure a real backend.
+    its reasoning. Results are deduplicated by URL across backends.
     """
     if not query or not query.strip():
         return "Error: empty query."
@@ -757,42 +838,52 @@ def web_search(query: str, limit: int = 5) -> str:
     results = []
     errors = []
 
+    def _extend(new_items: list):
+        """Merge new results, deduplicating by URL."""
+        for r in new_items:
+            u = r.get("url", "")
+            if u and any(u == existing["url"] for existing in results):
+                continue
+            results.append(r)
+            if len(results) >= limit:
+                return
+
     # Try backends in priority order. Continue past failures so a flaky
     # backend doesn't kill the whole search.
     api_key = os.environ.get("BRAVE_SEARCH_API_KEY", "").strip()
     if api_key:
         try:
-            results.extend(_search_brave(query, limit, api_key))
+            _extend(_search_brave(query, limit, api_key))
         except Exception as e:
             errors.append(f"brave: {e}")
 
     if len(results) < limit:
         try:
-            results.extend(_search_wikipedia(query, limit - len(results)))
+            _extend(_search_ddg_lite(query, limit - len(results)))
+        except Exception as e:
+            errors.append(f"ddg-lite: {e}")
+
+    if len(results) < limit:
+        try:
+            _extend(_search_wikipedia(query, limit - len(results)))
         except Exception as e:
             errors.append(f"wikipedia: {e}")
 
     if len(results) < limit:
         try:
-            for r in _search_ddg_instant(query):
-                if not any(r["url"] == existing["url"] for existing in results):
-                    results.append(r)
-                if len(results) >= limit:
-                    break
+            _extend(_search_ddg_instant(query))
         except Exception as e:
-            errors.append(f"ddg: {e}")
+            errors.append(f"ddg-instant: {e}")
 
     if not results:
         msg = f"No results found for {query!r}."
         if errors:
             msg += "\n\nBackend errors: " + "; ".join(errors)
-        if not api_key:
-            msg += (
-                "\n\nTip: set BRAVE_SEARCH_API_KEY (free tier at "
-                "search.brave.com/app/api) for real general-purpose search. "
-                "Without it, only Wikipedia + DDG instant-answers are queried, "
-                "which miss most error-message lookups."
-            )
+        msg += (
+            "\n\nIf this was a live-data query (weather, stock price, "
+            "score), try web_fetch on a specific endpoint instead — e.g. "
+            "https://wttr.in/<city>?format=3 for weather."
+        )
         return msg
 
     lines = [f"## Search results for: {query}", ""]
