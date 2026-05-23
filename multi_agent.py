@@ -1481,6 +1481,20 @@ No fluff. No "In this task...". Just facts."""
             )
             if single_step_done or plan_done:
                 yield {"type": "status", "content": f"🦀 {pick(COMPLETED)}."}
+                # End of orchestration — synthesize the user-facing reply from
+                # the accumulated step history. Streams content chunks (Spec E).
+                if step_history:
+                    last_step_output = step_history[-1].get("output", "")
+                    synthesis_parts = []
+                    for chunk in self._synthesize_user_reply(
+                        user_input=user_input,
+                        step_history=step_history,
+                        last_step_output=last_step_output,
+                    ):
+                        synthesis_parts.append(chunk.get("content", ""))
+                        yield chunk
+                    if synthesis_parts:
+                        final_response = "".join(synthesis_parts).strip()
                 final_text = final_response.strip() if final_response else "Task completed."
                 self._append_conversation_turn(user_input, final_text, step_history, self.current_plan)
 
@@ -1753,6 +1767,20 @@ No fluff. No "In this task...". Just facts."""
             yield {"type": "halt", "reason": "iteration_cap"}
             hit_cap = True
             cap_reason = "iteration_cap"
+            # End of orchestration (cap hit) — synthesize the user-facing reply
+            # from the accumulated step history. Streams content chunks (Spec E).
+            if step_history:
+                last_step_output = step_history[-1].get("output", "")
+                synthesis_parts = []
+                for chunk in self._synthesize_user_reply(
+                    user_input=user_input,
+                    step_history=step_history,
+                    last_step_output=last_step_output,
+                ):
+                    synthesis_parts.append(chunk.get("content", ""))
+                    yield chunk
+                if synthesis_parts:
+                    final_response = "".join(synthesis_parts).strip()
             if final_response:
                 self._append_conversation_turn(user_input, final_response, step_history, self.current_plan)
 
