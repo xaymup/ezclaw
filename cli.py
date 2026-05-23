@@ -374,15 +374,26 @@ class ChatUI:
         model_info = self.agent.model.split(",")[0][:45] if "," in self.agent.model else self.agent.model[:45]
         msg_count = len(self.agent.messages) if hasattr(self.agent, 'messages') and self.agent.messages else 0
 
+        # Animated activity glyph: cycles through ACTIVITY_FRAMES at ~4Hz
+        # while generating. Idle state shows a static dot.
+        if self.is_generating:
+            frame_idx = int(time.time() * 4) % len(ACTIVITY_FRAMES)
+            activity = ACTIVITY_FRAMES[frame_idx]
+        else:
+            activity = "·"
+
         live = ""
         if self.is_generating:
             n_tools = len(self.tool_executions)
             elapsed = time.time() - self.generation_start_time if self.generation_start_time else 0
-            live = f"  ·  ⚙ {n_tools} tool{'s' if n_tools != 1 else ''}  ·  {elapsed:.1f}s"
+            live = f"  ╱  ⚙ {n_tools} tool{'s' if n_tools != 1 else ''}  ╱  {elapsed:.1f}s"
 
-        copy_badge = "  ·  ✂ COPY MODE" if not self._mouse_capture else ""
-        arch_badge = "  ·  🧠 STRATEGY" if self.show_architect else ""
-        return f"  {auth_icon}  {mode} {model_info}  ·  {msg_count} msgs{live}{copy_badge}{arch_badge}  |  [Ctrl+C] Exit  [F2] Copy  [F3] Strategy  [Arrows] Scroll"
+        copy_badge = "  ╱  ✂ COPY MODE" if not self._mouse_capture else ""
+        arch_badge = "  ╱  🧠 STRATEGY" if self.show_architect else ""
+        return (
+            f"  {activity}  {auth_icon}  {mode} {model_info}  ╱  {msg_count} msgs"
+            f"{live}{copy_badge}{arch_badge}  │  [Ctrl+C] Exit  [F2] Copy  [F3] Strategy  [Arrows] Scroll"
+        )
 
     def _spinner_for(self, role):
         """Return a cached Spinner instance for the given role.
