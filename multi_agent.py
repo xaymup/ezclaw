@@ -460,7 +460,30 @@ Rules for execution:
 ## When no plan is active (single-step path)
 ═══════════════════════════════════════════════════════════════
 
-If the EXECUTION REQUEST says `Plan: (none — single-step request)`, this is a chat reply, a fact lookup, or any other one-shot exchange. Set `current_task_id` to `0`, leave `task_updates` and `new_tasks` empty, and **ALWAYS set `complete: true`** — the routed agent will produce a single reply and the turn is done. Do NOT keep the loop running expecting verification; chat replies don't have verifications. (The orchestrator also auto-completes after the first responsive step in this mode, so `complete: false` here just wastes a turn.)
+If the EXECUTION REQUEST says `Plan: (none — single-step request)`, the routed agent will respond once or twice. Set `current_task_id` to `0`, leave `task_updates` and `new_tasks` empty. For completion:
+- **Set `complete: true`** as soon as the routed agent has produced a reply that addresses the user's request (a chat reply, an answer, a successful one-shot tool use). Do not iterate further "just to verify" — there is no plan to verify against.
+- **Keep `complete: false`** only if the agent errored out, returned obviously incomplete output, or the routing was wrong and you need to retry with a different agent.
+
+═══════════════════════════════════════════════════════════════
+## Persistence (this is non-negotiable)
+═══════════════════════════════════════════════════════════════
+
+**Never stop iterating until the user's primary goal is achieved or you have hit a genuine blocker that requires user input.**
+
+The PRIMARY GOAL is the user's original request (the first line of `## User Request` / `## Task Context`). Re-read it on every step. Do not drift toward easier sub-goals; do not declare victory on a partial result.
+
+When a step fails:
+- Diagnose what went wrong (read the error in the previous step's result)
+- Route to a different agent if needed (executor → debugger; researcher → executor; etc.)
+- Try a different tool path (read a different file, run a different command)
+- Insert a corrective `new_task` if the plan didn't anticipate the obstacle
+
+What counts as a "genuine blocker" — set `complete: false` and stop ONLY if:
+- A tool keeps failing with a credentials/permission/missing-config error that needs the user's setup
+- The user's request is ambiguous in a way that affects correctness (multiple files match, conflicting requirements)
+- An external service is down and there's no workaround
+
+Otherwise: **keep going**. The orchestrator gives you up to 40 steps and 3 pivot attempts per run — use them.
 
 ═══════════════════════════════════════════════════════════════
 ## Conversation flow awareness
@@ -920,17 +943,19 @@ No fluff. No "In this task...". Just facts."""
             user_input = user_input[:4000] + "\n... (truncated)"
         task_context = f"User Request: {user_input}"
         self.current_plan = None
-        max_steps = 20
-        # Loop detection: track the previous (agent, plan) hash and how many
-        # times it has repeated *without progress*. A "stuck" turn is one
-        # where the executor produced zero tool calls and zero text output.
-        # Plans legitimately repeat across steps in long tasks (the architect
-        # carries the same overall plan while the agent works sub-steps), so
-        # repetition alone is not enough to halt.
+        # Persistence-first orchestration: keep iterating until the user's
+        # primary goal is achieved, only halt on a genuine blocker. Three
+        # knobs cooperate:
+        #   - max_steps gives generous runway for complex multi-task plans
+        #   - pivot_count allows several different approaches before giving up
+        #   - the stuck detector still catches true infinite loops (same plan,
+        #     same agent, zero tool calls AND zero output)
+        max_steps = 40
         last_step_hash = None
         stuck_repeats = 0
-        STUCK_LIMIT = 2  # halt after this many consecutive stuck repeats
-        pivot_used = False  # one auto-recovery (high-temp re-analyze) per run
+        STUCK_LIMIT = 2
+        pivot_count = 0
+        MAX_PIVOTS = 3  # try up to 3 different approaches before halting
         agent_has_responded = False
         step_history = []
         final_response = ""
@@ -1056,20 +1081,23 @@ No fluff. No "In this task...". Just facts."""
                 "complete": intent.get("complete")
             }
 
-            # Two completion paths:
+            # Completion paths:
             #   1. Plan-driven: architect signals complete AND the plan is done.
-            #   2. Single-step (no plan): the architect's job is just routing
-            #      the first turn. As soon as the routed agent produced output,
-            #      we're done — don't ask the architect to second-guess
-            #      a chat reply. Local LLMs habitually keep returning
-            #      complete:false for greetings, which used to drive the
-            #      loop until the stuck-detector tripped.
-            single_step_done = (
-                self.current_plan is None and agent_has_responded and step >= 1
-            )
+            #   2. Single-step (no plan): trust the architect's complete=true
+            #      ONLY IF the previous step actually responded. If the
+            #      architect calls complete on step 1 before any agent has
+            #      run, it's hallucinating — wait for at least one productive
+            #      step. (Greeting loops are now caught upstream by the
+            #      textual short-circuit in _short_circuit_classify, so we
+            #      don't need the old after-step-1 force-complete.)
             plan_done = (
                 intent.get("complete") and agent_has_responded
                 and self.current_plan is not None and self.current_plan.is_complete()
+            )
+            single_step_done = (
+                self.current_plan is None
+                and intent.get("complete")
+                and agent_has_responded
             )
             if single_step_done or plan_done:
                 yield {"type": "status", "content": f"🦀 {pick(COMPLETED)}."}
@@ -1083,9 +1111,21 @@ No fluff. No "In this task...". Just facts."""
             agent_key = intent.get("recommended_agent", "executor")
             agent = self.agents.get(agent_key)
             if not agent:
-                yield {"type": "status", "content": f"🦀 {pick(ARCHITECT_FINALIZING)}…"}
-                self._append_conversation_turn(user_input, final_response.strip(), step_history, self.current_plan)
-                break
+                # The architect named an agent that doesn't exist (rare).
+                # Don't halt — fall back to the executor (the most general
+                # role) so the loop can keep making progress toward the goal.
+                yield {
+                    "type": "status",
+                    "content": f"architect named unknown agent '{agent_key}' — falling back to executor",
+                }
+                agent_key = "executor"
+                agent = self.agents.get("executor")
+                if not agent:
+                    yield {
+                        "type": "status",
+                        "content": "⚠ blocker: executor agent missing from agent map; cannot proceed.",
+                    }
+                    break
 
             plan = intent.get("plan") or intent.get("reasoning", "") or "Executing..."
 
@@ -1099,24 +1139,31 @@ No fluff. No "In this task...". Just facts."""
             # resets on a productive step below.
             agent_plan_hash = hash((agent_key, plan_str))
             if agent_plan_hash == last_step_hash and stuck_repeats >= STUCK_LIMIT:
-                if not pivot_used:
-                    # Auto-recovery: re-analyze once at higher temperature with
-                    # an explicit pivot nudge. Don't halt — try to break out.
-                    pivot_used = True
+                if pivot_count < MAX_PIVOTS:
+                    # Auto-recovery: re-analyze with a pivot nudge.
+                    # Temperature rises with each pivot attempt — start at
+                    # 0.7, climb to 0.9, then 1.0 — so successive retries
+                    # explore a wider space rather than re-hitting the same
+                    # local minimum.
+                    pivot_count += 1
+                    pivot_temp = min(0.6 + 0.2 * pivot_count, 1.0)
                     yield {
                         "type": "status",
-                        "content": f"🦀 stuck on '{agent_key}' — {pick(PIVOT)}…",
+                        "content": f"🦀 stuck on '{agent_key}' — {pick(PIVOT)} (attempt {pivot_count}/{MAX_PIVOTS})…",
                     }
                     hint = (
                         f"The previous plan was sent to '{agent_key}' "
                         f"{stuck_repeats + 1} times with no progress (no tool calls, "
-                        f"no output). The current approach is not working."
+                        f"no output). This is pivot attempt #{pivot_count} of "
+                        f"{MAX_PIVOTS}. The current approach is not working — "
+                        f"try a fundamentally different agent, a different "
+                        f"decomposition, or a different tool path."
                     )
                     intent = self.architect.execute(
                         self.current_plan, task_context, memory_block, skills_block,
                         routing_block=routing_block, history_block=history_block,
                         map_block=map_block, experiences_block=exp_block,
-                        temperature=0.7, pivot_hint=hint,
+                        temperature=pivot_temp, pivot_hint=hint,
                     )
                     yield from self._apply_intent_to_plan(intent)
                     yield {
@@ -1130,17 +1177,35 @@ No fluff. No "In this task...". Just facts."""
                     agent_key = intent.get("recommended_agent", "executor")
                     agent = self.agents.get(agent_key)
                     if not agent:
-                        yield {"type": "status", "content": f"🦀 {pick(ARCHITECT_FINALIZING)}…"}
-                        break
+                        # Architect named a nonexistent agent — fall back to
+                        # executor rather than silently halting. The executor
+                        # is the most general path and least likely to make
+                        # things worse.
+                        agent_key = "executor"
+                        agent = self.agents.get("executor")
+                        if not agent:
+                            # Truly broken setup — surface as a blocker.
+                            yield {
+                                "type": "status",
+                                "content": "⚠ blocker: executor agent missing from agent map; cannot proceed.",
+                            }
+                            break
                     plan = intent.get("plan") or intent.get("reasoning", "") or "Executing..."
                     plan_str = str(plan)
                     agent_plan_hash = hash((agent_key, plan_str))
                     stuck_repeats = 0
                     last_step_hash = None
                 else:
+                    # All pivot attempts exhausted. Frame as a blocker that
+                    # needs the user's input rather than a silent give-up.
                     yield {
                         "type": "status",
-                        "content": f"🦀 {pick(LOOP_DETECTED)} ('{agent_key}').",
+                        "content": (
+                            f"⚠ blocker: tried {MAX_PIVOTS} different approaches "
+                            f"on '{agent_key}' and still stuck. The agent needs your "
+                            f"help — please clarify the goal, simplify the request, "
+                            f"or tell me which approach to retry."
+                        ),
                     }
                     break
 
@@ -1228,8 +1293,23 @@ No fluff. No "In this task...". Just facts."""
             )
 
         if step >= max_steps:
-            from phrases import pick as _pick, STEP_LIMIT as _SL
-            yield {"type": "status", "content": f"🦀 {_pick(_SL)}.\n"}
+            # Hitting the step cap means the task is more complex than the
+            # orchestrator can autonomously drive to completion. Frame as a
+            # blocker, not a give-up — the user should refine the goal,
+            # split the task, or confirm what's been done so far.
+            done_count = (
+                f"{self.current_plan.progress()[0]}/{self.current_plan.progress()[1]} tasks done; "
+                if self.current_plan is not None else ""
+            )
+            yield {
+                "type": "status",
+                "content": (
+                    f"⚠ blocker: reached the {max_steps}-step ceiling on this turn. "
+                    f"{done_count}the task is bigger than one run can carry. "
+                    f"Please review what's been done and tell me how to continue "
+                    f"(or break the goal into smaller pieces)."
+                ),
+            }
             if final_response:
                 self._append_conversation_turn(user_input, final_response, step_history, self.current_plan)
 
