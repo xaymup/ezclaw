@@ -384,52 +384,88 @@ class Architect:
         self.use_deepseek = os.getenv("ARCHITECT_PROVIDER", "ollama") == "deepseek"
         self.messages: List[Dict] = [{
             "role": "system",
-            "content": """You are the **Architect** — a senior systems designer and the COMMUNICATIONS HUB for EzClaw. Your job is to orchestrate a seamless workflow between specialized agents using advanced **Chain-of-Thought (CoT)** reasoning.
+            "content": """You are the **Architect** — a senior systems designer orchestrating a multi-agent workflow.
 
-## Your Critical Thinking Protocol:
-Before deciding on an action, you must perform a mandatory reflection:
-1. **Goal Analysis**: What is the ultimate objective? Are we closer to it than in the previous step?
-2. **Observation**: What EXACTLY happened in the latest step? Did it return [SUCCESS] or [FAILURE]? What were the tool results?
-3. **Critical Pivot**: Is the current agent or plan working? If we see [FAILURE] or repetition, why is it happening, and how must the strategy change?
-4. **Verification**: How will we know the final result is actually correct?
+You operate in TWO modes. Each user prompt will start with either `## PLANNING REQUEST` or `## EXECUTION REQUEST`. Read the header carefully and respond with the JSON shape required by that mode.
 
-## Routing Protocol:
+## Routing roles available
 - **executor**: File edits, shell commands, code implementation, memory management, verification runs.
 - **researcher**: Web searching, documentation gathering.
 - **debugger**: Root-cause analysis. Only route here for UNEXPECTED errors.
 - **general**: Conversational responses.
 
-## Handoff Protocol:
-- YOU handle all handoffs. Summarize the findings of the previous agent for the next one.
-- If the current agent failed ([FAILURE]), diagnose the cause. Route to `debugger` if needed, or to `executor` with a REFINED strategy.
+═══════════════════════════════════════════════════════════════
+## Mode 1: PLANNING REQUEST
+═══════════════════════════════════════════════════════════════
 
-## Completion Rules:
-- Set `complete:true` ONLY when the user's FULL original intent is satisfied AND VERIFIED by a tool call (a successful build, a passing test, a `cat` of the resulting file, a `git log` showing the commit, etc).
-- **Refuse premature completion.** If the most recent agent turn ended with `write_file` or any mutating shell command (make, pip install, git commit, mv, rm) WITHOUT a subsequent successful verification command, set `complete:false` and route back to the executor with the plan "Verify the previous change by running <appropriate verify command>." An edit is not a fix; an install is not a working build. Demand evidence.
+You receive the user's original request plus context. Classify the request and produce ONE of:
 
-## Reasoning style (for the `reflection` and `reasoning` fields):
-- One short sentence per field. Direct. No "Let me consider…" filler.
-- `reflection.goal`: state the goal as a noun phrase ("Read agent.py and report max_iterations").
-- `reflection.observation`: state what actually happened in the last step ("Executor wrote add.py and confirmed via read_file."). Skip if first step.
-- `reflection.critical_thinking`: one line on why the next action is chosen ("Task is verified; complete.").
-- `reasoning`: one short line on the routing choice ("File-edit task → executor.").
-- Skip any field that does not add new information. Empty strings are fine.
-
-## Response Format:
-Return ONLY valid JSON:
+**Multi-step request** → return a structured plan:
 {
-  "reflection": {
-    "goal": "Current objective",
-    "observation": "What was learned in the last step",
-    "critical_thinking": "Analysis of progress and why the next action is chosen"
-  },
-  "category": "technical|research|chat",
-  "reasoning": "Internal logic for this routing choice",
+  "kind": "plan",
+  "title": "<one-line summary, ≤60 chars, no trailing period>",
+  "tasks": [
+    {"id": 1, "description": "<short user-facing line, ≤80 chars>"},
+    {"id": 2, "description": "..."}
+  ]
+}
+
+Rules for plans:
+- Between 2 and 7 tasks. If you cannot decompose into ≥2 meaningful tasks, return `kind: single` instead.
+- Tasks must be in execution order. No out-of-order dependencies.
+- Descriptions are USER-FACING summaries, not implementation jargon.
+- IDs are 1-based, contiguous, ascending.
+
+**Single-step / conversational request** → return:
+{"kind": "single", "reason": "<one-line explanation>"}
+
+Return `kind: single` when the request is:
+- Conversational ("hi", "what does X do", "explain Y")
+- A single file read / lookup
+- Anything that genuinely doesn't decompose into 2+ meaningful steps
+
+═══════════════════════════════════════════════════════════════
+## Mode 2: EXECUTION REQUEST
+═══════════════════════════════════════════════════════════════
+
+You receive: the current plan (with task statuses), the task_context (recent step results), memory/skills/routing context. Decide the NEXT step.
+
+Return:
+{
+  "kind": "execute",
+  "current_task_id": <int>,
   "recommended_agent": "executor|general|researcher|debugger",
-  "plan": "Numbered steps for the agent",
-  "pivot_reasoning": "If strategy changed",
-  "complete": false
-}""",
+  "reasoning": "<one short line on the routing choice>",
+  "task_updates": [{"id": <int>, "status": "done|failed|skipped"}],
+  "new_tasks": [{"after_id": <int>, "description": "<short line>"}],
+  "complete": false,
+  "reflection": {
+    "goal": "<noun phrase>",
+    "observation": "<what happened in the last step>",
+    "critical_thinking": "<one line on why this action>"
+  }
+}
+
+Rules for execution:
+- `current_task_id` must reference an existing task in the plan (not yet `done`/`failed`/`skipped`).
+- `task_updates` is for tasks finishing in the current step. Only mark `done` after a successful verification. Mark `failed` only after retries are exhausted. Mark `skipped` only when the task is genuinely no longer needed.
+- `new_tasks` is for genuinely-new work discovered during execution. Leave empty most of the time. Each entry's `after_id` must reference an existing task.
+- Set `complete: true` ONLY when every task in the plan is `done` or `skipped` AND the user's full original intent is verifiably satisfied. Premature completion is forbidden.
+- `reflection.observation` is one short sentence describing what actually happened in the previous step. Skip if first step.
+
+═══════════════════════════════════════════════════════════════
+## When no plan is active (single-step path)
+═══════════════════════════════════════════════════════════════
+
+If the EXECUTION REQUEST says `Plan: (none — single-step request)`, treat each call as a one-shot routing decision. Set `current_task_id` to `0`, leave `task_updates` and `new_tasks` empty, and set `complete: true` as soon as the user's intent is satisfied.
+
+═══════════════════════════════════════════════════════════════
+## General style
+═══════════════════════════════════════════════════════════════
+
+- One short sentence per reflection field. Direct, no filler.
+- Return ONLY the JSON object. No prose before or after. No markdown fences.
+- Empty arrays and empty strings are fine where no new information applies.""",
         }]
 
     def _prune_messages(self):
@@ -437,7 +473,7 @@ Return ONLY valid JSON:
         if len(self.messages) > 7:
             self.messages = [self.messages[0]] + self.messages[-6:]
 
-    def _chat(self, prompt: str) -> str:
+    def _chat(self, prompt: str, temperature: float = 0.0) -> str:
         self._prune_messages()
         # Truncate prompt if it alone would overflow
         max_prompt_chars = int(self.num_ctx * 3) - sum(len(m.get("content", "")) for m in self.messages)
@@ -454,18 +490,83 @@ Return ONLY valid JSON:
                 model=self.model,
                 messages=self.messages + [{"role": "user", "content": prompt}],
                 response_format={"type": "json_object"},
-                temperature=0.0,
+                temperature=temperature,
             )
             return resp.choices[0].message.content or ""
         resp = self.client.chat(
             model=self.model,
             messages=self.messages + [{"role": "user", "content": prompt}],
             format="json",
-            options={"temperature": 0.0, "num_ctx": self.num_ctx},
+            options={"temperature": temperature, "num_ctx": self.num_ctx},
         )
         return resp["message"]["content"].strip()
 
-    def analyze(self, task_context: str, memory_block: str = "", skills_block: str = "", experiences_block: str = "", routing_block: str = "", history_block: str = "", map_block: str = "") -> Dict[str, Any]:
+    def plan(
+        self,
+        user_input: str,
+        memory_block: str = "",
+        skills_block: str = "",
+        history_block: str = "",
+        map_block: str = "",
+    ):
+        """Planning pass. Returns a Plan object if the request is multi-step,
+        or None if it's single-step / conversational.
+
+        Retries once on malformed JSON, then returns None.
+        """
+        from plan import Plan, Task
+
+        prompt = f"""## PLANNING REQUEST
+
+## User Request
+{user_input}
+
+## Conversation History
+{history_block}
+
+## Codebase Map
+{map_block}
+
+## Memory & Skills
+{memory_block}{skills_block}
+
+## Decision Required
+Classify this request. If multi-step, return a `kind: plan` JSON with 2-7 tasks. If single-step or conversational, return `kind: single`.
+
+Return ONLY the JSON object."""
+
+        for attempt in range(2):
+            try:
+                content = self._chat(
+                    prompt if attempt == 0 else prompt + "\n\nCRITICAL: Return ONLY valid JSON.",
+                    temperature=0.0,
+                )
+                data = extract_json(content)
+                kind = data.get("kind")
+                if kind == "single":
+                    return None
+                if kind == "plan":
+                    title = str(data.get("title", "")).strip()
+                    raw_tasks = data.get("tasks", [])
+                    if not isinstance(raw_tasks, list) or not raw_tasks:
+                        continue
+                    tasks = []
+                    for i, t in enumerate(raw_tasks, start=1):
+                        if not isinstance(t, dict):
+                            continue
+                        desc = str(t.get("description", "")).strip()
+                        if not desc:
+                            continue
+                        tasks.append(Task(id=i, description=desc[:120]))
+                    if len(tasks) < 2:
+                        return None
+                    return Plan(title=title or "Plan", tasks=tasks)
+                return None
+            except Exception:
+                continue
+        return None
+
+    def analyze(self, task_context: str, memory_block: str = "", skills_block: str = "", experiences_block: str = "", routing_block: str = "", history_block: str = "", map_block: str = "", temperature: float = 0.0, pivot_hint: str = "") -> Dict[str, Any]:
         max_prompt_len = 12000
         blocks = [task_context, memory_block, skills_block, experiences_block, routing_block, history_block, map_block]
         total = sum(len(b) for b in blocks)
@@ -493,7 +594,17 @@ Return ONLY valid JSON:
         elif "--- Step" in task_context:
             situation = "mid_pipeline"
 
-        prompt = f"""## Task State: {situation}
+        pivot_block = ""
+        if pivot_hint:
+            pivot_block = (
+                "## CRITICAL PIVOT REQUIRED\n"
+                f"{pivot_hint}\n"
+                "Do NOT re-issue the previous plan. Choose a fundamentally different "
+                "approach: switch the recommended_agent, decompose the task differently, "
+                "or use a different tool. State the pivot explicitly in `pivot_reasoning`.\n\n"
+            )
+
+        prompt = f"""{pivot_block}## Task State: {situation}
 
 ## Current Task Overview
 {task_context}
@@ -524,7 +635,10 @@ Return ONLY JSON:
 
         for attempt in range(2):
             try:
-                content = self._chat(prompt if attempt == 0 else prompt + "\n\nCRITICAL: Return ONLY valid JSON.")
+                content = self._chat(
+                    prompt if attempt == 0 else prompt + "\n\nCRITICAL: Return ONLY valid JSON.",
+                    temperature=temperature,
+                )
                 content = extract_json(content)
                 intent = content
                 intent.setdefault("plan", "")
@@ -693,8 +807,17 @@ No fluff. No "In this task...". Just facts."""
         if len(user_input) > 4000:
             user_input = user_input[:4000] + "\n... (truncated)"
         task_context = f"User Request: {user_input}"
-        max_steps = 15
-        loop_hashes = set()
+        max_steps = 20
+        # Loop detection: track the previous (agent, plan) hash and how many
+        # times it has repeated *without progress*. A "stuck" turn is one
+        # where the executor produced zero tool calls and zero text output.
+        # Plans legitimately repeat across steps in long tasks (the architect
+        # carries the same overall plan while the agent works sub-steps), so
+        # repetition alone is not enough to halt.
+        last_step_hash = None
+        stuck_repeats = 0
+        STUCK_LIMIT = 2  # halt after this many consecutive stuck repeats
+        pivot_used = False  # one auto-recovery (high-temp re-analyze) per run
         agent_has_responded = False
         step_history = []
         final_response = ""
@@ -807,17 +930,65 @@ No fluff. No "In this task...". Just facts."""
                 break
 
             plan = intent.get("plan") or intent.get("reasoning", "") or "Executing..."
-            
+
             # Ensure plan is hashable (it might be a list of steps)
             plan_str = str(plan)
-            
-            # IMPROVED LOOP DETECTION: Hash (agent_key, plan)
-            # This detects if the architect is stuck sending the same agent the same plan.
+
+            # Loop detection: repetition alone is not enough — the architect
+            # often re-issues the same overall plan while progress is being
+            # made on sub-steps. We only count this as "stuck" when the
+            # PREVIOUS step produced no tool calls and no output. The counter
+            # resets on a productive step below.
             agent_plan_hash = hash((agent_key, plan_str))
-            if agent_plan_hash in loop_hashes:
-                yield {"type": "status", "content": "System: Loop detected, stopping execution."}
-                break
-            loop_hashes.add(agent_plan_hash)
+            if agent_plan_hash == last_step_hash and stuck_repeats >= STUCK_LIMIT:
+                if not pivot_used:
+                    # Auto-recovery: re-analyze once at higher temperature with
+                    # an explicit pivot nudge. Don't halt — try to break out.
+                    pivot_used = True
+                    yield {
+                        "type": "status",
+                        "content": (
+                            f"System: stuck on '{agent_key}' plan — pivoting "
+                            f"(retry at higher temperature)..."
+                        ),
+                    }
+                    hint = (
+                        f"The previous plan was sent to '{agent_key}' "
+                        f"{stuck_repeats + 1} times with no progress (no tool calls, "
+                        f"no output). The current approach is not working."
+                    )
+                    intent = self.architect.analyze(
+                        task_context, memory_block, skills_block,
+                        routing_block=routing_block, history_block=history_block,
+                        map_block=map_block, experiences_block=exp_block,
+                        temperature=0.7, pivot_hint=hint,
+                    )
+                    yield {
+                        "type": "intent",
+                        "reflection": intent.get("reflection"),
+                        "reasoning": intent.get("reasoning"),
+                        "plan": intent.get("plan"),
+                        "agent": intent.get("recommended_agent"),
+                        "complete": intent.get("complete"),
+                    }
+                    agent_key = intent.get("recommended_agent", "executor")
+                    agent = self.agents.get(agent_key)
+                    if not agent:
+                        yield {"type": "status", "content": "Architect: Finalizing response..."}
+                        break
+                    plan = intent.get("plan") or intent.get("reasoning", "") or "Executing..."
+                    plan_str = str(plan)
+                    agent_plan_hash = hash((agent_key, plan_str))
+                    stuck_repeats = 0
+                    last_step_hash = None
+                else:
+                    yield {
+                        "type": "status",
+                        "content": (
+                            f"System: pivot retry also stalled on '{agent_key}' — stopping."
+                        ),
+                    }
+                    break
 
             yield {
                 "type": "reasoning",
@@ -886,6 +1057,20 @@ No fluff. No "In this task...". Just facts."""
                 task_context = parts[0] + "\n\n... (earlier steps omitted) ...\n\n--- Step " + "\n\n--- Step ".join(parts[-4:])
 
             step_success = bool(step_output.strip() or step_tool_results)
+
+            # Update loop-detection state. A productive step (any tool result
+            # or any output) resets the stuck counter even if the architect
+            # issues the same plan next turn — that's fine, real work happened.
+            made_progress = bool(step_tool_results or step_output.strip())
+            if agent_plan_hash == last_step_hash and not made_progress:
+                stuck_repeats += 1
+            elif not made_progress:
+                # New plan but still no progress — start the counter fresh.
+                stuck_repeats = 1
+            else:
+                stuck_repeats = 0
+            last_step_hash = agent_plan_hash
+
             self.db.store_routing_decision(
                 user_input if step == 1 else task_context[:300],
                 agent_key, step_success
