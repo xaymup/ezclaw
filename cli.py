@@ -518,10 +518,13 @@ class ChatUI:
     def _get_current_renderable_ansi(self):
 
         if not self.is_generating and not self.current_response_parts and not self.reasoning_chunks and not self.tool_executions:
-            if not self.welcome_shown:
-                self.welcome_shown = True
-                return render_to_ansi(self._get_welcome_panel())
-            return ""
+            # Re-render every tick when idle so the welcome banner's
+            # gradient flow and 🦀 color pulse actually animate. The
+            # previous one-shot `welcome_shown` gate locked the banner
+            # to a single frozen frame after first paint.
+            if self.history_ansi:
+                return ""  # post-conversation idle — keep history clean
+            return render_to_ansi(self._get_welcome_panel())
             
         parts = []
         for msg in self.side_messages:
@@ -721,16 +724,25 @@ class ChatUI:
     def _get_welcome_panel(self):
         body = Text()
 
-        # Mascot prefix + per-character gradient on the "EzClaw" title —
-        # the gradient offset shifts every ~0.4s so the colors flow across
-        # the letters over time. Welcome banner only re-renders when there's
-        # no content above, so the flow is visible on the intro frame and
-        # on /clear; static the rest of the time.
+        # Mascot prefix + animated gradient title.
+        # The gradient offset shifts ~2.5Hz so colors flow across the letters.
+        # A SHIMMER position (one letter at a time, sweeping left-to-right
+        # at ~2Hz) gets rendered bright white on top of the gradient — a
+        # clearly-visible "light moving across the title" effect.
         body.append(f"{MASCOT} ", style=f"bold {self._cycle_palette_color(TITLE_GRADIENT)}")
         offset = self._gradient_offset()
         title = "EzClaw"
+        # Shimmer cell: sweeps 0..len(title)-1 then pauses for a beat
+        # before restarting. The pause makes the next sweep feel intentional
+        # rather than a continuous strobe.
+        shimmer_period = len(title) + 2
+        shimmer_pos = int(time.time() * 2) % shimmer_period
         for i, ch in enumerate(title):
-            body.append(ch, style=f"bold {TITLE_GRADIENT[(i + offset) % len(TITLE_GRADIENT)]}")
+            base_color = TITLE_GRADIENT[(i + offset) % len(TITLE_GRADIENT)]
+            if i == shimmer_pos:
+                body.append(ch, style=f"bold reverse {base_color}")
+            else:
+                body.append(ch, style=f"bold {base_color}")
         body.append(" ", "")
         body.append("v2.2 (Full TUI)\n", style=f"dim {DIM}")
         body.append("─" * 40 + "\n", style=f"dim {DIM}")
@@ -1054,16 +1066,30 @@ class ChatUI:
         threading.Thread(target=self._agent_worker, args=(text,), daemon=True).start()
 
     def _start_animation_loop(self):
-        """Periodically triggers UI updates to animate spinners using the native event loop."""
+        """Run a continuous UI tick so animations are visible at all times.
+
+        - During generation: 10fps (matches the spinner cadence)
+        - At idle: 4fps — enough for the welcome banner's gradient flow
+          and mascot color pulse to be visible, cheap enough that the CPU
+          cost is negligible.
+        """
         loop = getattr(self.app, 'loop', None)
         if not loop:
             return
+        # Guard against double-starting the loop (handle_input restarts it
+        # on every new prompt). If a tick is already scheduled, this no-ops.
+        if getattr(self, "_anim_loop_active", False):
+            return
+        self._anim_loop_active = True
 
         def tick():
-            if self.is_generating:
+            try:
                 self._update_ui()
-                loop.call_later(0.1, tick)
-        
+            except Exception:
+                pass
+            delay = 0.1 if self.is_generating else 0.25
+            loop.call_later(delay, tick)
+
         loop.call_later(0.1, tick)
 
     def _handle_command(self, cmd):
@@ -1332,6 +1358,11 @@ class ChatUI:
         threading.Thread(target=self._heartbeat_monitor, daemon=True).start()
         # Initial update
         self._update_ui()
+        # Kick off the animation loop NOW (was only starting on first user
+        # input). This makes the welcome-banner gradient flow and 🦀 color
+        # pulse visible from the moment the app starts, not just during
+        # generation.
+        self._start_animation_loop()
         self.app.run()
 
     def _heartbeat_monitor(self):
