@@ -152,8 +152,18 @@ class ChatUI:
         self._setup_keybindings()
 
         self.layout = self._create_layout()
+        # Warm-coastal palette for the bottom status bar — replaces the
+        # default white-background eyesore from `reverse #ffffff`.
+        # Deep warm brown bg, honey-amber text. Coordinates with the
+        # 🦀 mascot palette and the Palette dataclass in theme.py.
         self.style = Style.from_dict({
-            'status': f'reverse #ffffff bg:#333333',
+            'status': 'bg:#1f160e #ffd166',
+            'status.badge.copy': 'bg:#1f160e #ff8c5c bold',
+            'status.badge.strategy': 'bg:#1f160e #ff5fd7 bold',
+            'status.badge.tools': 'bg:#1f160e #7fd070 bold',
+            'status.activity': 'bg:#1f160e bold',
+            'status.divider': 'bg:#1f160e #7a7570',
+            'status.keys': 'bg:#1f160e #c8c4be',
             'prompt': f'bold {PRIMARY}',
             'frame.border': f'{DIM}',
         })
@@ -481,34 +491,61 @@ class ChatUI:
         last_visible = info.vertical_scroll + info.window_height
         return last_visible >= total_lines - 2
     def _get_status_text(self):
+        """Return the status bar as a list of (inline-style, text) tuples.
+
+        We use inline styles (`bg:#xxx fg`) instead of class-based styles
+        so each segment can carry its own color while still inheriting
+        the bar-wide warm-dark background defined in self.style. The
+        activity glyph and 🦀 mascot both color-cycle per tick — visible
+        because the animation loop re-renders the status bar at 4-10fps.
+        """
+        BG = "bg:#1f160e "
         auth_icon = "◉" if self.agent.session_authorized else "○"
-        mode = "⚡" if ENABLE_MULTI_AGENT else "●"
+        mode_glyph = "⚡" if ENABLE_MULTI_AGENT else "●"
         model_info = self.agent.model.split(",")[0][:45] if "," in self.agent.model else self.agent.model[:45]
         msg_count = len(self.agent.messages) if hasattr(self.agent, 'messages') and self.agent.messages else 0
 
-        # Animated activity glyph: cycles through ACTIVITY_FRAMES at ~4Hz
-        # AND through TITLE_GRADIENT colors at ~0.7Hz. Idle shows a static dot.
         if self.is_generating:
             frame_idx = int(time.time() * 4) % len(ACTIVITY_FRAMES)
             glyph = ACTIVITY_FRAMES[frame_idx]
-            color = self._cycle_palette_color(TITLE_GRADIENT)
-            activity = f"[{color}]{glyph}[/{color}]"
+            act_color = self._cycle_palette_color(TITLE_GRADIENT)
         else:
-            activity = "·"
+            glyph = "·"
+            act_color = "#7a7570"
 
-        live = ""
+        mascot_color = self._cycle_palette_color(TITLE_GRADIENT, period_sec=1.2)
+        divider = (BG + "#5a4a3a", "  ╱  ")
+
+        segments = [
+            (BG + f"bold {act_color}", f"  {glyph}  "),
+            (BG + f"bold {mascot_color}", MASCOT + " "),
+            (BG + "#7a7570", f"{auth_icon}  "),
+            (BG + "#ffd166", f"{mode_glyph} {model_info}"),
+            divider,
+            (BG + "#c8c4be", f"{msg_count} msgs"),
+        ]
+
         if self.is_generating:
             n_tools = len(self.tool_executions)
             elapsed = time.time() - self.generation_start_time if self.generation_start_time else 0
-            live = f"  ╱  ⚙ {n_tools} tool{'s' if n_tools != 1 else ''}  ╱  {elapsed:.1f}s"
+            segments.append(divider)
+            segments.append((BG + "#7fd070", f"⚙ {n_tools} tool{'s' if n_tools != 1 else ''}"))
+            segments.append(divider)
+            segments.append((BG + "#ff8c5c", f"{elapsed:.1f}s"))
 
-        copy_badge = "  ╱  ✂ COPY MODE" if not self._mouse_capture else ""
-        arch_badge = "  ╱  🧠 STRATEGY" if self.show_architect else ""
-        tools_badge = "  ╱  ⊞ FULL TOOLS" if not self.compact_tools else ""
-        return (
-            f"  {activity}  {auth_icon}  {mode} {model_info}  ╱  {msg_count} msgs"
-            f"{live}{copy_badge}{arch_badge}{tools_badge}  │  [Ctrl+C] Exit  [F2] Copy  [F3] Strategy  [F4] Tools  [PgUp/PgDn/End] Scroll"
-        )
+        if not self._mouse_capture:
+            segments.append(divider)
+            segments.append((BG + "bold #ff8c5c", "✂ COPY"))
+        if self.show_architect:
+            segments.append(divider)
+            segments.append((BG + "bold #ff5fd7", "🧠 STRATEGY"))
+        if not self.compact_tools:
+            segments.append(divider)
+            segments.append((BG + "bold #7fd070", "⊞ FULL TOOLS"))
+
+        segments.append((BG + "#5a4a3a", "  │  "))
+        segments.append((BG + "#a89884", "[^C] exit  [F2] copy  [F3] strategy  [F4] tools  [PgUp/Dn] scroll"))
+        return segments
 
     def _spinner_for(self, role):
         """Return a cached Spinner instance for the given role.
@@ -537,7 +574,10 @@ class ChatUI:
             return render_to_ansi(self._get_welcome_panel())
             
         parts = []
-        for msg in self.side_messages:
+        # Cap to the last 3 side_messages — without this cap, a long
+        # multi-step turn stacked 20+ dim italic lines at the top of the
+        # active area, duplicating what the architect chip already shows.
+        for msg in self.side_messages[-3:]:
             parts.append(Text(msg, style=f"dim {DIM} italic"))
             
         current_reasoning = "".join(self.reasoning_chunks)
@@ -664,11 +704,17 @@ class ChatUI:
             line_text.append(task.description, style=f"{weight}{line_color}")
             body_lines.append(line_text)
 
+        # Title color shifts through the sunset palette every ~1.5s so the
+        # plan panel reads as actively alive. Border breathes between dim
+        # and full saturation at ~0.6Hz — slow enough to feel meditative.
+        title_color = self._cycle_palette_color(TITLE_GRADIENT, period_sec=1.5)
+        border_breath = (time.time() * 1.2) % 2.0
+        border_prefix = "" if border_breath < 1.0 else "dim "
         title = f"Plan: {plan.title}  ·  {done}/{total}"
         return Panel(
             Group(*body_lines),
-            title=f"[bold {PRIMARY}]{title}[/bold {PRIMARY}]",
-            border_style=f"dim {PRIMARY}",
+            title=f"[bold {title_color}]{title}[/bold {title_color}]",
+            border_style=f"{border_prefix}{title_color}",
             box=ROUNDED,
             padding=(0, 1),
         )
@@ -687,16 +733,29 @@ class ChatUI:
             # the screen-eating panels. F3 expands.
             rs = THEME.role(agent)
             flashing = time.time() < self._chip_flash_until
+            # The icon ALWAYS pulses subtly between the role's base color
+            # and a brightened flash color — even when not transitioning —
+            # so the chip feels alive instead of static. Flash on
+            # role-change still spikes to the full flash color.
+            icon_pulse_t = (time.time() * 1.4) % 2.0
+            icon_color = rs.flash_color if flashing or icon_pulse_t < 0.4 else rs.color
             chip_color = rs.flash_color if flashing else rs.color
             from phrases import THINKING_BADGE as _TB
             headline = goal or (plan.splitlines()[0] if plan else reasoning) or f"{_TB}…"
             if len(headline) > 110:
                 headline = headline[:107] + "…"
+            # Subtle headline shimmer: one character at a time rendered
+            # bright at ~1.5Hz sweep — gentle but unmistakably "alive".
+            shimmer_pos = int(time.time() * 6) % max(len(headline), 1)
             line = Text()
-            line.append(f"{rs.icon} ", style=f"bold {chip_color}")
+            line.append(f"{rs.icon} ", style=f"bold {icon_color}")
             line.append(agent, style=f"bold {chip_color}")
             line.append(" · ", style=f"dim {DIM}")
-            line.append(headline, style=f"italic {DIM}")
+            for i, ch in enumerate(headline):
+                if i == shimmer_pos:
+                    line.append(ch, style=f"italic bold {SECONDARY}")
+                else:
+                    line.append(ch, style=f"italic {DIM}")
             line.append("   [F3] expand", style=f"dim {DIM}")
             return line
 
@@ -802,10 +861,18 @@ class ChatUI:
 
     def _one_line_tool_head(self, tool_kind, tool_name, args, index):
         """Build the icon + index + name + (args) prefix used by the
-        one-line collapsed/running tool entries. Returns a Text that the
-        caller can extend with summary or running-verb tails."""
+        one-line collapsed/running tool entries. The kind icon pulses
+        subtly between its base color and a brightened sunset shade per
+        tick — gives running tool panels a heartbeat."""
+        # Pulse only the icon at ~0.6Hz (so the eye catches it without
+        # being distracting), keep the name + signature solid.
+        pulse_t = (time.time() * 1.2) % 2.0
+        icon_color = (
+            self._cycle_palette_color(TITLE_GRADIENT, period_sec=1.5)
+            if pulse_t < 0.4 else tool_kind.color
+        )
         line = Text()
-        line.append(f"{tool_kind.icon} ", style=f"bold {tool_kind.color}")
+        line.append(f"{tool_kind.icon} ", style=f"bold {icon_color}")
         if index is not None:
             line.append(f"[{index}] ", style=f"dim {DIM}")
         line.append(tool_name, style=f"bold {tool_kind.color}")
@@ -1306,7 +1373,14 @@ class ChatUI:
                     self.current_response_parts.append(chunk["content"])
                 elif chunk["type"] == "status":
                     self.current_status = chunk["content"].strip()
-                    self.side_messages.append(self.current_status)
+                    # The architect chip / spinner status line already
+                    # surface the current status; don't ALSO stack each
+                    # one as a dim italic line in side_messages — that
+                    # produced 20+ duplicate lines on long turns.
+                    # Side messages are now reserved for true side-channel
+                    # events (memory stored, context augmented, blockers).
+                    if self.current_status.startswith("⚠") or self.current_status.startswith("⚠ blocker"):
+                        self.side_messages.append(self.current_status)
                     # Attention triggers: any status starting with ⚠ blocker
                     # means the architect has stopped and needs user input.
                     # Long-running task completion is also a notify
