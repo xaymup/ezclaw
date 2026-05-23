@@ -668,103 +668,6 @@ Decide the next routing step. Return the EXECUTION JSON object."""
             "reflection": {"critical_thinking": "Parsing failed; routing to executor as a default."},
         }
 
-    def analyze(self, task_context: str, memory_block: str = "", skills_block: str = "", experiences_block: str = "", routing_block: str = "", history_block: str = "", map_block: str = "", temperature: float = 0.0, pivot_hint: str = "") -> Dict[str, Any]:
-        max_prompt_len = 12000
-        blocks = [task_context, memory_block, skills_block, experiences_block, routing_block, history_block, map_block]
-        total = sum(len(b) for b in blocks)
-        
-        if total > max_prompt_len:
-            overflow = total - max_prompt_len
-            if len(task_context) > overflow + 1000:
-                parts = task_context.split("\n\n--- Step ")
-                if len(parts) > 3:
-                     task_context = parts[0] + "\n\n... (earlier steps truncated) ...\n\n--- Step " + "\n\n--- Step ".join(parts[-2:])
-                else:
-                     task_context = task_context[:1000] + "\n... (middle truncated) ...\n" + task_context[-(len(task_context)-overflow-1500):]
-
-        # Improved error detection: look for [FAILURE] tag in the LATEST step
-        latest_step_split = task_context.split("--- Step")
-        latest_step_content = latest_step_split[-1] if len(latest_step_split) > 1 else task_context
-        has_failure = "[FAILURE]" in latest_step_content
-        debugger_ran = "(debugger)" in latest_step_content
-
-        situation = "initial"
-        if debugger_ran and not has_failure:
-            situation = "debugger_finished_fix"
-        elif has_failure:
-            situation = "error_detected"
-        elif "--- Step" in task_context:
-            situation = "mid_pipeline"
-
-        pivot_block = ""
-        if pivot_hint:
-            pivot_block = (
-                "## CRITICAL PIVOT REQUIRED\n"
-                f"{pivot_hint}\n"
-                "Do NOT re-issue the previous plan. Choose a fundamentally different "
-                "approach: switch the recommended_agent, decompose the task differently, "
-                "or use a different tool. State the pivot explicitly in `pivot_reasoning`.\n\n"
-            )
-
-        prompt = f"""{pivot_block}## Task State: {situation}
-
-## Current Task Overview
-{task_context}
-
-## Task History & State
-{history_block}
-
-## Auxiliary Context (For Reference Only)
-### Codebase Map
-{map_block}
-### Past Experiences
-{experiences_block}
-{memory_block}{skills_block}{routing_block}
-
-## Decision Required
-Analyze the CURRENT state using the Critical Thinking Protocol. Decide the NEXT action.
-
-Return ONLY JSON: 
-{{
-  "reflection": {{"goal": "...", "observation": "...", "critical_thinking": "..."}},
-  "category": "technical|research|chat",
-  "reasoning": "...",
-  "recommended_agent": "executor|general|researcher|debugger",
-  "plan": "numbered steps",
-  "pivot_reasoning": "if needed",
-  "complete": false
-}}"""
-
-        for attempt in range(2):
-            try:
-                content = self._chat(
-                    prompt if attempt == 0 else prompt + "\n\nCRITICAL: Return ONLY valid JSON.",
-                    temperature=temperature,
-                )
-                content = extract_json(content)
-                intent = content
-                intent.setdefault("plan", "")
-                intent.setdefault("reasoning", "")
-                intent.setdefault("complete", False)
-                intent.setdefault("reflection", {})
-
-                valid_agents = {"executor", "general", "researcher", "debugger"}
-                if intent.get("recommended_agent") not in valid_agents:
-                    intent["recommended_agent"] = "executor"
-
-                self.messages.append({"role": "assistant", "content": json.dumps(intent)})
-                return intent
-            except Exception:
-                if attempt == 1:
-                    return {
-                        "category": "technical",
-                        "reasoning": "Fallback routing",
-                        "recommended_agent": "executor",
-                        "plan": "Continue with the task.",
-                        "complete": False,
-                        "reflection": {"critical_thinking": "Parsing failed, falling back to execution."}
-                    }
-                continue
 
 
 class MultiAgentSystem:
@@ -778,6 +681,8 @@ class MultiAgentSystem:
             for name, cfg in AGENT_DEFS.items()
         }
         self._conversation_history: List[Dict[str, str]] = []
+        # Current plan for the in-flight user request. Reset on each run.
+        self.current_plan = None
 
     def chat_stream(self, user_input: str) -> Iterator[Dict[str, Any]]:
         yield from self.run(user_input)
@@ -909,6 +814,7 @@ No fluff. No "In this task...". Just facts."""
         if len(user_input) > 4000:
             user_input = user_input[:4000] + "\n... (truncated)"
         task_context = f"User Request: {user_input}"
+        self.current_plan = None
         max_steps = 20
         # Loop detection: track the previous (agent, plan) hash and how many
         # times it has repeated *without progress*. A "stuck" turn is one
@@ -994,6 +900,17 @@ No fluff. No "In this task...". Just facts."""
             [f"- Task: {e['task']}\n  Result: {e['trace']}" for e in experiences]
         ) + "\n" if experiences else ""
 
+        # Planning pass: produce a structured task list, or None for single-step.
+        self.current_plan = self.architect.plan(
+            user_input,
+            memory_block=memory_block,
+            skills_block=skills_block,
+            history_block=history_block,
+            map_block=map_block,
+        )
+        if self.current_plan is not None:
+            yield {"type": "plan_created", "plan": self.current_plan}
+
         for step in range(1, max_steps + 1):
             yield {"type": "status", "content": f"Architect: Analyzing task state (Step {step}/{max_steps})..."}
 
@@ -1003,8 +920,25 @@ No fluff. No "In this task...". Just facts."""
             skills_block = format_skills_block(matched_skills)
 
             self._prune_architect()
-            intent = self.architect.analyze(task_context, memory_block, skills_block, routing_block=routing_block, history_block=history_block, map_block=map_block, experiences_block=exp_block)
+            intent = self.architect.execute(
+                self.current_plan, task_context, memory_block, skills_block,
+                routing_block=routing_block, history_block=history_block,
+                map_block=map_block, experiences_block=exp_block,
+            )
             
+            # Apply plan mutations from the execute intent
+            if self.current_plan is not None:
+                for upd in intent.get("task_updates", []) or []:
+                    if isinstance(upd, dict) and "id" in upd and "status" in upd:
+                        self.current_plan.advance(upd["id"], upd["status"])
+                for new in intent.get("new_tasks", []) or []:
+                    if isinstance(new, dict) and "after_id" in new and "description" in new:
+                        self.current_plan.insert(new["after_id"], new["description"])
+                current_id = intent.get("current_task_id")
+                if current_id and self.current_plan.get_task(current_id):
+                    self.current_plan.advance(current_id, "in_progress")
+                yield {"type": "plan_update", "plan": self.current_plan}
+
             # Yield the full intent for UI display (Reflection + Plan)
             yield {
                 "type": "intent",
@@ -1059,8 +993,8 @@ No fluff. No "In this task...". Just facts."""
                         f"{stuck_repeats + 1} times with no progress (no tool calls, "
                         f"no output). The current approach is not working."
                     )
-                    intent = self.architect.analyze(
-                        task_context, memory_block, skills_block,
+                    intent = self.architect.execute(
+                        self.current_plan, task_context, memory_block, skills_block,
                         routing_block=routing_block, history_block=history_block,
                         map_block=map_block, experiences_block=exp_block,
                         temperature=0.7, pivot_hint=hint,
@@ -1182,3 +1116,10 @@ No fluff. No "In this task...". Just facts."""
             yield {"type": "status", "content": "Step limit reached.\n"}
             if final_response:
                 self._conversation_history.append({"user": user_input, "assistant": final_response})
+
+        # Finalize plan: any lingering in_progress task → skipped, emit final update
+        if self.current_plan is not None:
+            for t in self.current_plan.tasks:
+                if t.status == "in_progress":
+                    self.current_plan.advance(t.id, "skipped")
+            yield {"type": "plan_update", "plan": self.current_plan}
