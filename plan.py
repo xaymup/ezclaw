@@ -7,7 +7,7 @@ mutator for task status; the rest of the codebase reads `Plan` snapshots
 but does not edit task fields directly.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 
@@ -48,8 +48,11 @@ class Plan:
         appends to the end. Returns the new task. The new id is `max(existing) + 1`."""
         new_id = max((t.id for t in self.tasks), default=0) + 1
         new_task = Task(id=new_id, description=description)
-        idx = next((i for i, t in enumerate(self.tasks) if t.id == after_id), len(self.tasks) - 1)
-        self.tasks.insert(idx + 1, new_task)
+        idx = next((i for i, t in enumerate(self.tasks) if t.id == after_id), None)
+        if idx is None:
+            self.tasks.append(new_task)
+        else:
+            self.tasks.insert(idx + 1, new_task)
         return new_task
 
     def is_complete(self) -> bool:
