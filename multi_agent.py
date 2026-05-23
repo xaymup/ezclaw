@@ -1641,7 +1641,10 @@ No fluff. No "In this task...". Just facts."""
             # (the architect still sees them via step_output_parts so it can
             # turn the Proposed Fix into new_tasks). Tool calls and status
             # still surface so the user sees that work is happening.
-            suppress_user_visible = (agent_key == "debugger")
+            # All delegated agents now route content through the architect's
+            # end-of-turn synthesis (Spec E). Tool/status/plan chunks still
+            # surface; only content is suppressed.
+            suppress_user_visible = True
 
             step_output_parts = []
             step_tool_results = []
@@ -1664,11 +1667,9 @@ No fluff. No "In this task...". Just facts."""
                 step_output = "Done."
                 if not suppress_user_visible:
                     yield {"type": "content", "content": "Done."}
-            if step_output.strip() and not suppress_user_visible:
-                # Only update final_response from agents whose output is
-                # meant for the user. Otherwise the debugger's diagnosis
-                # would become the answer when the run completes.
-                final_response = step_output.strip()
+            # final_response is now produced by _synthesize_user_reply at
+            # end-of-loop (Spec E). step_output is captured into step_history
+            # below so the synthesis can summarize it.
 
             if suppress_user_visible:
                 # Tell the user the debugger handed off so they can see
