@@ -593,12 +593,13 @@ class ChatUI:
         read_cap = 5000 if expanded else 25
         output_cap = 5000 if expanded else 100
 
+        tool_kind = THEME.tool_kind(tool_name)
         idx_label = f"[{index}] " if index is not None else ""
         state_label = "  ⇣ expanded" if expanded else ""
         header = Text.assemble(
-            ("▸ ", f"bold {WARN}"),
+            (f"{tool_kind.icon} ", f"bold {tool_kind.color}"),
             (idx_label, f"dim {DIM}"),
-            (tool_name, "bold"),
+            (tool_name, f"bold {tool_kind.color}"),
             (state_label, f"dim {ACCENT}"),
         )
         tool_parts = []
@@ -642,7 +643,26 @@ class ChatUI:
             elapsed = time.time() - start_time if start_time else 0
             label = f"running... ({elapsed:.1f}s)" if elapsed > 1 else "running..."
             tool_parts.append(Text(label, style=f"dim {DIM}"))
-        return Panel(Group(*tool_parts), title=header, border_style=DIM, box=ROUNDED)
+        # Collapsed panels gain a single-line summary pulled from the first
+        # non-empty stripped line of the tool result. Helps scan a long
+        # transcript without expanding every panel.
+        summary = None
+        if not expanded and result:
+            for line in str(result).splitlines():
+                stripped = line.strip()
+                if stripped:
+                    summary = stripped[:80] + ("…" if len(stripped) > 80 else "")
+                    break
+        if summary:
+            summary_text = Text(f"  ↳ {summary}", style=f"dim {DIM} italic")
+            tool_parts.insert(0, summary_text)
+
+        return Panel(
+            Group(*tool_parts),
+            title=header,
+            border_style=f"dim {tool_kind.color}",
+            box=ROUNDED,
+        )
 
     _LANG_BY_EXT = {
         ".py": "python", ".js": "javascript", ".ts": "typescript",
