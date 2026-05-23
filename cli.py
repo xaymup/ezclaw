@@ -507,27 +507,32 @@ class ChatUI:
 
     def _get_welcome_panel(self):
         body = Text()
-        body.append("EzClaw ", style=f"bold {PRIMARY}")
+
+        # Per-character gradient on the "EzClaw" title — wraps the ramp
+        # if the string is longer than TITLE_GRADIENT.
+        title = "EzClaw"
+        for i, ch in enumerate(title):
+            body.append(ch, style=f"bold {TITLE_GRADIENT[i % len(TITLE_GRADIENT)]}")
+        body.append(" ", "")
         body.append("v2.2 (Full TUI)\n", style=f"dim {DIM}")
-        body.append("\n", "")
+        body.append("─" * 40 + "\n", style=f"dim {DIM}")
 
         if ENABLE_MULTI_AGENT and hasattr(self.agent, "agents"):
-            # Multi-agent: enumerate each role with its model.
             body.append("⚡ Multi-agent\n", style=f"bold {PRIMARY}")
             arch_model = getattr(self.agent.architect, "model", "?") if hasattr(self.agent, "architect") else "?"
-            color = THEME.role("architect").color
-            body.append(f"  architect   ", style=f"bold {color}")
+            arch_style = THEME.role("architect")
+            body.append(f"  {arch_style.icon} architect   ", style=f"bold {arch_style.color}")
             body.append(f"{arch_model}\n", style=SECONDARY)
             for role, sub_agent in self.agent.agents.items():
-                color = THEME.role(role).color
-                body.append(f"  {role:<11} ", style=f"bold {color}")
+                rs = THEME.role(role)
+                body.append(f"  {rs.icon} {role:<9} ", style=f"bold {rs.color}")
                 body.append(f"{sub_agent.model}\n", style=SECONDARY)
         else:
             body.append("● Single-agent\n", style=f"bold {PRIMARY}")
             body.append(f"  model       ", style=f"bold {SECONDARY}")
             body.append(f"{self.agent.model}\n", style=SECONDARY)
 
-        body.append("\n", "")
+        body.append("─" * 40 + "\n", style=f"dim {DIM}")
         body.append(f"  workspace   ", style=f"bold {DIM}")
         body.append(f"./workspace\n", style=f"dim {DIM}")
         body.append("\n", "")
