@@ -639,13 +639,175 @@ def web_fetch(url: str) -> str:
             response = client.get(url, headers=headers)
             response.raise_for_status()
             text = clean_html(response.text)
-            
+
             # Context window protection: Limit to 12,000 characters
             if len(text) > 12000:
                 return f"--- CONTENT FROM {url} (TRUNCATED) ---\n" + text[:12000] + "\n... (Content truncated for length) ..."
             return f"--- CONTENT FROM {url} ---\n" + text
     except Exception as e:
         return f"Error fetching {url}: {str(e)}"
+
+
+def _search_brave(query: str, limit: int, api_key: str) -> list:
+    """Brave Search API — real general-purpose search. Best results, but
+    requires an API key (free tier 2000/mo at search.brave.com/app/api)."""
+    with httpx.Client(timeout=15.0) as client:
+        resp = client.get(
+            "https://api.search.brave.com/res/v1/web/search",
+            params={"q": query, "count": min(limit, 20)},
+            headers={
+                "Accept": "application/json",
+                "X-Subscription-Token": api_key,
+            },
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    results = []
+    for r in (data.get("web") or {}).get("results", [])[:limit]:
+        results.append({
+            "title": r.get("title", "").strip(),
+            "url": r.get("url", ""),
+            "snippet": r.get("description", "").strip(),
+            "source": "brave",
+        })
+    return results
+
+
+def _search_wikipedia(query: str, limit: int) -> list:
+    """Wikipedia opensearch — free, no key, no anti-bot. Excellent for
+    library names, language features, documented APIs; useless for raw
+    error messages."""
+    with httpx.Client(timeout=15.0, follow_redirects=True) as client:
+        resp = client.get(
+            "https://en.wikipedia.org/w/api.php",
+            params={
+                "action": "opensearch", "search": query,
+                "limit": limit, "format": "json",
+            },
+            headers={"User-Agent": "ezclaw/1.0"},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    if not isinstance(data, list) or len(data) < 4:
+        return []
+    _, titles, snippets, urls = data[0], data[1], data[2], data[3]
+    results = []
+    for i in range(min(len(titles), limit)):
+        results.append({
+            "title": titles[i],
+            "url": urls[i] if i < len(urls) else "",
+            "snippet": snippets[i] if i < len(snippets) else "",
+            "source": "wikipedia",
+        })
+    return results
+
+
+def _search_ddg_instant(query: str) -> list:
+    """DDG Instant Answer — narrow but reliable. Returns at most one
+    encyclopedic entry for common topics."""
+    with httpx.Client(timeout=10.0, follow_redirects=True) as client:
+        resp = client.get(
+            "https://api.duckduckgo.com/",
+            params={"q": query, "format": "json", "no_html": 1, "skip_disambig": 1},
+            headers={"User-Agent": "ezclaw/1.0"},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    out = []
+    if data.get("Abstract"):
+        out.append({
+            "title": data.get("Heading") or query,
+            "url": data.get("AbstractURL", ""),
+            "snippet": data.get("AbstractText", ""),
+            "source": "ddg-instant",
+        })
+    for rt in (data.get("RelatedTopics") or [])[:4]:
+        if isinstance(rt, dict) and rt.get("FirstURL"):
+            out.append({
+                "title": rt.get("Text", "")[:80] or query,
+                "url": rt.get("FirstURL", ""),
+                "snippet": rt.get("Text", ""),
+                "source": "ddg-instant",
+            })
+    return out
+
+
+@registry.register
+def web_search(query: str, limit: int = 5) -> str:
+    """
+    Search the web and return top results (title, URL, snippet).
+
+    Used to GROUND analysis in real sources rather than training-data
+    guesses — when you hit an unfamiliar error, library behavior, or
+    framework concept, search for the exact phrase before diagnosing.
+
+    Backend chain (best → fallback):
+      1. Brave Search API — if BRAVE_SEARCH_API_KEY env var is set
+         (free tier at search.brave.com/app/api, 2000 queries/month)
+      2. Wikipedia opensearch — free, covers documented APIs and concepts
+      3. DuckDuckGo Instant Answer — narrow, mostly Wikipedia-derived
+
+    Returns markdown-formatted results so the agent can cite URLs in
+    its reasoning. If everything returns nothing, includes a note about
+    how to configure a real backend.
+    """
+    if not query or not query.strip():
+        return "Error: empty query."
+
+    results = []
+    errors = []
+
+    # Try backends in priority order. Continue past failures so a flaky
+    # backend doesn't kill the whole search.
+    api_key = os.environ.get("BRAVE_SEARCH_API_KEY", "").strip()
+    if api_key:
+        try:
+            results.extend(_search_brave(query, limit, api_key))
+        except Exception as e:
+            errors.append(f"brave: {e}")
+
+    if len(results) < limit:
+        try:
+            results.extend(_search_wikipedia(query, limit - len(results)))
+        except Exception as e:
+            errors.append(f"wikipedia: {e}")
+
+    if len(results) < limit:
+        try:
+            for r in _search_ddg_instant(query):
+                if not any(r["url"] == existing["url"] for existing in results):
+                    results.append(r)
+                if len(results) >= limit:
+                    break
+        except Exception as e:
+            errors.append(f"ddg: {e}")
+
+    if not results:
+        msg = f"No results found for {query!r}."
+        if errors:
+            msg += "\n\nBackend errors: " + "; ".join(errors)
+        if not api_key:
+            msg += (
+                "\n\nTip: set BRAVE_SEARCH_API_KEY (free tier at "
+                "search.brave.com/app/api) for real general-purpose search. "
+                "Without it, only Wikipedia + DDG instant-answers are queried, "
+                "which miss most error-message lookups."
+            )
+        return msg
+
+    lines = [f"## Search results for: {query}", ""]
+    for i, r in enumerate(results[:limit], 1):
+        title = r["title"] or "(untitled)"
+        lines.append(f"{i}. **{title}**  [_{r['source']}_]")
+        if r["url"]:
+            lines.append(f"   {r['url']}")
+        if r["snippet"]:
+            snippet = r["snippet"][:300]
+            if len(r["snippet"]) > 300:
+                snippet += "…"
+            lines.append(f"   {snippet}")
+        lines.append("")
+    return "\n".join(lines).rstrip()
 
 @registry.register
 def schedule_task(scheduled_time: str, description: str) -> str:

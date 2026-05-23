@@ -51,6 +51,7 @@ _TOOL_NAME_TO_KIND: Dict[str, str] = {
     "generate_codebase_map": "file",
     "run_shell": "shell",
     "web_fetch": "web",
+    "web_search": "web",
     "remember": "memory",
     "recall": "memory",
     "forget": "memory",
