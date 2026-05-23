@@ -463,6 +463,12 @@ Rules for execution:
 If the EXECUTION REQUEST says `Plan: (none — single-step request)`, this is a chat reply, a fact lookup, or any other one-shot exchange. Set `current_task_id` to `0`, leave `task_updates` and `new_tasks` empty, and **ALWAYS set `complete: true`** — the routed agent will produce a single reply and the turn is done. Do NOT keep the loop running expecting verification; chat replies don't have verifications. (The orchestrator also auto-completes after the first responsive step in this mode, so `complete: false` here just wastes a turn.)
 
 ═══════════════════════════════════════════════════════════════
+## Conversation flow awareness
+═══════════════════════════════════════════════════════════════
+
+When the request contains references to prior work — "that file", "the bug we discussed", "fix it", "what we just did", "make it shorter" — the answer is in `## Conversation History`. Each past turn there shows the user's request, the assistant's reply, any tools used (e.g. `Tools: write_file(foo.py), run_shell("pytest")`), and a plan summary if there was one. USE this context to resolve pronouns and continue the thread instead of asking "which file?" or treating every request as fresh.
+
+═══════════════════════════════════════════════════════════════
 ## General style
 ═══════════════════════════════════════════════════════════════
 
@@ -712,18 +718,73 @@ class MultiAgentSystem:
         return self.architect.messages
 
     def _format_history(self) -> str:
+        """Render the last few turns as a context block for prompts.
+
+        Includes tool calls and plan summaries per turn so the next turn
+        can resolve references like "that file" or "the bug we discussed"
+        — without those, the agent only sees user+assistant text and
+        loses track of what was actually done.
+
+        Returns content only — no `## Conversation History` header (the
+        caller wraps it). This avoids the double-header bug the older
+        code shipped with.
+        """
         if not self._conversation_history:
             return ""
-        lines = ["## Conversation History"]
+        lines = []
         for turn in self._conversation_history[-5:]:
-            lines.append(f"- User: {turn['user']}")
-            if turn.get('assistant'):
-                # Truncate long responses but keep the core meaning
-                resp = turn['assistant']
-                if len(resp) > 500:
-                    resp = resp[:400] + "... [truncated]"
+            user_text = turn["user"]
+            if len(user_text) > 200:
+                user_text = user_text[:200] + "…"
+            lines.append(f"- User: {user_text}")
+
+            resp = turn.get("assistant") or ""
+            if resp:
+                if len(resp) > 1200:
+                    resp = resp[:1200] + "… [truncated]"
                 lines.append(f"  Assistant: {resp}")
+
+            tools = turn.get("tools") or []
+            if tools:
+                # Dedup while preserving order — same tool can appear many
+                # times in a turn, the history just needs the gist.
+                seen = set()
+                unique_tools = [t for t in tools if not (t in seen or seen.add(t))]
+                lines.append(f"  Tools: {', '.join(unique_tools[:8])}")
+
+            plan_summary = turn.get("plan_summary")
+            if plan_summary:
+                lines.append(f"  Plan: {plan_summary}")
         return "\n".join(lines) + "\n"
+
+    def _append_conversation_turn(
+        self,
+        user_input: str,
+        assistant_text: str,
+        step_history=None,
+        plan=None,
+    ) -> None:
+        """Single entry-point for recording a completed turn. Captures
+        user text + assistant reply + every tool used + a plan summary
+        if a plan was active. Replaces the bare {user, assistant} dicts
+        that older code appended directly."""
+        all_tools = []
+        if step_history:
+            for step in step_history:
+                all_tools.extend(step.get("tools") or [])
+
+        plan_summary = None
+        if plan is not None and getattr(plan, "tasks", None):
+            done = sum(1 for t in plan.tasks if t.status == "done")
+            total = len(plan.tasks)
+            plan_summary = f"{plan.title} ({done}/{total} done)"
+
+        self._conversation_history.append({
+            "user": user_input,
+            "assistant": assistant_text,
+            "tools": all_tools,
+            "plan_summary": plan_summary,
+        })
 
     def clear_session_history(self):
         for a in self.agents.values():
@@ -929,7 +990,10 @@ No fluff. No "In this task...". Just facts."""
                 else:
                     yield {"type": "status", "content": "Done.\n"}
                     self.db.store_routing_decision(user_input, agent_key, True)
-                    self._conversation_history.append({"user": user_input, "assistant": sc_output.strip()})
+                    # Fast-route case: synthesize a single-step history of
+                    # the one tool batch the routed agent ran (if any).
+                    sc_steps = [{"agent": agent_key, "tools": sc_tool_results}] if sc_tool_results else None
+                    self._append_conversation_turn(user_input, sc_output.strip(), step_history=sc_steps)
                     return
 
         # Hoist constant-per-turn lookups out of the step loop.
@@ -1010,7 +1074,7 @@ No fluff. No "In this task...". Just facts."""
             if single_step_done or plan_done:
                 yield {"type": "status", "content": f"🦀 {pick(COMPLETED)}."}
                 final_text = final_response.strip() if final_response else "Task completed."
-                self._conversation_history.append({"user": user_input, "assistant": final_text})
+                self._append_conversation_turn(user_input, final_text, step_history, self.current_plan)
 
                 # PILLAR 1: Store experience
                 self._summarize_experience(user_input, task_context)
@@ -1020,7 +1084,7 @@ No fluff. No "In this task...". Just facts."""
             agent = self.agents.get(agent_key)
             if not agent:
                 yield {"type": "status", "content": f"🦀 {pick(ARCHITECT_FINALIZING)}…"}
-                self._conversation_history.append({"user": user_input, "assistant": final_response.strip()})
+                self._append_conversation_turn(user_input, final_response.strip(), step_history, self.current_plan)
                 break
 
             plan = intent.get("plan") or intent.get("reasoning", "") or "Executing..."
@@ -1095,7 +1159,7 @@ No fluff. No "In this task...". Just facts."""
                 if last.get('tools'):
                     prev_step_summary += f"\nTools used: {', '.join(last['tools'][:5])}"
 
-            history_block = f"\n## Conversation History\n{recent_history}\n" if recent_history else ""
+            history_block = f"\n## Conversation History\n{recent_history}" if recent_history else ""
             agent_context = f"{memory_block}{history_block}## Instructions\n{instruction}\n\n## Original Request\n{user_input}{prev_step_summary}"
 
             step_output_parts = []
@@ -1167,7 +1231,7 @@ No fluff. No "In this task...". Just facts."""
             from phrases import pick as _pick, STEP_LIMIT as _SL
             yield {"type": "status", "content": f"🦀 {_pick(_SL)}.\n"}
             if final_response:
-                self._conversation_history.append({"user": user_input, "assistant": final_response})
+                self._append_conversation_turn(user_input, final_response, step_history, self.current_plan)
 
         # Finalize plan: any lingering in_progress task → skipped, emit final update
         if self.current_plan is not None:
