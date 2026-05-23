@@ -4,7 +4,9 @@ import json
 import re
 from typing import List, Dict, Any, Optional, Iterator
 from memory import Database
-from tools import registry, create_memory_tools
+import pickle
+from tools import registry, create_memory_tools, MUTATING_TOOLS, create_action_tracking_tools, set_session_context
+from action_tracking import classify_outcome, extract_why, summarize_action
 from agent import load_skills, match_skills, format_skills_block
 from embed import embed, cosine_similarity, classify_by_similarity
 from model_client import build_architect_client, build_agent_client, extract_json
@@ -173,7 +175,7 @@ class _SharedAuthState:
 class SpecializedAgent:
     """Self-contained agent with its own model, prompt, tools, and history."""
 
-    def __init__(self, name: str, config: dict, db: Database, auth_state: "_SharedAuthState" = None):
+    def __init__(self, name: str, config: dict, db: Database, auth_state: "_SharedAuthState" = None, session_id: int = None):
         self.name = name
         self.client = build_agent_client()
         self.model = config["model"]
@@ -181,6 +183,7 @@ class SpecializedAgent:
         # Give all agents access to all registered tools
         self.tools = registry.get_tool_definitions()
         self.db = db
+        self.session_id = session_id
         self.messages: List[Dict] = [{"role": "system", "content": self.system_prompt}]
         self.num_ctx = int(os.getenv("OLLAMA_NUM_CTX", 16384))
         self.options = {
@@ -193,6 +196,36 @@ class SpecializedAgent:
         # Shared with sibling agents — see _SharedAuthState docstring.
         self._auth_state = auth_state if auth_state is not None else _SharedAuthState()
         self._pre_embed_tools()
+
+    def _record_action(self, tool_name: str, args: dict, result: str, assistant_text: str) -> None:
+        """Record one mutating tool call to the actions table. Best-effort —
+        never propagates out and never blocks the tool."""
+        try:
+            from embed import embed as _embed
+            if self.session_id is None:
+                return
+            summary = summarize_action(tool_name, args)
+            why = extract_why(assistant_text)
+            outcome, error_excerpt = classify_outcome(result)
+            embed_text = f"{summary} {why or ''}".strip()
+            try:
+                vec = _embed(embed_text)
+                emb_blob = pickle.dumps(vec)
+            except Exception:
+                emb_blob = None
+            self.db.add_action(
+                session_id=self.session_id,
+                tool=tool_name,
+                args_json=json.dumps(args, default=str),
+                summary=summary,
+                why=why,
+                outcome=outcome,
+                error_excerpt=error_excerpt,
+                embedding=emb_blob,
+            )
+        except Exception as e:
+            import sys
+            print(f"[action-tracking] record failed: {e}", file=sys.stderr)
 
     @property
     def session_authorized(self) -> bool:
@@ -784,13 +817,18 @@ class MultiAgentSystem:
     def __init__(self, session_id: Optional[int] = None):
         self.db = Database(os.getenv("DATABASE_PATH", "ezclaw.db"))
         create_memory_tools(self.db)
+        create_action_tracking_tools(self.db)
         self.skills = load_skills()
+        if session_id is None:
+            session_id = self.db.get_last_session_id() or self.db.create_session()
+        self.session_id = session_id
+        set_session_context(self.session_id)
         self.architect = Architect(self.db)
         # Shared auth state so pressing [A] in any sub-agent's prompt
         # authorizes the entire session, not just that one role.
         self._shared_auth = _SharedAuthState()
         self.agents = {
-            name: SpecializedAgent(name, cfg, self.db, auth_state=self._shared_auth)
+            name: SpecializedAgent(name, cfg, self.db, auth_state=self._shared_auth, session_id=self.session_id)
             for name, cfg in AGENT_DEFS.items()
         }
         self._conversation_history: List[Dict[str, str]] = []

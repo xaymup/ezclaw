@@ -134,3 +134,42 @@ def test_non_mutating_tool_in_dispatcher_does_not_record(tmp_db, monkeypatch):
         )
 
     assert _count_actions(tmp_db, agent.session_id) == 0
+
+
+# ── SpecializedAgent (multi-agent) ──────────────────────────────────────────
+
+
+def test_specialized_agent_records_mutating_action(tmp_db, monkeypatch):
+    """SpecializedAgent has a session_id and a _record_action method that works."""
+    import embed as embed_mod
+    monkeypatch.setattr(embed_mod, "embed", lambda text: [1.0, 0.0])
+
+    from multi_agent import SpecializedAgent
+
+    sid = tmp_db.create_session("multi")
+    # Construct without the heavy parts — we only need db, session_id, and the method.
+    agent = SpecializedAgent.__new__(SpecializedAgent)
+    agent.db = tmp_db
+    agent.session_id = sid
+
+    agent._record_action(
+        tool_name="write_file",
+        args={"path": "out.txt", "content": "hi"},
+        result="wrote 2 bytes",
+        assistant_text="creating the file",
+    )
+    assert _count_actions(tmp_db, sid) == 1
+
+
+def test_multi_agent_system_propagates_session_id(monkeypatch, tmp_path):
+    """MultiAgentSystem.__init__ accepts and stores session_id, and passes it
+    to each SpecializedAgent."""
+    import multi_agent
+    monkeypatch.setattr(multi_agent, "load_skills", lambda: [])
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "mas.db"))
+
+    from multi_agent import MultiAgentSystem
+    mas = MultiAgentSystem(session_id=None)
+    assert mas.session_id is not None  # auto-created if None
+    for agent in mas.agents.values():
+        assert agent.session_id == mas.session_id
