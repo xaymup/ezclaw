@@ -17,6 +17,27 @@ class Database:
             cursor.execute('''CREATE TABLE IF NOT EXISTS memories (id INTEGER PRIMARY KEY AUTOINCREMENT, fact TEXT, tags TEXT, embedding BLOB, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
             cursor.execute('''CREATE TABLE IF NOT EXISTS experiences (id INTEGER PRIMARY KEY AUTOINCREMENT, task TEXT, trace TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
             cursor.execute('''CREATE TABLE IF NOT EXISTS routing_history (id INTEGER PRIMARY KEY AUTOINCREMENT, query TEXT, selected_agent TEXT, success BOOLEAN, query_embedding BLOB, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+            cursor.execute('''CREATE TABLE IF NOT EXISTS file_cache (
+    path TEXT PRIMARY KEY,
+    mtime REAL NOT NULL,
+    size INTEGER NOT NULL,
+    content_hash TEXT NOT NULL,
+    content TEXT NOT NULL,
+    cached_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)''')
+            cursor.execute('''CREATE TABLE IF NOT EXISTS file_chunks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    path TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    chunk_index INTEGER NOT NULL,
+    start_line INTEGER NOT NULL,
+    end_line INTEGER NOT NULL,
+    content TEXT NOT NULL,
+    embedding BLOB NOT NULL,
+    UNIQUE(path, content_hash, chunk_index)
+)''')
+            cursor.execute('''CREATE INDEX IF NOT EXISTS idx_file_chunks_path_hash
+    ON file_chunks(path, content_hash)''')
             conn.commit()
             self._migrate()
 
@@ -26,6 +47,7 @@ class Database:
             for migration in [
                 ("ALTER TABLE memories ADD COLUMN embedding BLOB", "memories"),
                 ("ALTER TABLE messages ADD COLUMN embedding BLOB", "messages"),
+                ("ALTER TABLE experiences ADD COLUMN embedding BLOB", "experiences"),
             ]:
                 try:
                     cursor.execute(migration[0])
@@ -198,31 +220,43 @@ class Database:
             return row[0] if row else None
 
     def add_experience(self, task: str, trace: str):
+        from embed import embed
+        try:
+            vector = embed(task)
+            blob = pickle.dumps(vector)
+        except Exception:
+            blob = None
+
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
-            cursor.execute("INSERT INTO experiences (task, trace) VALUES (?, ?)", (task, trace))
+            cursor.execute("INSERT INTO experiences (task, trace, embedding) VALUES (?, ?, ?)", (task, trace, blob))
             conn.commit()
 
-    def search_experiences(self, query: str, limit: int = 2) -> List[Dict[str, str]]:
-        from embed import rank_by_similarity
+    def search_experiences(self, query: str, limit: int = 3, threshold: float = 0.2) -> List[Dict[str, str]]:
+        from embed import embed, cosine_similarity
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT task, trace FROM experiences")
+            cursor.execute("SELECT task, trace, embedding FROM experiences")
             rows = cursor.fetchall()
 
         if not rows:
             return []
 
-        tasks = [row[0] for row in rows]
-        ranked_tasks = rank_by_similarity(query, tasks, top_n=limit)
+        q_vec = embed(query)
+        scored = []
+        for task, trace, emb_blob in rows:
+            if emb_blob:
+                e_vec = pickle.loads(emb_blob)
+                sim = cosine_similarity(q_vec, e_vec)
+            else:
+                # Fallback to simple keyword match if no embedding
+                sim = 0.5 if any(w in task.lower() for w in query.lower().split()) else 0.0
+            
+            if sim >= threshold:
+                scored.append((sim, {"task": task, "trace": trace}))
 
-        results = []
-        for t in ranked_tasks:
-            for row in rows:
-                if row[0] == t:
-                    results.append({"task": row[0], "trace": row[1]})
-                    break
-        return results
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [item[1] for item in scored[:limit]]
 
     # ── Routing History ──────────────────────────────────────────────
 
