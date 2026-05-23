@@ -306,13 +306,12 @@ Respond with JSON only:
         and swallowed — never propagates out and never blocks the tool.
         """
         try:
-            from embed import embed as _embed
             summary = summarize_action(tool_name, args)
             why = extract_why(assistant_text)
             outcome, error_excerpt = classify_outcome(result)
             embed_text = f"{summary} {why or ''}".strip()
             try:
-                vec = _embed(embed_text)
+                vec = embed(embed_text)
                 emb_blob = pickle.dumps(vec)
             except Exception:
                 emb_blob = None

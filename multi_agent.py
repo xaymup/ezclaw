@@ -210,7 +210,6 @@ class SpecializedAgent:
         """Record one mutating tool call to the actions table. Best-effort —
         never propagates out and never blocks the tool."""
         try:
-            from embed import embed as _embed
             if self.session_id is None:
                 return
             summary = summarize_action(tool_name, args)
@@ -218,7 +217,7 @@ class SpecializedAgent:
             outcome, error_excerpt = classify_outcome(result)
             embed_text = f"{summary} {why or ''}".strip()
             try:
-                vec = _embed(embed_text)
+                vec = embed(embed_text)
                 emb_blob = pickle.dumps(vec)
             except Exception:
                 emb_blob = None

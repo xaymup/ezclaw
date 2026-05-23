@@ -1112,7 +1112,13 @@ def create_memory_tools(db: Any):
 
 def create_action_tracking_tools(db: Any):
     """Register the `recall_actions` tool. Bound to `db`; reads the current
-    session id from the module-level contextvar set by the agent."""
+    session id from the module-level contextvar set by the agent.
+
+    Re-registering (e.g., from a second agent in the same process)
+    rebinds the closure to the new `db`. This is fine when only one
+    agent is alive at a time (the normal case); it's intentional in
+    tests where each fixture wants its own Database.
+    """
 
     @registry.register
     def recall_actions(query: str, limit: int = 5) -> str:

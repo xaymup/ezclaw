@@ -109,3 +109,11 @@ def test_recall_actions_returns_error_when_no_session_set(tmp_db):
 def test_executor_prompt_mentions_recall_actions():
     from multi_agent import AGENT_DEFS
     assert "recall_actions" in AGENT_DEFS["executor"]["system_prompt"]
+
+
+def test_chat_agent_source_contains_recall_actions_nudge():
+    """ChatAgent.__init__ augments its system prompt with the recall_actions nudge."""
+    import inspect
+    from agent import ChatAgent
+    src = inspect.getsource(ChatAgent.__init__)
+    assert "recall_actions" in src
