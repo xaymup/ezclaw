@@ -1353,6 +1353,8 @@ No fluff. No "In this task...". Just facts."""
             ESCALATING, LOOP_DETECTED, STEP_LIMIT, PIVOT, COMPLETED,
         )
 
+        hit_cap = False
+        cap_reason = None
         for step in range(1, max_steps + 1):
             yield {"type": "status", "content": f"🦀 {pick(ARCHITECT_THINKING)}… (step {step}/{max_steps})"}
 
@@ -1520,6 +1522,15 @@ No fluff. No "In this task...". Just facts."""
                             f"or tell me which approach to retry."
                         ),
                     }
+                    yield {"type": "content", "content": (
+                        "\n[System: architect ran out of pivot attempts — "
+                        "pausing here. Type \"continue\" (or one of: go on / keep "
+                        "going / more / next) to extend this response, or send a "
+                        "new prompt to start fresh.]"
+                    )}
+                    yield {"type": "halt", "reason": "pivot_exhausted"}
+                    hit_cap = True
+                    cap_reason = "pivot_exhausted"
                     break
 
             yield {
@@ -1636,7 +1647,7 @@ No fluff. No "In this task...". Just facts."""
                 agent_key, step_success
             )
 
-        if step >= max_steps:
+        if step >= max_steps and not hit_cap:
             # Hitting the step cap means the task is more complex than the
             # orchestrator can autonomously drive to completion. Frame as a
             # blocker, not a give-up — the user should refine the goal,
@@ -1654,6 +1665,15 @@ No fluff. No "In this task...". Just facts."""
                     f"(or break the goal into smaller pieces)."
                 ),
             }
+            yield {"type": "content", "content": (
+                f"\n[System: architect ran {max_steps} orchestration steps "
+                f"— pausing here. Type \"continue\" (or one of: go on / keep "
+                f"going / more / next) to extend this response, or send a "
+                f"new prompt to start fresh.]"
+            )}
+            yield {"type": "halt", "reason": "iteration_cap"}
+            hit_cap = True
+            cap_reason = "iteration_cap"
             if final_response:
                 self._append_conversation_turn(user_input, final_response, step_history, self.current_plan)
 
