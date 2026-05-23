@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+import re
 import sys
 import time
 import threading
@@ -16,7 +17,6 @@ if os.path.isdir(_venv) and not sys.prefix.startswith(_venv):
     _python = os.path.join(_venv, "bin", "python3")
     os.execv(_python, [_python] + sys.argv)
 
-from prompt_toolkit.eventloop import call_soon_threadsafe
 from rich.console import Console, Group
 from rich.markdown import Markdown
 from rich.panel import Panel
@@ -25,7 +25,7 @@ from rich.box import ROUNDED
 from rich.syntax import Syntax
 from rich.spinner import Spinner
 
-from prompt_toolkit.application import Application, run_in_terminal
+from prompt_toolkit.application import Application
 from prompt_toolkit.layout.containers import HSplit, Window
 from prompt_toolkit.layout.controls import FormattedTextControl, BufferControl
 from prompt_toolkit.layout.layout import Layout
@@ -212,61 +212,99 @@ class ChatUI:
         # the agent's reply.
         self._force_scroll_next_update = False
 
+        # Active embedded interactive shell session, or None. While set,
+        # user input typed into the prompt is forwarded to the subprocess
+        # via the session's input_queue instead of being sent to the agent.
+        self._interactive_session = None
+
     def _wrap_tools(self):
         from tools import registry
         original_run_shell = registry.tools.get('run_shell')
-        if original_run_shell:
-            def wrapped_run_shell(command: str, interactive: bool = False) -> str:
-                if interactive:
-                    res_queue = queue.Queue()
-                    def _trigger():
-                        async def _run_async():
-                            def _run():
-                                from rich.console import Console
-                                from rich.panel import Panel
-                                from rich.text import Text
-                                r_console = Console()
-                                
-                                r_console.print("\n")
-                                r_console.print(Panel(
-                                    Text.assemble(
-                                        ("EZCLAW SUSPENDED\n\n", "bold yellow"),
-                                        ("Command: ", ""), (command, "bold cyan"),
-                                        ("\n\nInstructions: ", "bold"), 
-                                        ("Provide any required input (password, confirmation, etc.).\n", ""),
-                                        ("Wait for the command to finish completely.\n", ""),
-                                        ("If the command hangs after finishing, press [Enter].", "italic dim")
-                                    ),
-                                    title="[bold yellow]Interactive Shell Session[/bold yellow]",
-                                    border_style="yellow",
-                                    expand=False
-                                ))
-                                
-                                result = original_run_shell(command, interactive=True)
-                                
-                                r_console.print(Panel(
-                                    "Interactive session finished. Resuming EzClaw TUI...",
-                                    title="[bold green]Success[/bold green]",
-                                    border_style="green",
-                                    expand=False
-                                ))
-                                r_console.print("\n")
-                                return result
-                            
-                            # run_in_terminal suspends the TUI and gives control to the terminal
-                            result = await run_in_terminal(_run, render_cli_done=False)
-                            res_queue.put(result)
-                        
-                        # Create background task on the main event loop
-                        self.app.create_background_task(_run_async())
-                    
-                    loop = getattr(self.app, 'loop', None)
-                    call_soon_threadsafe(_trigger, loop=loop)
-                    
-                    # Block the agent thread until the user is done with the terminal
-                    return res_queue.get()
+        if not original_run_shell:
+            return
+
+        def wrapped_run_shell(command: str, interactive: bool = False) -> str:
+            if not interactive:
                 return original_run_shell(command, interactive=False)
-            registry.tools['run_shell'] = wrapped_run_shell
+
+            # ── UI-embedded interactive shell ─────────────────────────────
+            # Subprocess output streams into a live tool panel inside the
+            # chat. User input typed into the prompt is routed to the
+            # subprocess via input_queue. The TUI is never suspended.
+            input_q: "queue.Queue[bytes]" = queue.Queue()
+            live_buffer: list[bytes] = []
+
+            # Find the tool execution dict that was just appended for this
+            # call (the agent emitted tool_start → cli appended an entry).
+            # We tag it with our streaming buffer so the panel render can
+            # show output as it arrives.
+            tool_dict = None
+            for t in reversed(self.tool_executions):
+                if t.get("name") == "run_shell" and t.get("result") is None:
+                    tool_dict = t
+                    tool_dict["_live_buffer"] = live_buffer
+                    tool_dict["interactive"] = True
+                    tool_dict["expanded"] = True  # show output live
+                    break
+
+            self._interactive_session = {
+                "input_queue": input_q,
+                "tool": tool_dict,
+                "command": command,
+            }
+
+            def on_output(data: bytes):
+                # Cap the in-memory buffer so a runaway subprocess can't
+                # balloon UI state. Keep the last ~64 KB.
+                live_buffer.append(data)
+                total = sum(len(c) for c in live_buffer)
+                while total > 64 * 1024 and len(live_buffer) > 1:
+                    total -= len(live_buffer.pop(0))
+                try:
+                    self._update_ui()
+                except Exception:
+                    pass
+
+            def input_provider():
+                try:
+                    return input_q.get_nowait()
+                except queue.Empty:
+                    return None
+
+            try:
+                from tools import (
+                    _run_shell_interactive, _build_sandbox_env,
+                    _ensure_workspace_self_symlink, WORKSPACE_DIR,
+                )
+                workspace_cwd = os.path.abspath(WORKSPACE_DIR)
+                os.makedirs(workspace_cwd, exist_ok=True)
+                _ensure_workspace_self_symlink(workspace_cwd)
+                result = _run_shell_interactive(
+                    command,
+                    workspace_cwd=workspace_cwd,
+                    sandbox_env=_build_sandbox_env(),
+                    on_output=on_output,
+                    input_provider=input_provider,
+                )
+            except Exception as exc:
+                # Defensive: any failure during the embedded interactive
+                # run gets caught here so the TUI never crashes. The agent
+                # sees a clear error string as the tool result.
+                result = (
+                    f"[Interactive shell session — crashed]\n"
+                    f"Command: {command}\n"
+                    f"Error: {type(exc).__name__}: {exc}\n"
+                )
+            finally:
+                self._interactive_session = None
+                try:
+                    self._update_ui()
+                except Exception:
+                    pass
+
+            return result
+
+        registry.tools['run_shell'] = wrapped_run_shell
 
     def _setup_keybindings(self):
         @self.kb.add('c-c')
@@ -800,15 +838,39 @@ class ChatUI:
         if not result:
             start_time = tool.get("start_time")
             elapsed = time.time() - start_time if start_time else 0
-            # The whimsical verb is picked once per tool execution and cached
-            # on the tool dict — without caching, it would shuffle on every
-            # UI tick and produce a vertigo-inducing flicker.
             verb = tool.get("_running_verb")
             if verb is None:
                 from phrases import pick as _pick, TOOL_RUNNING as _TR
                 verb = _pick(_TR)
                 tool["_running_verb"] = verb
             elapsed_str = f" ({elapsed:.1f}s)" if elapsed > 1 else ""
+
+            # Embedded interactive shell — render the streaming subprocess
+            # output as a live tool panel inside the chat. The panel
+            # expands as bytes arrive; the user types into the chat box
+            # and their keystrokes are forwarded to the subprocess.
+            live_buffer = tool.get("_live_buffer")
+            if tool.get("interactive") and live_buffer is not None:
+                head = self._one_line_tool_head(tool_kind, tool_name, args, index)
+                head.append(f"   ⏳ live{elapsed_str}", style=f"bold {WARN}")
+                head.append("   (type to send input to subprocess)", style=f"dim {DIM} italic")
+
+                # Decode the streaming bytes and strip ANSI; keep the last
+                # ~40 lines so the panel doesn't grow indefinitely on a
+                # very chatty subprocess.
+                try:
+                    full = b"".join(live_buffer).decode("utf-8", errors="ignore")
+                except Exception:
+                    full = ""
+                full = re.sub(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])", "", full)
+                lines = [l for l in full.splitlines() if l.strip("\r")][-40:]
+                body = Text("\n".join(lines), style="")
+                return Panel(
+                    Group(head, body),
+                    border_style=f"dim {WARN}",
+                    box=ROUNDED,
+                )
+
             line = self._one_line_tool_head(tool_kind, tool_name, args, index)
             line.append(f"   ⏳ {verb}…{elapsed_str}", style=f"dim {DIM} italic")
             return line
@@ -943,6 +1005,21 @@ class ChatUI:
     def handle_input(self, text):
         if text.lower() in ["exit", "quit"]:
             self.app.exit()
+            return
+
+        # An embedded interactive shell session is active — every keystroke
+        # the user types goes to the subprocess via the session's input
+        # queue (with a trailing newline so subprocesses like `sudo` see
+        # a complete line). The agent loop stays paused for the duration.
+        if self._interactive_session is not None:
+            try:
+                self._interactive_session["input_queue"].put((text + "\n").encode())
+            except Exception:
+                pass
+            self.history_ansi.append(render_to_ansi(
+                Text(f"→ {text}", style=f"italic dim {DIM}")
+            ))
+            self._update_ui()
             return
 
         if text.startswith("/"):

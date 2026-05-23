@@ -355,17 +355,28 @@ def run_shell(command: str, interactive: bool = False) -> str:
         return f"Error executing command: {str(e)}"
 
 
-def _run_shell_interactive(command: str, workspace_cwd: str, sandbox_env: dict) -> str:
+def _run_shell_interactive(
+    command: str,
+    workspace_cwd: str,
+    sandbox_env: dict,
+    on_output=None,
+    input_provider=None,
+) -> str:
     """Interactive shell via a pty pair, with the same sandboxing as the
     non-interactive path. The parent's cwd is NEVER mutated — cwd flows
     through Popen's `cwd=` kwarg directly to the forked child.
 
-    The returned string is a structured report — header with command,
-    exit code, duration, and byte count, followed by the cleaned terminal
-    output. The structured form lets the agent's next turn reason about
-    whether the interactive session actually succeeded; the old format
-    was just the raw stream which was easy to mis-interpret (especially
-    when the subprocess produced no output, like a successful `sudo true`).
+    UI-embeddable: when `on_output` and `input_provider` are supplied,
+    output bytes go to the callback (instead of sys.stdout) and input
+    bytes come from the provider (instead of the real tty). This lets
+    the TUI stream subprocess output into a live tool panel and route
+    user chat input to the subprocess, without suspending the TUI.
+
+    When both are None (back-compat), behavior matches the old terminal-
+    takeover path: output → sys.stdout, input ← sys.stdin.
+
+    Returns a structured report — header with command, exit code,
+    duration, and byte count, followed by the cleaned terminal output.
     """
     import pty
     import select
@@ -392,23 +403,65 @@ def _run_shell_interactive(command: str, workspace_cwd: str, sandbox_env: dict) 
         os.close(slave_fd)
         slave_fd = -1
 
-        stdin_fd = sys.stdin.fileno() if sys.stdin.isatty() else None
+        # When no callbacks are supplied, fall back to the legacy
+        # terminal-takeover behavior (write to sys.stdout, read from
+        # sys.stdin). The TUI uses the callback path; smoke tests and
+        # any future headless caller can still rely on the legacy path.
+        use_callbacks = on_output is not None
+        stdin_fd = None
+        if not use_callbacks:
+            stdin_fd = sys.stdin.fileno() if sys.stdin.isatty() else None
 
-        # Pump bytes between the user's terminal and the pty master.
+        def _emit(data: bytes) -> None:
+            output_data.append(data)
+            if use_callbacks:
+                try:
+                    on_output(data)
+                except Exception:
+                    pass
+            else:
+                try:
+                    sys.stdout.buffer.write(data)
+                    sys.stdout.buffer.flush()
+                except Exception:
+                    pass
+
+        def _check_user_input():
+            """Forward one chunk of user input to the subprocess if any
+            is pending. Two sources: input_provider (UI-embedded path),
+            or the real tty (terminal-takeover path)."""
+            user_input = b""
+            if use_callbacks and input_provider is not None:
+                try:
+                    val = input_provider()
+                except Exception:
+                    val = None
+                if val:
+                    user_input = val if isinstance(val, (bytes, bytearray)) else str(val).encode()
+            elif stdin_fd is not None and stdin_fd in r:
+                try:
+                    user_input = os.read(stdin_fd, 4096)
+                except OSError:
+                    user_input = b""
+            if user_input:
+                try:
+                    os.write(master_fd, user_input)
+                except OSError:
+                    pass
+
+        # Pump bytes between the subprocess and the active I/O source.
         while True:
             if proc.poll() is not None:
                 # Drain any final output then exit
                 try:
                     while True:
-                        data = os.read(master_fd, 4096)
+                        try:
+                            data = os.read(master_fd, 4096)
+                        except OSError:
+                            break
                         if not data:
                             break
-                        try:
-                            sys.stdout.buffer.write(data)
-                            sys.stdout.buffer.flush()
-                        except Exception:
-                            pass
-                        output_data.append(data)
+                        _emit(data)
                 except OSError:
                     pass
                 break
@@ -417,7 +470,7 @@ def _run_shell_interactive(command: str, workspace_cwd: str, sandbox_env: dict) 
             if stdin_fd is not None:
                 rlist.append(stdin_fd)
             try:
-                r, _, _ = select.select(rlist, [], [], 0.1)
+                r, _, _ = select.select(rlist, [], [], 0.05)
             except (OSError, ValueError):
                 break
 
@@ -428,23 +481,9 @@ def _run_shell_interactive(command: str, workspace_cwd: str, sandbox_env: dict) 
                     break
                 if not data:
                     break
-                try:
-                    sys.stdout.buffer.write(data)
-                    sys.stdout.buffer.flush()
-                except Exception:
-                    pass
-                output_data.append(data)
+                _emit(data)
 
-            if stdin_fd is not None and stdin_fd in r:
-                try:
-                    user_input = os.read(stdin_fd, 4096)
-                except OSError:
-                    user_input = b""
-                if user_input:
-                    try:
-                        os.write(master_fd, user_input)
-                    except OSError:
-                        pass
+            _check_user_input()
     finally:
         try:
             if slave_fd >= 0:

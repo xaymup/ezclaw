@@ -224,6 +224,46 @@ def test_interactive_explains_empty_output_case():
 
 
 @pytest.mark.skipif(os.name == "nt", reason="pty is POSIX-only")
+def test_interactive_callback_path_streams_output():
+    """When on_output is provided, output goes to the callback instead of
+    sys.stdout. The TUI uses this to stream subprocess bytes into a live
+    tool panel inside the chat."""
+    workspace = os.path.abspath(WORKSPACE_DIR)
+    os.makedirs(workspace, exist_ok=True)
+    chunks = []
+    _run_shell_interactive(
+        "echo 'streamed via callback'",
+        workspace_cwd=workspace,
+        sandbox_env=_build_sandbox_env(),
+        on_output=chunks.append,
+    )
+    joined = b"".join(chunks).decode("utf-8", errors="ignore")
+    assert "streamed via callback" in joined
+
+
+@pytest.mark.skipif(os.name == "nt", reason="pty is POSIX-only")
+def test_interactive_input_provider_feeds_subprocess():
+    """A subprocess that reads a line from stdin should receive the bytes
+    returned by input_provider. The TUI uses this to route user chat
+    input to the subprocess while a session is active."""
+    workspace = os.path.abspath(WORKSPACE_DIR)
+    os.makedirs(workspace, exist_ok=True)
+    fed = [b"hello-from-test\n"]
+
+    def provider():
+        return fed.pop(0) if fed else None
+
+    out = _run_shell_interactive(
+        "read line && echo \"got: $line\"",
+        workspace_cwd=workspace,
+        sandbox_env=_build_sandbox_env(),
+        on_output=lambda _b: None,
+        input_provider=provider,
+    )
+    assert "got: hello-from-test" in out
+
+
+@pytest.mark.skipif(os.name == "nt", reason="pty is POSIX-only")
 def test_interactive_surfaces_nonzero_exit_code():
     """A failing command must be marked failed in the header so the agent
     knows to retry or escalate, not silently treat it as success."""
