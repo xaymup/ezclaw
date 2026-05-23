@@ -16,7 +16,7 @@ OLLAMA_HOST = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 
 AGENT_DEFS = {
     "executor": {
-        "model": os.getenv("OLLAMA_MODEL", "qwen2.5-coder:14b"),
+        "model": os.getenv("OLLAMA_MODEL", "qwen3:14b"),
         "system_prompt": """You are EzClaw's **Executor** — you receive a numbered plan and execute it step by step using tools.
 
 ## Core Rules
@@ -29,7 +29,7 @@ AGENT_DEFS = {
 - **Interactive Shell Handling**: 
     - ALWAYS use `interactive=True` for commands that require user input (e.g., `sudo`, `pacman`, `apt`, `pip` installs that might prompt, `vim`, `ssh`).
     - When running an interactive command, tell the user in your reasoning that they may need to provide input (like a password).
-- **Workspace Awareness**: Files are usually in the root or a `workspace/` folder. Always check both if a file is not found.
+- **Workspace Awareness**: When the user names a file (e.g. "agent.py", "README.md"), ALWAYS try `read_file(path)` with the path EXACTLY as given first. Only if that returns a "does not exist" error should you try alternates like `workspace/<path>`. Do NOT pre-emptively `list_dir` to "verify" the file exists — just attempt the read. List_dir is for discovery, not validation.
 - **Verification First**: Before modifying or copying a file, verify its existence and content to avoid redundant work.
 - After each tool result, proceed to the NEXT step. Do NOT repeat a step unless it failed and you have a new approach.
 - Do NOT ask questions. Do NOT say "how can I help". Just execute.
@@ -715,10 +715,26 @@ No fluff. No "In this task...". Just facts."""
                 if not sc_output.strip() and sc_tool_results:
                     sc_output = "Done."
                     yield {"type": "content", "content": "Done."}
-                yield {"type": "status", "content": "Done.\n"}
-                self.db.store_routing_decision(user_input, agent_key, True)
-                self._conversation_history.append({"user": user_input, "assistant": sc_output.strip()})
-                return
+
+                # Escape hatch: if the fast-routed agent returned a give-up signal,
+                # don't trust the short-circuit — escalate to the full architect loop.
+                escalate_re = re.compile(
+                    r"\b(not found|could not|cannot|unable to|does not exist|"
+                    r"no such file|i don'?t know|wasn'?t able|was not found)\b",
+                    re.IGNORECASE,
+                )
+                success_re = re.compile(r"\b(i found|successfully|here is|here are|done)\b", re.IGNORECASE)
+                if escalate_re.search(sc_output) and not success_re.search(sc_output):
+                    yield {"type": "status", "content": f"\n[fast-route returned uncertain result; escalating to architect]\n"}
+                    self.db.store_routing_decision(user_input, agent_key, False)
+                    agent.messages = [agent.messages[0]]
+                    task_context = f"User Request: {user_input}\n\n[FAILURE] Fast-route to '{agent_key}' returned: {sc_output.strip()[:500]}"
+                    # Fall through to the architect loop below.
+                else:
+                    yield {"type": "status", "content": "Done.\n"}
+                    self.db.store_routing_decision(user_input, agent_key, True)
+                    self._conversation_history.append({"user": user_input, "assistant": sc_output.strip()})
+                    return
 
         for step in range(1, max_steps + 1):
             yield {"type": "status", "content": f"Architect: Analyzing task state (Step {step}/{max_steps})..."}
