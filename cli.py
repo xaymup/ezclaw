@@ -59,7 +59,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ── Theme (opencode-inspired) ───────────────────────────────────
-from theme import THEME, TITLE_GRADIENT, ACTIVITY_FRAMES
+from theme import THEME, TITLE_GRADIENT, ACTIVITY_FRAMES, MASCOT
 
 PRIMARY = THEME.palette.primary
 SECONDARY = THEME.palette.secondary
@@ -542,7 +542,7 @@ class ChatUI:
             elapsed = time.time() - self.generation_start_time
             idle_time = time.time() - self.last_chunk_time
             rs = THEME.role(self.current_role or "")
-            status_text = f" {rs.icon} {self.current_status}  [{elapsed:.1f}s]"
+            status_text = f" {MASCOT} {rs.icon} {self.current_status}  [{elapsed:.1f}s]"
             if idle_time > 15:
                 status_text += f"  ⚠ idle {idle_time:.0f}s"
             spinner = self._spinner_for(self.current_role)
@@ -663,8 +663,9 @@ class ChatUI:
     def _get_welcome_panel(self):
         body = Text()
 
-        # Per-character gradient on the "EzClaw" title — wraps the ramp
-        # if the string is longer than TITLE_GRADIENT.
+        # Mascot prefix + per-character gradient on the "EzClaw" title —
+        # gradient wraps the ramp if the string is longer than TITLE_GRADIENT.
+        body.append(f"{MASCOT} ", style=f"bold {PRIMARY}")
         title = "EzClaw"
         for i, ch in enumerate(title):
             body.append(ch, style=f"bold {TITLE_GRADIENT[i % len(TITLE_GRADIENT)]}")
@@ -697,7 +698,7 @@ class ChatUI:
         return Panel(
             body,
             box=ROUNDED, padding=(1, 2), border_style=DIM,
-            title=f"[bold {PRIMARY}]EzClaw[/bold {PRIMARY}]",
+            title=f"[bold {PRIMARY}]{MASCOT} EzClaw[/bold {PRIMARY}]",
         )
 
     @staticmethod

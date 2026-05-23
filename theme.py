@@ -12,12 +12,20 @@ from typing import Dict, Tuple
 
 @dataclass(frozen=True)
 class Palette:
-    primary: str = "#ffd700"    # gold
-    secondary: str = "#bdbdbd"  # grey74
-    accent: str = "#00ff00"     # green
-    dim: str = "#808080"        # grey50
-    warn: str = "#ff8c00"       # dark orange
-    err: str = "#ff0000"        # red
+    """Warm coastal palette inspired by the 🦀 mascot — amber carapace,
+    sandy greys, sage seaweed, coral red. All colors chosen to be legible
+    on a dark terminal background and to coordinate with the role colors
+    in `_ROLES` below (which lean cool to contrast the warm base)."""
+    primary: str = "#ffb84d"    # warm amber (was #ffd700 gold)
+    secondary: str = "#c8c4be"  # warm light grey (was cool #bdbdbd)
+    accent: str = "#7fd070"     # sage green (was eye-burning #00ff00)
+    dim: str = "#7a7570"        # warm grey-brown (was cool #808080)
+    warn: str = "#f5a623"       # honey amber (was #ff8c00)
+    err: str = "#e85a5a"        # coral red (was eye-burning #ff0000)
+
+
+# The 🦀 mascot. Used in the welcome banner and the working spinner.
+MASCOT = "🦀"
 
 
 @dataclass(frozen=True)
@@ -51,13 +59,15 @@ _TOOL_NAME_TO_KIND: Dict[str, str] = {
 
 # Per-character gradient applied to the welcome banner title. The string
 # is mapped to this ramp character-by-character, wrapping if longer.
+# Sunset ramp — amber through coral, mirrored back. Coordinates with the
+# warm `Palette` above so the title reads as part of the same scheme.
 TITLE_GRADIENT: Tuple[str, ...] = (
-    "#ffd700",  # gold
-    "#ffaa55",  # orange
-    "#ff7755",  # red-orange
-    "#ff5fd7",  # magenta
-    "#ffaa55",  # orange
-    "#ffd700",  # gold
+    "#ffd166",  # honey
+    "#ffb84d",  # amber
+    "#ff8c5c",  # coral
+    "#e85a8a",  # rose
+    "#ff8c5c",  # coral
+    "#ffb84d",  # amber
 )
 
 
@@ -112,10 +122,10 @@ _ROLES: Dict[str, RoleStyle] = {
         flash_color="#ffafff",
     ),
     "architect": RoleStyle(
-        color="#ffd700",
+        color=_PALETTE.primary,    # tracks the palette so the chip + welcome agree
         icon="◈",
         spinner_frames=("◇", "◈", "◆", "◈"),
-        flash_color="#ffeb7a",
+        flash_color="#ffd9a0",     # brighter variant of primary amber
     ),
 }
 
