@@ -162,52 +162,110 @@ def get_system_info() -> str:
     except Exception as e:
         return f"Error getting system info: {str(e)}"
 
+# Environment variables the sandbox passes through to children. Everything
+# else (including API keys, OLLAMA_* config, PYTHONPATH, VIRTUAL_ENV) is
+# stripped. Keep this set conservative.
+_ENV_ALLOWLIST = frozenset({
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "TERM",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LC_MESSAGES",
+    "TMPDIR",
+    "TZ",
+})
+
+# Hard resource ceilings for shell children (POSIX only). These cap a runaway
+# command's blast radius without preventing reasonable builds.
+_RLIMIT_AS_BYTES = 2 * 1024 * 1024 * 1024     # 2 GB virtual address space
+_RLIMIT_CPU_SECONDS = 60                       # 60 s CPU time (matches the 60 s wall timeout)
+_RLIMIT_FSIZE_BYTES = 100 * 1024 * 1024        # 100 MB max single-file write
+_RLIMIT_NPROC = 256                            # fork-bomb stopper
+_RLIMIT_CORE = 0                               # no core dumps
+
+
+def _build_sandbox_env() -> dict:
+    """Return a scrubbed environment dict for shell children.
+
+    Only variables in `_ENV_ALLOWLIST` pass through. We add a sentinel
+    `EZCLAW_SANDBOX=1` so nested invocations can detect they're inside
+    the sandbox. `PWD` is set to the workspace; the child's cwd will
+    match (Popen.cwd= takes precedence anyway, this is just for shells
+    that consult $PWD for prompts).
+    """
+    env = {k: os.environ[k] for k in _ENV_ALLOWLIST if k in os.environ}
+    env["EZCLAW_SANDBOX"] = "1"
+    env["PWD"] = os.path.abspath(WORKSPACE_DIR)
+    # PATH is mandatory for command lookup; provide a sane default if the
+    # parent had none (rare but possible in stripped CI environments).
+    env.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin")
+    return env
+
+
+def _apply_sandbox_rlimits() -> None:
+    """preexec_fn that caps the child's resource usage. POSIX only.
+
+    Runs in the forked child between fork() and exec(). Must not raise
+    or the child will die before exec — every limit is wrapped in its
+    own try/except because not all platforms support every rlimit
+    (e.g. RLIMIT_NPROC is missing on macOS in some builds).
+    """
+    if os.name == "nt":
+        return
+    try:
+        import resource
+    except ImportError:
+        return
+    for name, value in (
+        ("RLIMIT_AS",    _RLIMIT_AS_BYTES),
+        ("RLIMIT_CPU",   _RLIMIT_CPU_SECONDS),
+        ("RLIMIT_FSIZE", _RLIMIT_FSIZE_BYTES),
+        ("RLIMIT_NPROC", _RLIMIT_NPROC),
+        ("RLIMIT_CORE",  _RLIMIT_CORE),
+    ):
+        which = getattr(resource, name, None)
+        if which is None:
+            continue
+        try:
+            resource.setrlimit(which, (value, value))
+        except (ValueError, OSError):
+            # The hard limit may already be lower (e.g. RLIMIT_NPROC on a
+            # systemd-restricted user). Don't fail the run for that.
+            pass
+
+
 @registry.register(auth_required=True)
 def run_shell(command: str, interactive: bool = False) -> str:
     """
-    Execute a shell command from the workspace directory.
+    Execute a shell command in a sandboxed child process.
 
-    All commands run with cwd=workspace/ so that shell paths line up with
-    the paths read_file/write_file/list_dir use. This eliminates the
-    silent split where the agent edited workspace/X but built ./X.
+    Sandbox properties:
+      - cwd is `./workspace/` (passed to Popen; the parent process's cwd
+        is never mutated, even for interactive commands).
+      - Environment is scrubbed to a small allowlist (PATH, HOME, USER,
+        SHELL, TERM, LANG, LC_*, TMPDIR, TZ). API keys, OLLAMA_* config,
+        PYTHONPATH, and VIRTUAL_ENV are dropped. `EZCLAW_SANDBOX=1` is set.
+      - The child runs in its own session/process group (`start_new_session`),
+        so signals don't cross the boundary.
+      - POSIX rlimits cap the child: 2 GB virtual memory, 60 s CPU time,
+        100 MB max file size, 256 max processes, no core dumps.
 
-    Use interactive=True for commands that require user input (sudo, vim, ssh, interactive scripts, installers).
-    For 'ls', 'grep', 'cat', etc., keep interactive=False for faster, cleaner output.
+    interactive=True allocates a pty so commands that need a tty (sudo, ssh,
+    vim, installers) work. The parent process's cwd is still untouched —
+    cwd is passed via Popen, not via os.chdir.
     """
     workspace_cwd = os.path.abspath(WORKSPACE_DIR)
     os.makedirs(workspace_cwd, exist_ok=True)
+    sandbox_env = _build_sandbox_env()
+
     try:
-        if interactive and os.name != 'nt':
-            import pty
-            import sys
-
-            output_data = []
-            def read(fd):
-                data = os.read(fd, 1024)
-                if data:
-                    try:
-                        sys.stdout.buffer.write(data)
-                        sys.stdout.buffer.flush()
-                    except Exception:
-                        pass
-                    output_data.append(data)
-                return data
-
-            # pty.spawn doesn't take a cwd kwarg, so we shift to workspace
-            # in the parent before spawning. pty.spawn forks; the child
-            # inherits cwd. We restore the parent's cwd afterward so other
-            # tools (like the embedding client or DB lookups) aren't
-            # affected.
-            prev_cwd = os.getcwd()
-            os.chdir(workspace_cwd)
-            try:
-                pty.spawn(['/bin/sh', '-c', command], read)
-            finally:
-                os.chdir(prev_cwd)
-
-            full_output = b"".join(output_data).decode('utf-8', errors='ignore')
-            clean_output = re.sub(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])', '', full_output)
-            return clean_output or "Interactive command completed."
+        if interactive and os.name != "nt":
+            return _run_shell_interactive(command, workspace_cwd, sandbox_env)
 
         result = subprocess.run(
             command,
@@ -216,6 +274,9 @@ def run_shell(command: str, interactive: bool = False) -> str:
             text=True,
             timeout=60,
             cwd=workspace_cwd,
+            env=sandbox_env,
+            start_new_session=True,
+            preexec_fn=_apply_sandbox_rlimits if os.name != "nt" else None,
         )
         output = result.stdout
         if result.stderr:
@@ -223,6 +284,112 @@ def run_shell(command: str, interactive: bool = False) -> str:
         return output or "Command executed successfully with no output."
     except Exception as e:
         return f"Error executing command: {str(e)}"
+
+
+def _run_shell_interactive(command: str, workspace_cwd: str, sandbox_env: dict) -> str:
+    """Interactive shell via a pty pair, with the same sandboxing as the
+    non-interactive path. The parent's cwd is NEVER mutated — cwd flows
+    through Popen's `cwd=` kwarg directly to the forked child.
+    """
+    import pty
+    import select
+    import sys
+
+    master_fd, slave_fd = pty.openpty()
+    output_data: list[bytes] = []
+    proc = None
+    try:
+        proc = subprocess.Popen(
+            ["/bin/sh", "-c", command],
+            stdin=slave_fd,
+            stdout=slave_fd,
+            stderr=slave_fd,
+            cwd=workspace_cwd,
+            env=sandbox_env,
+            start_new_session=True,
+            preexec_fn=_apply_sandbox_rlimits,
+            close_fds=True,
+        )
+        # Close the slave in the parent — the child owns it now.
+        os.close(slave_fd)
+        slave_fd = -1
+
+        stdin_fd = sys.stdin.fileno() if sys.stdin.isatty() else None
+
+        # Pump bytes between the user's terminal and the pty master.
+        while True:
+            if proc.poll() is not None:
+                # Drain any final output then exit
+                try:
+                    while True:
+                        data = os.read(master_fd, 4096)
+                        if not data:
+                            break
+                        try:
+                            sys.stdout.buffer.write(data)
+                            sys.stdout.buffer.flush()
+                        except Exception:
+                            pass
+                        output_data.append(data)
+                except OSError:
+                    pass
+                break
+
+            rlist = [master_fd]
+            if stdin_fd is not None:
+                rlist.append(stdin_fd)
+            try:
+                r, _, _ = select.select(rlist, [], [], 0.1)
+            except (OSError, ValueError):
+                break
+
+            if master_fd in r:
+                try:
+                    data = os.read(master_fd, 4096)
+                except OSError:
+                    break
+                if not data:
+                    break
+                try:
+                    sys.stdout.buffer.write(data)
+                    sys.stdout.buffer.flush()
+                except Exception:
+                    pass
+                output_data.append(data)
+
+            if stdin_fd is not None and stdin_fd in r:
+                try:
+                    user_input = os.read(stdin_fd, 4096)
+                except OSError:
+                    user_input = b""
+                if user_input:
+                    try:
+                        os.write(master_fd, user_input)
+                    except OSError:
+                        pass
+    finally:
+        try:
+            if slave_fd >= 0:
+                os.close(slave_fd)
+        except OSError:
+            pass
+        try:
+            os.close(master_fd)
+        except OSError:
+            pass
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=2)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+    full_output = b"".join(output_data).decode("utf-8", errors="ignore")
+    clean_output = re.sub(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])", "", full_output)
+    return clean_output or "Interactive command completed."
 
 @registry.register(auth_required=True)
 def read_file(path: str) -> str:
