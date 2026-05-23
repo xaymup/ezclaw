@@ -158,12 +158,17 @@ class ChatUI:
             'frame.border': f'{DIM}',
         })
 
+        # Mouse capture is toggleable so the user can drop into terminal-native
+        # text selection (F2). When True, prompt_toolkit owns the mouse (enables
+        # our ScrollUp/Down bindings); when False, the terminal handles
+        # click-drag selection so the user can copy text from the chat.
+        self._mouse_capture = True
         self.app = Application(
             layout=self.layout,
             key_bindings=self.kb,
             style=self.style,
             full_screen=True,
-            mouse_support=True,
+            mouse_support=Condition(lambda: self._mouse_capture),
         )
 
         self.welcome_shown = False
@@ -235,6 +240,14 @@ class ChatUI:
         @self.kb.add('tab')
         def _(event):
             event.app.layout.focus_next()
+
+        @self.kb.add('f2')
+        def _(event):
+            # Toggle terminal-native text selection. With mouse capture off,
+            # click-drag selects text the way the terminal natively expects,
+            # so the user can copy. Press F2 again to re-enable scroll bindings.
+            self._mouse_capture = not self._mouse_capture
+            event.app.invalidate()
 
         @self.kb.add('y', filter=Condition(lambda: self.auth_active))
         def _(event):
@@ -331,7 +344,8 @@ class ChatUI:
             elapsed = time.time() - self.generation_start_time if self.generation_start_time else 0
             live = f"  ·  ⚙ {n_tools} tool{'s' if n_tools != 1 else ''}  ·  {elapsed:.1f}s"
 
-        return f"  {auth_icon}  {mode} {model_info}  ·  {msg_count} msgs{live}  |  [Ctrl+C] Exit  [Arrows/Wheel] Scroll"
+        copy_badge = "  ·  ✂ COPY MODE" if not self._mouse_capture else ""
+        return f"  {auth_icon}  {mode} {model_info}  ·  {msg_count} msgs{live}{copy_badge}  |  [Ctrl+C] Exit  [F2] Copy  [Arrows] Scroll"
 
     def _get_current_renderable_ansi(self):
 
@@ -347,10 +361,23 @@ class ChatUI:
             
         current_reasoning = "".join(self.reasoning_chunks)
         if SHOW_THINKING and current_reasoning:
+            stripped = current_reasoning.strip()
+            char_count = len(stripped)
+            word_count = len(stripped.split())
+            still_thinking = self.is_generating and not self.current_response_parts
+            badge = "thinking…" if still_thinking else "thought"
+            # Soft purple-grey for reasoning so it visually recedes vs. the
+            # main response (which renders as markdown). Italic + dim caps
+            # are preserved; border picks up the role hue.
+            REASON_COLOR = "#9999cc"
+            body_text = Text()
+            body_text.append(stripped, style=f"italic {REASON_COLOR}")
             parts.append(Panel(
-                Text(current_reasoning, style=f"italic {DIM}"),
-                title=f"[bold {PRIMARY}]thinking[/bold {PRIMARY}]",
-                border_style=DIM, box=ROUNDED,
+                body_text,
+                title=f"[bold {REASON_COLOR}]{badge}[/bold {REASON_COLOR}]  [dim {DIM}]({word_count}w · {char_count}c)[/dim {DIM}]",
+                border_style=f"dim {REASON_COLOR}",
+                box=ROUNDED,
+                padding=(0, 1),
             ))
             
         for idx, tool in enumerate(self.tool_executions, 1):
@@ -651,6 +678,8 @@ class ChatUI:
                 "| `/authorize` | Toggle session-wide tool authorization |\n"
                 "| `/expand [N|last|all]` | Expand a truncated tool panel (defaults to last) |\n"
                 "| `/collapse [N|all]` | Re-collapse an expanded tool panel (defaults to all) |\n"
+                "| `/copy [last\\|all\\|N]` | Copy assistant text to clipboard (OSC52) |\n"
+                "| `[F2]` | Toggle copy mode (terminal-native selection) |\n"
                 "| `exit` / `quit` | Exit EzClaw |\n"
             )
             self.history_ansi.append(render_to_ansi(Panel(Markdown(help_text), title="help", border_style=DIM)))
@@ -662,10 +691,76 @@ class ChatUI:
             self.welcome_shown = False
         elif cmd.startswith("/expand") or cmd.startswith("/collapse"):
             self._toggle_tool_expansion(cmd)
+        elif cmd.startswith("/copy"):
+            self._copy_to_clipboard(cmd)
         else:
             self.history_ansi.append(render_to_ansi(Text(f"Unknown command: {cmd}", style=ERR)))
 
         self._update_ui()
+
+    def _copy_to_clipboard(self, cmd: str):
+        """Push content to the system clipboard via OSC52.
+
+        Forms: /copy           -> last assistant response
+               /copy all       -> entire visible chat history
+               /copy last N    -> last N assistant responses (joined)
+        """
+        import base64
+
+        parts = cmd.split()
+        target = parts[1] if len(parts) >= 2 else "last"
+
+        # Pull conversation pairs the multi-agent system tracked, or fall
+        # back to the rendered history_ansi if we're in single-agent mode.
+        history = getattr(self.agent, "_conversation_history", None)
+        if history is None:
+            messages = getattr(self.agent, "messages", []) or []
+            history = [
+                {"user": m.get("content", ""), "assistant": ""}
+                for m in messages if m.get("role") == "user"
+            ]
+
+        if not history:
+            self.history_ansi.append(render_to_ansi(Text("Nothing to copy yet.", style=ERR)))
+            return
+
+        if target == "all":
+            payload = "\n\n".join(
+                f"You: {turn.get('user', '')}\nAssistant: {turn.get('assistant', '')}"
+                for turn in history
+            )
+        elif target == "last":
+            payload = history[-1].get("assistant", "") or ""
+        else:
+            try:
+                n = int(target)
+                payload = "\n\n".join(
+                    turn.get("assistant", "") for turn in history[-n:] if turn.get("assistant")
+                )
+            except ValueError:
+                self.history_ansi.append(render_to_ansi(
+                    Text("Usage: /copy | /copy all | /copy <N>", style=ERR)
+                ))
+                return
+
+        if not payload.strip():
+            self.history_ansi.append(render_to_ansi(
+                Text("Nothing to copy (target was empty).", style=f"dim {DIM}")
+            ))
+            return
+
+        # OSC52: ESC ] 52 ; c ; <base64> BEL.  Most modern terminals support
+        # this (alacritty, kitty, foot, iTerm2, modern xterm, wezterm).
+        b64 = base64.b64encode(payload.encode("utf-8")).decode("ascii")
+        # Write directly to stdout — prompt_toolkit will redraw on top after.
+        sys.stdout.write(f"\033]52;c;{b64}\007")
+        sys.stdout.flush()
+
+        n_chars = len(payload)
+        self.history_ansi.append(render_to_ansi(
+            Text(f"✓ Copied {n_chars} chars to clipboard (OSC52). If clipboard is empty, your terminal may not support OSC52 — toggle copy mode with F2 and select manually.",
+                 style=f"dim {ACCENT}")
+        ))
 
     def _toggle_tool_expansion(self, cmd: str):
         """Handle /expand and /collapse commands.

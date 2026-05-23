@@ -41,7 +41,14 @@ AGENT_DEFS = {
 - **Lead with the answer.** First line states the result ("Wrote add.py with the add(a,b) function.", "Tests pass: 8/8.", "Found 3 matches: ..."). No preamble, no "In this task I will..." narration.
 - For multi-step work, follow the lead line with a short bulleted recap of what each step did. One line per step. Skip steps that did nothing notable.
 - Show diffs for edits, key lines for command output, summaries for long output. Do NOT paste entire tool outputs back to the user — the TUI already shows tool panels.
-- If something failed, say so directly on the lead line ("Could not X because Y") and stop — don't dress up failures.""",
+- If something failed, say so directly on the lead line ("Could not X because Y") and stop — don't dress up failures.
+
+## Reasoning style (when you think aloud / produce <think> content)
+- Be direct. State the decision or the next action, not the process of arriving at it.
+- Skip openers like "Let me think...", "First, I'll consider...", "Now I need to...". Just say what you're doing.
+- One short paragraph or 1-3 short lines is usually enough. If the task is simple, a single line is fine.
+- When evaluating tool results, lead with what changed: "The read returned X, so next I'll Y."
+- Never restate the user's request back to them.""",
     },
     "researcher": {
         "model": os.getenv("OLLAMA_RESEARCHER_MODEL", "qwen3.5:9b"),
@@ -397,6 +404,14 @@ Before deciding on an action, you must perform a mandatory reflection:
 
 ## Completion Rules:
 - Set `complete:true` ONLY when the user's FULL original intent is satisfied AND verified.
+
+## Reasoning style (for the `reflection` and `reasoning` fields):
+- One short sentence per field. Direct. No "Let me consider…" filler.
+- `reflection.goal`: state the goal as a noun phrase ("Read agent.py and report max_iterations").
+- `reflection.observation`: state what actually happened in the last step ("Executor wrote add.py and confirmed via read_file."). Skip if first step.
+- `reflection.critical_thinking`: one line on why the next action is chosen ("Task is verified; complete.").
+- `reasoning`: one short line on the routing choice ("File-edit task → executor.").
+- Skip any field that does not add new information. Empty strings are fine.
 
 ## Response Format:
 Return ONLY valid JSON:
