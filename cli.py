@@ -439,10 +439,12 @@ class ChatUI:
         msg_count = len(self.agent.messages) if hasattr(self.agent, 'messages') and self.agent.messages else 0
 
         # Animated activity glyph: cycles through ACTIVITY_FRAMES at ~4Hz
-        # while generating. Idle state shows a static dot.
+        # AND through TITLE_GRADIENT colors at ~0.7Hz. Idle shows a static dot.
         if self.is_generating:
             frame_idx = int(time.time() * 4) % len(ACTIVITY_FRAMES)
-            activity = ACTIVITY_FRAMES[frame_idx]
+            glyph = ACTIVITY_FRAMES[frame_idx]
+            color = self._cycle_palette_color(TITLE_GRADIENT)
+            activity = f"[{color}]{glyph}[/{color}]"
         else:
             activity = "·"
 
@@ -543,11 +545,18 @@ class ChatUI:
             elapsed = time.time() - self.generation_start_time
             idle_time = time.time() - self.last_chunk_time
             rs = THEME.role(self.current_role or "")
-            status_text = f" {MASCOT} {rs.icon} {self.current_status}  [{elapsed:.1f}s]"
+            # Build a multi-color status line so the 🦀 mascot can pulse
+            # through the sunset palette independently of the role color
+            # used for the rest of the line.
+            mascot_color = self._cycle_palette_color(TITLE_GRADIENT)
+            status_text = Text()
+            status_text.append(f" {MASCOT}", style=f"bold {mascot_color}")
+            status_text.append(f" {rs.icon} ", style=f"bold {rs.color}")
+            status_text.append(f"{self.current_status}  [{elapsed:.1f}s]", style=f"bold {rs.color}")
             if idle_time > 15:
-                status_text += f"  ⚠ idle {idle_time:.0f}s"
+                status_text.append(f"  ⚠ idle {idle_time:.0f}s", style=f"bold {WARN}")
             spinner = self._spinner_for(self.current_role)
-            spinner.text = Text(status_text, style=f"bold {rs.color}")
+            spinner.text = status_text
             parts.append(spinner)
 
         return self._render_to_ansi(Group(*parts))
@@ -587,10 +596,19 @@ class ChatUI:
             flashing = now < self._task_flash_until.get(task.id, 0.0)
             line_color = TASK_STATE_FLASH.get(task.status, color) if flashing else color
 
+            # Celebrate `done` transitions: during the 150ms flash window
+            # after a task lands on `done`, swap the icon for a sparkle ✨
+            # and animate its color through the gradient. The eye catches
+            # it for one tick, then it settles back to the green ● dot.
+            display_icon = icon
+            if flashing and task.status == "done":
+                display_icon = "✨"
+                line_color = self._cycle_palette_color(TITLE_GRADIENT, period_sec=0.15)
+
             # Bold for in_progress so the eye finds it immediately.
             weight = "bold " if task.status == "in_progress" else ""
             line_text = Text()
-            line_text.append(f"  {icon} ", style=f"{weight}{line_color}")
+            line_text.append(f"  {display_icon} ", style=f"{weight}{line_color}")
             line_text.append(f"{task.id}. ", style=f"dim {DIM}")
             line_text.append(task.description, style=f"{weight}{line_color}")
             body_lines.append(line_text)
@@ -666,11 +684,15 @@ class ChatUI:
         body = Text()
 
         # Mascot prefix + per-character gradient on the "EzClaw" title —
-        # gradient wraps the ramp if the string is longer than TITLE_GRADIENT.
-        body.append(f"{MASCOT} ", style=f"bold {PRIMARY}")
+        # the gradient offset shifts every ~0.4s so the colors flow across
+        # the letters over time. Welcome banner only re-renders when there's
+        # no content above, so the flow is visible on the intro frame and
+        # on /clear; static the rest of the time.
+        body.append(f"{MASCOT} ", style=f"bold {self._cycle_palette_color(TITLE_GRADIENT)}")
+        offset = self._gradient_offset()
         title = "EzClaw"
         for i, ch in enumerate(title):
-            body.append(ch, style=f"bold {TITLE_GRADIENT[i % len(TITLE_GRADIENT)]}")
+            body.append(ch, style=f"bold {TITLE_GRADIENT[(i + offset) % len(TITLE_GRADIENT)]}")
         body.append(" ", "")
         body.append("v2.2 (Full TUI)\n", style=f"dim {DIM}")
         body.append("─" * 40 + "\n", style=f"dim {DIM}")
@@ -702,6 +724,21 @@ class ChatUI:
             box=ROUNDED, padding=(1, 2), border_style=DIM,
             title=f"[bold {PRIMARY}]{MASCOT} EzClaw[/bold {PRIMARY}]",
         )
+
+    @staticmethod
+    def _cycle_palette_color(palette, period_sec: float = 1.5) -> str:
+        """Return a color from `palette` based on the current time. Used to
+        animate single glyphs (🦀, ◐, etc.) by re-picking each UI tick —
+        the animation loop redraws every ~100ms so the human sees a smooth
+        ~600ms transition between colors at the default 1.5s period."""
+        idx = int(time.time() / period_sec) % len(palette)
+        return palette[idx]
+
+    @classmethod
+    def _gradient_offset(cls) -> int:
+        """Index offset into TITLE_GRADIENT, advancing once per ~0.4s.
+        Used to flow the welcome title gradient across letters over time."""
+        return int(time.time() * 2.5) % len(TITLE_GRADIENT)
 
     def _one_line_tool_head(self, tool_kind, tool_name, args, index):
         """Build the icon + index + name + (args) prefix used by the
