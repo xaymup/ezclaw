@@ -1,0 +1,82 @@
+"""Unit tests for inline_code_saver."""
+
+import os
+import sys
+
+import pytest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from inline_code_saver import ParsedBlock, parse_tagged_blocks
+
+
+def test_no_blocks_returns_empty():
+    assert parse_tagged_blocks("just some prose") == []
+
+
+def test_untagged_block_ignored():
+    text = "Before\n```python\nprint('hi')\n```\nAfter"
+    assert parse_tagged_blocks(text) == []
+
+
+def test_single_tagged_block_parsed():
+    text = "intro\n```python:src/foo.py\nprint('hi')\n```\nout"
+    blocks = parse_tagged_blocks(text)
+    assert len(blocks) == 1
+    assert blocks[0].lang == "python"
+    assert blocks[0].path == "src/foo.py"
+    assert blocks[0].body == "print('hi')"
+
+
+def test_empty_lang_allowed():
+    text = "```:scripts/run.sh\necho hi\n```"
+    blocks = parse_tagged_blocks(text)
+    assert len(blocks) == 1
+    assert blocks[0].lang == ""
+    assert blocks[0].path == "scripts/run.sh"
+
+
+def test_multiple_tagged_blocks_in_one_text():
+    text = (
+        "first\n```python:a.py\nA = 1\n```\n"
+        "middle\n```text:b.txt\nB\n```\n"
+        "end"
+    )
+    blocks = parse_tagged_blocks(text)
+    assert len(blocks) == 2
+    assert {b.path for b in blocks} == {"a.py", "b.txt"}
+
+
+def test_tagged_among_untagged_only_tagged_returned():
+    text = (
+        "```python\nsnippet only\n```\n"
+        "```python:saved.py\nsaved = True\n```"
+    )
+    blocks = parse_tagged_blocks(text)
+    assert len(blocks) == 1
+    assert blocks[0].path == "saved.py"
+
+
+def test_trailing_whitespace_on_opener_tolerated():
+    text = "```python:src/foo.py   \nbody\n```"
+    blocks = parse_tagged_blocks(text)
+    assert len(blocks) == 1
+    assert blocks[0].path == "src/foo.py"
+
+
+def test_body_preserved_verbatim_without_trailing_newline():
+    text = "```python:foo.py\nline1\nline2\n```"
+    blocks = parse_tagged_blocks(text)
+    assert blocks[0].body == "line1\nline2"
+
+
+def test_block_offsets_captured():
+    text = "```python:foo.py\nbody\n```"
+    blocks = parse_tagged_blocks(text)
+    assert blocks[0].start == 0
+    assert blocks[0].end == len(text)
+
+
+def test_unclosed_block_skipped():
+    text = "```python:foo.py\nbody but no closing fence"
+    assert parse_tagged_blocks(text) == []
