@@ -2066,12 +2066,21 @@ class ChatUI:
                 elif chunk["type"] == "plan_update":
                     new_plan = chunk["plan"]
                     now = time.time()
+                    prev_in_progress = (
+                        {t.id for t in self.current_plan.tasks if t.status == "in_progress"}
+                        if self.current_plan else set()
+                    )
                     for task in new_plan.tasks:
                         prev = self._last_task_states.get(task.id)
                         if prev is not None and prev != task.status:
                             self._task_flash_until[task.id] = now + 0.15
                         self._last_task_states[task.id] = task.status
                     self.current_plan = new_plan
+                    new_in_progress = {t.id for t in new_plan.tasks if t.status == "in_progress"}
+                    if new_in_progress != prev_in_progress:
+                        # The previously-active task moved; any held intent is
+                        # about the prior task. Wait for the next intent chunk.
+                        self.architect_intent = None
                 elif chunk["type"] == "halt":
                     self.halted = True
                 elif chunk["type"] == "intent":
