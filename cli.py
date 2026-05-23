@@ -905,11 +905,15 @@ class ChatUI:
 
     def _one_line_tool_head(self, tool_kind, tool_name, args, index):
         """Build the icon + index + name + (args) prefix used by the
-        one-line collapsed/running tool entries. The kind icon pulses
-        subtly between its base color and a brightened sunset shade per
-        tick — gives running tool panels a heartbeat."""
-        # Pulse only the icon at ~0.6Hz (so the eye catches it without
-        # being distracting), keep the name + signature solid.
+        one-line collapsed/running tool entries.
+
+        Brightness hierarchy:
+          icon       — pulsing kind color (most prominent)
+          tool name  — solid kind color, bold
+          args       — SECONDARY (warm light grey, plainly readable)
+          [N] index  — dim (low-priority)
+          parens     — dim (chrome)
+        """
         pulse_t = (time.time() * 1.2) % 2.0
         icon_color = (
             self._cycle_palette_color(TITLE_GRADIENT, period_sec=1.5)
@@ -918,13 +922,13 @@ class ChatUI:
         line = Text()
         line.append(f"{tool_kind.icon} ", style=f"bold {icon_color}")
         if index is not None:
-            line.append(f"[{index}] ", style=f"dim {DIM}")
+            line.append(f"[{index}] ", style=f"{DIM}")
         line.append(tool_name, style=f"bold {tool_kind.color}")
         if args:
             sig = self._format_args_inline(args)
-            line.append("(", style=f"dim {DIM}")
-            line.append(sig, style=f"dim {DIM}")
-            line.append(")", style=f"dim {DIM}")
+            line.append("(", style=f"{DIM}")
+            line.append(sig, style=f"{SECONDARY}")
+            line.append(")", style=f"{DIM}")
         return line
 
     @staticmethod
@@ -1020,7 +1024,7 @@ class ChatUI:
                     border = WARN  # full saturation — not dim
                 else:
                     head.append(f"   ⏳ live{elapsed_str}", style=f"bold {WARN}")
-                    head.append("   (type to send input to subprocess)", style=f"dim {DIM} italic")
+                    head.append("   (type to send input to subprocess)", style=f"{SECONDARY} italic")
                     border = f"dim {WARN}"
 
                 # Decode the streaming bytes and strip ANSI; keep the last
@@ -1040,7 +1044,9 @@ class ChatUI:
                 )
 
             line = self._one_line_tool_head(tool_kind, tool_name, args, index)
-            line.append(f"   ⏳ {verb}…{elapsed_str}", style=f"dim {DIM} italic")
+            # Running-verb status: readable warm light grey, italic to set
+            # it apart from the args signature without disappearing.
+            line.append(f"   ⏳ {verb}…{elapsed_str}", style=f"{SECONDARY} italic")
             return line
 
         # We have a result. Compute the one-line summary and whether the
@@ -1061,8 +1067,13 @@ class ChatUI:
         if not expanded:
             line = self._one_line_tool_head(tool_kind, tool_name, args, index)
             if summary:
-                line.append("   ↳ ", style=f"dim {DIM}")
-                line.append(summary, style=f"dim {DIM} italic")
+                # Summary is the at-a-glance result the user reads while
+                # scanning the chat — must be plainly visible, not dimmed.
+                # `↳` arrow stays muted (chrome); the summary text uses
+                # SECONDARY (warm light grey) so it sits at body-text
+                # readability level.
+                line.append("   ↳ ", style=f"{DIM}")
+                line.append(summary, style=f"{SECONDARY} italic")
             if has_more and index is not None:
                 line.append(f"   [/expand {index}]", style=f"dim {DIM} italic")
             return line
