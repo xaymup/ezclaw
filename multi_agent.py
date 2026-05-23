@@ -1116,6 +1116,37 @@ Return ONLY the JSON object."""
         ("traceback shows", "executor"),
     ]
 
+    def _estimate_tool_kinds(self, user_input: str) -> Optional[int]:
+        """Single LLM call estimating the distinct tool kinds the executor
+        would need to fulfill `user_input`. Returns the count, or None on
+        any failure (timeout, parse failure, empty result).
+
+        Used by run() to gate the fast-route to executor: if this returns
+        a count >= PREFLIGHT_KIND_THRESHOLD, the architect plans instead.
+        """
+        prompt = (
+            "You are pre-flighting a tool plan. List the EZCLAW tool names "
+            "you would need to fulfill this request, ONE PER LINE, no prose, "
+            "no numbering.\nUse ONLY these names:\n"
+            "  apply_diff, write_file, run_shell, read_file, list_dir, "
+            "grep_codebase, web_search, web_fetch, recall, code_outline, "
+            "git_diff, git_log, git_blame, run_tests, python_eval, "
+            "schedule_task, unschedule_task, ask_user, current_datetime, "
+            "get_system_info\n\n"
+            f"Request: {user_input}\n\nTools needed (one per line):"
+        )
+        try:
+            resp = self.architect.client.chat(
+                model=self.architect.model,
+                messages=[{"role": "user", "content": prompt}],
+                options={"temperature": 0.0, "num_ctx": 2048},
+            )
+            text = resp.get("message", {}).get("content", "")
+            kinds = _parse_tool_lines(text)
+            return len(kinds) if kinds else None
+        except Exception:
+            return None
+
     def _short_circuit_classify(self, user_input: str) -> Optional[str]:
         # Layer 1: cheap textual heuristic for trivial chat. Anything that
         # looks like a short greeting / acknowledgement / nonsense one-liner
