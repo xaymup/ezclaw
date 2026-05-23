@@ -17,6 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tools import (
     _build_sandbox_env,
     _ENV_ALLOWLIST,
+    _ensure_workspace_self_symlink,
     _skill_filename,
     run_shell,
     WORKSPACE_DIR,
@@ -120,6 +121,68 @@ def test_run_shell_runs_in_new_process_group():
     # Parent's pgid — definitely not equal if isolation worked.
     parent_pgid = os.getpgid(0)
     assert child_pgid != parent_pgid
+
+
+# ── Workspace self-symlink (defeats workspace/workspace/ doubling) ─────────
+
+def test_ensure_workspace_self_symlink_creates_link(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _ensure_workspace_self_symlink(str(ws))
+    link = ws / WORKSPACE_DIR
+    assert link.is_symlink()
+    assert os.readlink(str(link)) == "."
+
+
+def test_ensure_workspace_self_symlink_is_idempotent(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _ensure_workspace_self_symlink(str(ws))
+    _ensure_workspace_self_symlink(str(ws))  # second call must be a no-op
+    link = ws / WORKSPACE_DIR
+    assert link.is_symlink()
+
+
+def test_ensure_workspace_self_symlink_does_not_clobber_real_dir(tmp_path):
+    """If a real workspace/workspace/ directory already exists (from past
+    mistakes), we must not touch it — the user's data is in there."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    real_subdir = ws / WORKSPACE_DIR
+    real_subdir.mkdir()
+    (real_subdir / "data.txt").write_text("user data")
+
+    _ensure_workspace_self_symlink(str(ws))
+    assert real_subdir.is_dir()
+    assert not real_subdir.is_symlink()
+    assert (real_subdir / "data.txt").read_text() == "user data"
+
+
+def test_workspace_workspace_path_resolves_through_symlink_to_workspace():
+    """End-to-end: agent runs `touch workspace/canary.txt` from inside the
+    workspace. The file should land at workspace/canary.txt (one level),
+    NOT at workspace/workspace/canary.txt (two levels)."""
+    canary = "_double_workspace_canary.txt"
+    workspace_abs = os.path.abspath(WORKSPACE_DIR)
+    canary_at_root = os.path.join(workspace_abs, canary)
+    canary_at_nested = os.path.join(workspace_abs, WORKSPACE_DIR, canary)
+    # Clean up any stragglers from previous runs
+    for p in (canary_at_root, canary_at_nested):
+        if os.path.lexists(p):
+            os.remove(p)
+
+    # Agent's mistake: extra workspace/ prefix in the shell command
+    run_shell(f"touch {WORKSPACE_DIR}/{canary}")
+
+    # Whether resolved via the symlink or accidentally created two-deep,
+    # the file should be readable at the one-level path.
+    assert os.path.exists(canary_at_root), (
+        f"Expected file at {canary_at_root} after touch via workspace/ prefix"
+    )
+
+    # Cleanup
+    if os.path.lexists(canary_at_root):
+        os.remove(canary_at_root)
 
 
 # ── Skill path-traversal protection ────────────────────────────────────────

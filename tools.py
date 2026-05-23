@@ -243,6 +243,32 @@ def _build_sandbox_env() -> dict:
     return env
 
 
+def _ensure_workspace_self_symlink(workspace_cwd: str) -> None:
+    """Create `./workspace/workspace -> .` so a bogus extra `workspace/`
+    segment in a shell path is a filesystem-level no-op.
+
+    Local LLMs sometimes do `run_shell("touch workspace/foo.py")` even
+    though run_shell is already cwd'd to ./workspace/. That used to land
+    at ./workspace/workspace/foo.py and stay there. With this self-symlink,
+    the path `workspace/foo.py` from inside `./workspace/` resolves via
+    `workspace -> .` back to `./workspace/foo.py` — the right place.
+
+    Idempotent. Skips if a real directory or file already occupies the
+    path (so we never clobber existing data — the user can clean that
+    up manually with `mv workspace/workspace/* workspace/ && rmdir
+    workspace/workspace`).
+    """
+    link_path = os.path.join(workspace_cwd, WORKSPACE_DIR)
+    if os.path.islink(link_path):
+        return
+    if os.path.exists(link_path):
+        return  # real directory in the way — leave it alone
+    try:
+        os.symlink(".", link_path)
+    except OSError:
+        pass  # filesystem doesn't support symlinks (rare) — best-effort
+
+
 def _apply_sandbox_rlimits() -> None:
     """preexec_fn that caps the child's resource usage. POSIX only.
 
@@ -303,6 +329,7 @@ def run_shell(command: str, interactive: bool = False) -> str:
     """
     workspace_cwd = os.path.abspath(WORKSPACE_DIR)
     os.makedirs(workspace_cwd, exist_ok=True)
+    _ensure_workspace_self_symlink(workspace_cwd)
     sandbox_env = _build_sandbox_env()
 
     try:
