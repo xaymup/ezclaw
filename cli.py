@@ -493,7 +493,8 @@ class ChatUI:
             char_count = len(stripped)
             word_count = len(stripped.split())
             still_thinking = self.is_generating and not self.current_response_parts
-            badge = "thinking…" if still_thinking else "thought"
+            from phrases import THINKING_BADGE, THOUGHT_BADGE
+            badge = f"{THINKING_BADGE}…" if still_thinking else THOUGHT_BADGE
             # Soft purple-grey for reasoning so it visually recedes vs. the
             # main response (which renders as markdown). Italic + dim caps
             # are preserved; border picks up the role hue.
@@ -618,7 +619,8 @@ class ChatUI:
             rs = THEME.role(agent)
             flashing = time.time() < self._chip_flash_until
             chip_color = rs.flash_color if flashing else rs.color
-            headline = goal or (plan.splitlines()[0] if plan else reasoning) or "thinking…"
+            from phrases import THINKING_BADGE as _TB
+            headline = goal or (plan.splitlines()[0] if plan else reasoning) or f"{_TB}…"
             if len(headline) > 110:
                 headline = headline[:107] + "…"
             line = Text()
@@ -766,7 +768,15 @@ class ChatUI:
         if not result:
             start_time = tool.get("start_time")
             elapsed = time.time() - start_time if start_time else 0
-            label = f"running... ({elapsed:.1f}s)" if elapsed > 1 else "running..."
+            # The whimsical verb is picked once per tool execution and cached
+            # on the tool dict — without caching, it would shuffle on every
+            # UI tick and produce a vertigo-inducing flicker.
+            verb = tool.get("_running_verb")
+            if verb is None:
+                from phrases import pick as _pick, TOOL_RUNNING as _TR
+                verb = _pick(_TR)
+                tool["_running_verb"] = verb
+            label = f"{verb}… ({elapsed:.1f}s)" if elapsed > 1 else f"{verb}…"
             tool_parts.append(Text(label, style=f"dim {DIM}"))
             return Panel(
                 Group(*tool_parts),
@@ -917,7 +927,8 @@ class ChatUI:
         self.current_plan = None
         self._last_task_states = {}
         self._task_flash_until = {}
-        self.current_status = "connecting..."
+        from phrases import pick as _pick, CONNECTING as _CN
+        self.current_status = f"{_pick(_CN)}…"
         self.generation_start_time = time.time()
         self.last_chunk_time = time.time()
         

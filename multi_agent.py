@@ -319,7 +319,8 @@ class SpecializedAgent:
                 str([(t.function.name, t.function.arguments) for t in tool_calls])
             )
             if current_hash == last_tool_hash:
-                yield {"type": "content", "content": "\n[Loop detected. Stopping.]"}
+                from phrases import pick as _pick, LOOP_DETECTED as _LD
+                yield {"type": "content", "content": f"\n[🦀 {_pick(_LD)}.]"}
                 break
             last_tool_hash = current_hash
 
@@ -873,7 +874,8 @@ No fluff. No "In this task...". Just facts."""
                 agent.messages = [agent.messages[0]]
                 memory_facts = self.db.search_memories_hybrid(user_input[:1000], alpha=0.6)
                 memory_hint = f"\n[Memory]: {memory_facts}\n" if memory_facts else ""
-                yield {"type": "status", "content": f"[{agent_key}] (fast-routed)\n"}
+                from phrases import pick as _pick, AGENT_WORKING as _AW
+                yield {"type": "status", "content": f"[{agent_key}] {_pick(_AW)} (fast-routed)\n"}
                 sc_output = ""
                 sc_tool_results = []
                 agent_input = f"{history_block}{memory_hint}{user_input}"
@@ -896,7 +898,8 @@ No fluff. No "In this task...". Just facts."""
                 )
                 success_re = re.compile(r"\b(i found|successfully|here is|here are|done)\b", re.IGNORECASE)
                 if escalate_re.search(sc_output) and not success_re.search(sc_output):
-                    yield {"type": "status", "content": f"\n[fast-route returned uncertain result; escalating to architect]\n"}
+                    from phrases import pick as _pick, ESCALATING as _ESC
+                    yield {"type": "status", "content": f"\n[{_pick(_ESC)}]\n"}
                     self.db.store_routing_decision(user_input, agent_key, False)
                     agent.messages = [agent.messages[0]]
                     task_context = f"User Request: {user_input}\n\n[FAILURE] Fast-route to '{agent_key}' returned: {sc_output.strip()[:500]}"
@@ -934,8 +937,13 @@ No fluff. No "In this task...". Just facts."""
         if self.current_plan is not None:
             yield {"type": "plan_created", "plan": self.current_plan}
 
+        from phrases import (
+            pick, ARCHITECT_THINKING, ARCHITECT_FINALIZING, AGENT_WORKING,
+            ESCALATING, LOOP_DETECTED, STEP_LIMIT, PIVOT, COMPLETED,
+        )
+
         for step in range(1, max_steps + 1):
-            yield {"type": "status", "content": f"Architect: Analyzing task state (Step {step}/{max_steps})..."}
+            yield {"type": "status", "content": f"🦀 {pick(ARCHITECT_THINKING)}… (step {step}/{max_steps})"}
 
             # Skills still computed per-step because they match against task_context,
             # which grows as steps complete.
@@ -965,7 +973,7 @@ No fluff. No "In this task...". Just facts."""
             if intent.get("complete") and agent_has_responded and (
                 self.current_plan is None or self.current_plan.is_complete()
             ):
-                yield {"type": "status", "content": "Task completed successfully."}
+                yield {"type": "status", "content": f"🦀 {pick(COMPLETED)}."}
                 final_text = final_response.strip() if final_response else "Task completed."
                 self._conversation_history.append({"user": user_input, "assistant": final_text})
                 
@@ -976,7 +984,7 @@ No fluff. No "In this task...". Just facts."""
             agent_key = intent.get("recommended_agent", "executor")
             agent = self.agents.get(agent_key)
             if not agent:
-                yield {"type": "status", "content": "Architect: Finalizing response..."}
+                yield {"type": "status", "content": f"🦀 {pick(ARCHITECT_FINALIZING)}…"}
                 self._conversation_history.append({"user": user_input, "assistant": final_response.strip()})
                 break
 
@@ -998,10 +1006,7 @@ No fluff. No "In this task...". Just facts."""
                     pivot_used = True
                     yield {
                         "type": "status",
-                        "content": (
-                            f"System: stuck on '{agent_key}' plan — pivoting "
-                            f"(retry at higher temperature)..."
-                        ),
+                        "content": f"🦀 stuck on '{agent_key}' — {pick(PIVOT)}…",
                     }
                     hint = (
                         f"The previous plan was sent to '{agent_key}' "
@@ -1026,7 +1031,7 @@ No fluff. No "In this task...". Just facts."""
                     agent_key = intent.get("recommended_agent", "executor")
                     agent = self.agents.get(agent_key)
                     if not agent:
-                        yield {"type": "status", "content": "Architect: Finalizing response..."}
+                        yield {"type": "status", "content": f"🦀 {pick(ARCHITECT_FINALIZING)}…"}
                         break
                     plan = intent.get("plan") or intent.get("reasoning", "") or "Executing..."
                     plan_str = str(plan)
@@ -1036,9 +1041,7 @@ No fluff. No "In this task...". Just facts."""
                 else:
                     yield {
                         "type": "status",
-                        "content": (
-                            f"System: pivot retry also stalled on '{agent_key}' — stopping."
-                        ),
+                        "content": f"🦀 {pick(LOOP_DETECTED)} ('{agent_key}').",
                     }
                     break
 
@@ -1046,7 +1049,7 @@ No fluff. No "In this task...". Just facts."""
                 "type": "reasoning",
                 "content": f"[{agent_key}] {plan}\n",
             }
-            yield {"type": "status", "content": f"{agent_key.capitalize()}: Working..."}
+            yield {"type": "status", "content": f"{agent_key}: {pick(AGENT_WORKING)}…"}
 
             instruction = intent.get("plan") or intent.get("reasoning", "Execute the next step.")
 
@@ -1126,7 +1129,8 @@ No fluff. No "In this task...". Just facts."""
             )
 
         if step >= max_steps:
-            yield {"type": "status", "content": "Step limit reached.\n"}
+            from phrases import pick as _pick, STEP_LIMIT as _SL
+            yield {"type": "status", "content": f"🦀 {_pick(_SL)}.\n"}
             if final_response:
                 self._conversation_history.append({"user": user_input, "assistant": final_response})
 
