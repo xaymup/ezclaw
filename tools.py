@@ -1000,3 +1000,520 @@ def delegate(agent_key: str, instruction: str) -> str:
     if agent_key not in allowed:
         return f"Error: agent_key must be one of {allowed}"
     return f"[DELEGATE:{agent_key}]{instruction}[/DELEGATE]"
+
+
+# ── Code-intelligence tools ────────────────────────────────────────────────
+
+@registry.register
+def code_outline(path: str) -> str:
+    """
+    Extract the symbol tree from a source file (imports, classes,
+    functions, top-level assignments) without reading the full file.
+
+    Saves context budget on large files: a 2000-line module is ~4000
+    tokens to read in full vs ~200 tokens for its outline. Use this
+    FIRST when exploring an unfamiliar file; read_file second only if
+    you need a specific symbol's body.
+
+    Python files use the AST for accurate parsing. Other languages fall
+    back to a regex pass that catches def/function/class/fn/func
+    declarations — useful but less precise.
+    """
+    try:
+        full_path = get_workspace_path(path)
+        if not os.path.exists(full_path):
+            return f"Error: File '{path}' does not exist."
+
+        with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
+            source = f.read()
+
+        if path.endswith(".py"):
+            return _code_outline_python(source, path)
+        # Generic fallback: catches common declaration patterns
+        return _code_outline_generic(source, path)
+    except Exception as e:
+        return f"Error outlining {path}: {e}"
+
+
+def _code_outline_python(source: str, path: str) -> str:
+    import ast
+    try:
+        tree = ast.parse(source)
+    except SyntaxError as e:
+        return f"Error: SyntaxError in {path}: {e}"
+
+    out = [f"# Outline: {path}", f"# {len(source.splitlines())} lines total", ""]
+
+    def emit(node, depth=0):
+        indent = "  " * depth
+        if isinstance(node, ast.Import):
+            names = ", ".join(a.name for a in node.names)
+            out.append(f"{indent}import {names}  L{node.lineno}")
+        elif isinstance(node, ast.ImportFrom):
+            mod = node.module or ""
+            names = ", ".join(a.name for a in node.names)
+            out.append(f"{indent}from {mod} import {names}  L{node.lineno}")
+        elif isinstance(node, ast.ClassDef):
+            bases = ", ".join(_unparse_short(b) for b in node.bases)
+            head = f"class {node.name}({bases})" if bases else f"class {node.name}"
+            out.append(f"{indent}{head}:  L{node.lineno}")
+            for child in node.body:
+                emit(child, depth + 1)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            args = ", ".join(a.arg for a in node.args.args)
+            kw = "async def" if isinstance(node, ast.AsyncFunctionDef) else "def"
+            out.append(f"{indent}{kw} {node.name}({args})  L{node.lineno}")
+        elif isinstance(node, ast.Assign) and depth == 0:
+            targets = ", ".join(_unparse_short(t) for t in node.targets)
+            out.append(f"{indent}{targets} = …  L{node.lineno}")
+
+    for top in tree.body:
+        emit(top, depth=0)
+    return "\n".join(out)
+
+
+def _unparse_short(node) -> str:
+    import ast
+    try:
+        return ast.unparse(node)[:60]
+    except Exception:
+        return getattr(node, "id", "?")
+
+
+def _code_outline_generic(source: str, path: str) -> str:
+    """Regex-based outline for non-Python source. Catches common
+    declaration patterns across C/Go/Rust/JS/TS."""
+    lines = source.splitlines()
+    patterns = [
+        # JS/TS function / class / arrow exports
+        (re.compile(r"^\s*(?:export\s+)?(?:async\s+)?function\s+(\w+)"), "function"),
+        (re.compile(r"^\s*(?:export\s+)?class\s+(\w+)"), "class"),
+        (re.compile(r"^\s*(?:export\s+)?(?:const|let|var)\s+(\w+)\s*="), "binding"),
+        # C / C++
+        (re.compile(r"^\s*(?:static\s+|inline\s+|extern\s+)*(?:[\w*&]+\s+){1,3}(\w+)\s*\([^;]*\)\s*\{"), "func"),
+        (re.compile(r"^\s*(?:typedef\s+)?(?:struct|enum|union)\s+(\w+)"), "type"),
+        # Go
+        (re.compile(r"^\s*func\s+(?:\([^)]*\)\s+)?(\w+)"), "func"),
+        (re.compile(r"^\s*type\s+(\w+)\s+(?:struct|interface)"), "type"),
+        # Rust
+        (re.compile(r"^\s*(?:pub\s+)?(?:async\s+)?fn\s+(\w+)"), "fn"),
+        (re.compile(r"^\s*(?:pub\s+)?(?:struct|enum|trait|impl)\s+(\w+)"), "type"),
+    ]
+    out = [f"# Outline: {path}", f"# {len(lines)} lines total", ""]
+    for lineno, line in enumerate(lines, 1):
+        for pat, kind in patterns:
+            m = pat.match(line)
+            if m:
+                out.append(f"{kind} {m.group(1)}  L{lineno}")
+                break
+    if len(out) == 3:
+        # Nothing matched — emit first 30 lines as a fallback
+        out.append("(no declarations matched; first 30 lines:)")
+        out.append("")
+        out.extend(lines[:30])
+    return "\n".join(out)
+
+
+# ── Apply diff ─────────────────────────────────────────────────────────────
+
+@registry.register(auth_required=True)
+def apply_diff(path: str, diff: str) -> str:
+    """
+    Apply a unified diff to a file in the workspace.
+
+    Use this instead of `write_file` for small edits: it sends just the
+    hunks, not the whole file. Saves context AND makes review clearer.
+
+    `diff` should be a standard unified diff:
+        @@ -10,3 +10,4 @@
+         context line
+        -removed line
+        +added line 1
+        +added line 2
+         context line
+
+    Header lines (`--- a/...`, `+++ b/...`) are tolerated but ignored —
+    only the hunks matter. The file at `path` is patched in-place.
+    """
+    try:
+        full_path = get_workspace_path(path)
+    except WorkspacePathError as e:
+        return f"Error: {e}"
+    if not os.path.exists(full_path):
+        return f"Error: File '{path}' does not exist. Use write_file to create it."
+
+    try:
+        with open(full_path, "r", encoding="utf-8") as f:
+            original = f.read().splitlines(keepends=True)
+    except Exception as e:
+        return f"Error reading {path}: {e}"
+
+    new_content, applied, rejected = _apply_unified_diff(original, diff)
+    if rejected:
+        return (
+            f"Error: {rejected} hunk(s) failed to apply to {path}. "
+            "The diff's context lines don't match the current file. "
+            "Either fetch the latest content with read_file and regenerate "
+            "the diff, or use write_file."
+        )
+    try:
+        with open(full_path, "w", encoding="utf-8") as f:
+            f.write("".join(new_content))
+    except Exception as e:
+        return f"Error writing {path}: {e}"
+
+    return f"Applied {applied} hunk(s) to {path}."
+
+
+def _apply_unified_diff(original_lines, diff_text):
+    """Minimal unified-diff applier. Returns (new_lines, applied_count,
+    rejected_count). Each hunk is matched by its `@@ -N,n +M,m @@` header
+    and then replayed line-by-line."""
+    lines = diff_text.splitlines()
+    new_content = list(original_lines)
+    applied = 0
+    rejected = 0
+    i = 0
+    # Track cumulative offset from prior hunks so later hunks land at
+    # the right line numbers after additions/deletions.
+    offset = 0
+    hunk_header = re.compile(r"^@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s+@@")
+
+    while i < len(lines):
+        line = lines[i]
+        m = hunk_header.match(line)
+        if not m:
+            i += 1
+            continue
+
+        old_start = int(m.group(1))
+        new_start = int(m.group(3))
+        # Collect hunk body until next @@ or end
+        body = []
+        i += 1
+        while i < len(lines) and not lines[i].startswith("@@"):
+            body.append(lines[i])
+            i += 1
+
+        # Apply this hunk
+        # Compute the index in new_content where the hunk starts (1-based to 0-based)
+        idx = old_start - 1 + offset
+        if old_start == 0:  # special case: empty file pre-image
+            idx = 0
+        ok, replacement = _apply_hunk(new_content, idx, body)
+        if not ok:
+            rejected += 1
+            continue
+        # `replacement` is (delete_count, insert_lines)
+        del_count, insert_lines = replacement
+        new_content[idx:idx + del_count] = insert_lines
+        offset += len(insert_lines) - del_count
+        applied += 1
+
+    return new_content, applied, rejected
+
+
+def _apply_hunk(content_lines, start_idx, body):
+    """Replay a single hunk's body at start_idx. Returns
+    (ok, (delete_count, insert_lines))."""
+    # Build the expected pre-image and the post-image from the hunk body
+    pre = []
+    post = []
+    for bl in body:
+        if bl.startswith("-"):
+            pre.append(bl[1:] + "\n" if not bl.endswith("\n") else bl[1:])
+        elif bl.startswith("+"):
+            post.append(bl[1:] + "\n" if not bl.endswith("\n") else bl[1:])
+        elif bl.startswith(" ") or bl == "":
+            pre.append((bl[1:] if bl.startswith(" ") else bl) + ("\n" if not bl.endswith("\n") else ""))
+            post.append((bl[1:] if bl.startswith(" ") else bl) + ("\n" if not bl.endswith("\n") else ""))
+        elif bl.startswith("\\"):
+            # "\ No newline at end of file" — strip the trailing newline
+            # from the previous line in pre/post.
+            for arr in (pre, post):
+                if arr and arr[-1].endswith("\n"):
+                    arr[-1] = arr[-1][:-1]
+    # Verify pre-image matches the file at start_idx
+    if start_idx < 0 or start_idx + len(pre) > len(content_lines):
+        return False, (0, [])
+    for j, expected in enumerate(pre):
+        actual = content_lines[start_idx + j]
+        # Be lenient about trailing whitespace differences
+        if actual.rstrip() != expected.rstrip():
+            return False, (0, [])
+    return True, (len(pre), post)
+
+
+# ── Codebase grep ──────────────────────────────────────────────────────────
+
+@registry.register
+def grep_codebase(pattern: str, path: str = ".", max_results: int = 100) -> str:
+    """
+    Search the workspace for lines matching `pattern` (Python regex).
+
+    Returns matches as `path:line: matched_line`, capped at max_results.
+    Skips binary files, .git/, node_modules/, venv/, __pycache__/, dist/,
+    build/, .pytest_cache/, target/, *.pyc.
+
+    Use this for "find every place X is used / defined / referenced"
+    instead of constructing fragile `run_shell("grep -rn ...")` calls.
+    """
+    if not pattern:
+        return "Error: empty pattern."
+    try:
+        compiled = re.compile(pattern)
+    except re.error as e:
+        return f"Error: invalid regex: {e}"
+    try:
+        base = get_workspace_path(path)
+    except WorkspacePathError as e:
+        return f"Error: {e}"
+    if not os.path.exists(base):
+        return f"Error: path {path!r} does not exist in workspace."
+
+    SKIP_DIRS = {
+        ".git", "node_modules", "venv", ".venv", "__pycache__", "dist",
+        "build", ".pytest_cache", "target", ".cache", ".next",
+    }
+    SKIP_SUFFIXES = (".pyc", ".pyo", ".o", ".so", ".dylib", ".class",
+                     ".jpg", ".jpeg", ".png", ".gif", ".pdf", ".zip",
+                     ".gz", ".tar", ".webp", ".ico", ".woff", ".woff2",
+                     ".ttf", ".otf", ".eot")
+
+    hits = []
+    for root, dirs, files in os.walk(base):
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+        for fname in files:
+            if fname.endswith(SKIP_SUFFIXES):
+                continue
+            fpath = os.path.join(root, fname)
+            try:
+                with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                    for lineno, line in enumerate(f, 1):
+                        if compiled.search(line):
+                            rel = os.path.relpath(fpath, base)
+                            hits.append(f"{rel}:{lineno}: {line.rstrip()}")
+                            if len(hits) >= max_results:
+                                hits.append(f"… (capped at {max_results} matches)")
+                                return "\n".join(hits)
+            except (OSError, UnicodeDecodeError):
+                continue
+    if not hits:
+        return f"No matches for {pattern!r} under {path!r}."
+    return "\n".join(hits)
+
+
+# ── Test runner ────────────────────────────────────────────────────────────
+
+@registry.register(auth_required=True)
+def run_tests(target: str = "") -> str:
+    """
+    Auto-detect the project's test framework and run it.
+
+    Detection (first match wins, within the workspace):
+      - pyproject.toml or pytest.ini or tests/conftest.py → pytest
+      - package.json with a "test" script        → npm test
+      - Cargo.toml                               → cargo test
+      - go.mod                                   → go test ./...
+      - Makefile with a 'test' target            → make test
+
+    `target` optionally narrows: passed as the final argument to the
+    framework (e.g., a test path, module name, or test pattern).
+
+    Returns the test output. Honors the standard process-level sandbox
+    (env scrub, cwd=workspace, rlimits).
+    """
+    workspace_cwd = os.path.abspath(WORKSPACE_DIR)
+    os.makedirs(workspace_cwd, exist_ok=True)
+
+    def exists(*names):
+        return any(os.path.exists(os.path.join(workspace_cwd, n)) for n in names)
+
+    if exists("pyproject.toml", "pytest.ini", "tests/conftest.py", "setup.cfg"):
+        cmd = f"pytest -v {target}".strip()
+    elif exists("package.json"):
+        cmd = f"npm test -- {target}".strip() if target else "npm test"
+    elif exists("Cargo.toml"):
+        cmd = f"cargo test {target}".strip()
+    elif exists("go.mod"):
+        cmd = f"go test ./... {target}".strip()
+    elif exists("Makefile") and _makefile_has_target(os.path.join(workspace_cwd, "Makefile"), "test"):
+        cmd = f"make test {target}".strip()
+    else:
+        return (
+            "Error: no test framework detected. "
+            "Looked for: pyproject.toml / pytest.ini / package.json / "
+            "Cargo.toml / go.mod / Makefile-with-test-target. "
+            "Either add one or call run_shell with the exact test command."
+        )
+    return run_shell(cmd, interactive=False)
+
+
+def _makefile_has_target(path: str, target: str) -> bool:
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            return any(line.lstrip().startswith(f"{target}:") for line in f)
+    except OSError:
+        return False
+
+
+# ── Python eval ────────────────────────────────────────────────────────────
+
+@registry.register
+def python_eval(expr: str) -> str:
+    """
+    Evaluate a Python expression in a sandboxed subprocess.
+
+    Use this for math, datetime arithmetic, JSON parsing, list/dict
+    manipulation — anything you'd otherwise compute in your head and
+    likely get wrong. Returns repr() of the result.
+
+    Sandbox: subprocess with scrubbed env, cwd=workspace, 10s wall timeout,
+    no network access by convention (the sandbox doesn't enforce this —
+    just don't write expressions that fetch URLs).
+
+    Examples:
+      python_eval("2**32 - 1")            → 4294967295
+      python_eval("sum(range(100))")      → 4950
+      python_eval("[x*2 for x in range(5)]") → [0, 2, 4, 6, 8]
+      python_eval("import json; json.dumps({'a': 1})") → '{"a": 1}'
+    """
+    if not expr or not expr.strip():
+        return "Error: empty expression."
+    # Wrap so we can exec multi-line snippets too (e.g., the json import case).
+    # Use a small driver that prints repr of the LAST expression's result.
+    driver = (
+        "import sys\n"
+        "_src = sys.stdin.read()\n"
+        "try:\n"
+        "    _ast = compile(_src, '<eval>', 'exec')\n"
+        "    _ns = {}\n"
+        "    exec(_ast, _ns)\n"
+        "    # Find the last expression's value via re-parsing\n"
+        "    import ast as _astmod\n"
+        "    _tree = _astmod.parse(_src)\n"
+        "    if _tree.body and isinstance(_tree.body[-1], _astmod.Expr):\n"
+        "        _last = _astmod.Expression(_tree.body[-1].value)\n"
+        "        _val = eval(compile(_last, '<eval>', 'eval'), _ns)\n"
+        "        sys.stdout.write(repr(_val))\n"
+        "    else:\n"
+        "        sys.stdout.write('(executed; no expression result)')\n"
+        "except Exception as e:\n"
+        "    sys.stdout.write(f'Error: {type(e).__name__}: {e}')\n"
+    )
+    sandbox_env = _build_sandbox_env()
+    try:
+        result = subprocess.run(
+            ["python", "-c", driver],
+            input=expr, text=True, capture_output=True,
+            timeout=10, cwd=os.path.abspath(WORKSPACE_DIR),
+            env=sandbox_env, start_new_session=True,
+            preexec_fn=_apply_sandbox_rlimits if os.name != "nt" else None,
+        )
+    except subprocess.TimeoutExpired:
+        return "Error: python_eval timed out after 10s."
+    except Exception as e:
+        return f"Error launching python_eval: {e}"
+    if result.returncode != 0:
+        return f"Error: {result.stderr.strip() or 'non-zero exit'}"
+    return result.stdout.strip() or "(empty result)"
+
+
+# ── Git helpers ────────────────────────────────────────────────────────────
+
+def _git_in_workspace(args: list, path: str = ".") -> str:
+    """Shared helper: run `git <args>` inside the workspace path. Returns
+    output or a clear error if the path isn't a git repo."""
+    try:
+        cwd = get_workspace_path(path)
+    except WorkspacePathError as e:
+        return f"Error: {e}"
+    # Make sure it's a git repo
+    if not os.path.exists(os.path.join(cwd, ".git")):
+        # Walk up to find a .git in a parent within workspace
+        probe = cwd
+        ws_root = os.path.abspath(WORKSPACE_DIR)
+        found = False
+        while probe and probe.startswith(ws_root):
+            if os.path.exists(os.path.join(probe, ".git")):
+                cwd = probe
+                found = True
+                break
+            parent = os.path.dirname(probe)
+            if parent == probe:
+                break
+            probe = parent
+        if not found:
+            return f"Error: no git repository found at or above {path!r} in workspace."
+    try:
+        result = subprocess.run(
+            ["git"] + args,
+            cwd=cwd, capture_output=True, text=True,
+            timeout=30, env=_build_sandbox_env(),
+        )
+    except subprocess.TimeoutExpired:
+        return f"Error: git {' '.join(args)} timed out."
+    except FileNotFoundError:
+        return "Error: git not installed."
+    output = result.stdout
+    if result.stderr:
+        output += ("\n" if output else "") + result.stderr
+    return output or f"(git {' '.join(args)} produced no output)"
+
+
+@registry.register
+def git_diff(ref: str = "HEAD", path: str = ".") -> str:
+    """
+    Show git diff against `ref` for a path in the workspace.
+
+    Defaults to comparing the working tree against HEAD. Useful for
+    seeing what's changed before committing, or comparing two refs
+    with `ref` like "main..feature-branch".
+    """
+    args = ["diff", "--no-color"]
+    if ref:
+        args.append(ref)
+    return _git_in_workspace(args, path)
+
+
+@registry.register
+def git_log(path: str = ".", limit: int = 10) -> str:
+    """
+    Show recent commits for a path in the workspace.
+
+    Returns one line per commit: `<short_hash> <date> <author>: <subject>`.
+    Default last 10 commits.
+    """
+    args = ["log", f"-{limit}", "--no-color",
+            "--pretty=format:%h %ad %an: %s", "--date=short"]
+    return _git_in_workspace(args, path)
+
+
+@registry.register
+def git_blame(file: str, line: Optional[int] = None) -> str:
+    """
+    Show git blame for a file in the workspace, optionally narrowed
+    to a specific line number.
+
+    Each output line is `<short_hash> (<author> <date>) <code>`.
+    Useful for "who added this and why" — pair with git_log on the
+    returned hash for the commit message.
+    """
+    # `git blame --no-color` is ambiguous (clashes with --no-color-lines /
+    # --no-color-by-age). Default ANSI in output is fine — the caller can
+    # strip if needed.
+    args = ["blame"]
+    if line is not None:
+        try:
+            n = int(line)
+            args.extend(["-L", f"{n},{n}"])
+        except (TypeError, ValueError):
+            return f"Error: line must be an integer, got {line!r}"
+    # The file path is relative to the repo root, so resolve it inside
+    # the workspace via get_workspace_path before passing to git blame.
+    try:
+        full = get_workspace_path(file)
+    except WorkspacePathError as e:
+        return f"Error: {e}"
+    args.append(full)
+    return _git_in_workspace(args, ".")

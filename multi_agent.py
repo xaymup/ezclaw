@@ -32,6 +32,13 @@ AGENT_DEFS = {
 - **Workspace Sandbox (STRICT)**: ALL file and shell tools operate from the SAME `workspace/` directory. `read_file("foo.py")` reads `workspace/foo.py`; `run_shell("make")` runs `make` from inside `workspace/`. Pass paths as relative names ("foo.py", "blex_os/Makefile") — NEVER prefix with `workspace/` yourself, that double-prefixes to `workspace/workspace/foo.py`.
 - **Writes stay in workspace.** `write_file` enforces this automatically (paths outside `workspace/` raise WorkspacePathError). For `run_shell`, the enforcement is YOUR job — never run `echo X > /path/outside/workspace`, never `cp file /elsewhere`, never `git commit` on anything but a repo inside `workspace/`. Reads outside workspace via shell (e.g., `cat /etc/os-release` for system info, or `git log` on a sibling repo) are fine; writes are not. The project source (`cli.py`, `tools.py`, `multi_agent.py`, etc.) at the parent directory is OFF-LIMITS for modification.
 - **Don't pre-validate**: Just call `read_file(path)` — if it errors, then act. Do NOT `list_dir` first to "check if the file exists."
+- **Use the efficient tools when they fit** — they save context budget and avoid common mistakes:
+    - `code_outline(file)` BEFORE `read_file` on large source files. The outline tells you which symbols exist; only `read_file` after you know which part you want.
+    - `apply_diff(file, diff)` INSTEAD of `write_file` for small edits. It sends just the hunks, not the whole file.
+    - `grep_codebase(pattern)` INSTEAD of `run_shell("grep -rn …")`. Structured output, skips binary/cache dirs automatically.
+    - `run_tests([target])` INSTEAD of guessing pytest/jest/cargo invocations.
+    - `python_eval(expr)` INSTEAD of mental math, datetime arithmetic, or JSON manipulation. Use it whenever the answer is computable.
+    - `git_diff` / `git_log` / `git_blame` INSTEAD of `run_shell("git …")` for structured output.
 - **Verify after every change.** If you `write_file` or run any mutating shell command (make, pip install, git commit, mv, rm, etc.), you MUST IN THE SAME TURN re-run the verification command (e.g. `make`, the test suite, `cat` the resulting file) BEFORE declaring success. Editing the file is not the same as fixing it. NEVER write "build succeeded" or "fix applied" based on a successful write_file alone — base success on a successful build/test/cat output.
 - **Verification First**: Before modifying or copying a file, verify its existence and content to avoid redundant work.
 - After each tool result, proceed to the NEXT step. Do NOT repeat a step unless it failed and you have a new approach.
