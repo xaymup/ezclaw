@@ -7,6 +7,35 @@ import urllib.parse
 from datetime import datetime
 from typing import Callable, Dict, Any, List, Optional
 import inspect
+import contextvars
+
+# Whitelist of tools whose calls are recorded as actions. Reads/searches
+# are excluded — only state-changing operations qualify.
+MUTATING_TOOLS = frozenset({
+    "apply_diff",
+    "write_file",
+    "run_shell",
+    "schedule_task",
+    "unschedule_task",
+})
+
+# Set by the agent at session start; read by recall_actions to scope its
+# search. Module-level so it survives across the tool's invocation
+# without threading a parameter through every call site.
+_session_id_var: contextvars.ContextVar = contextvars.ContextVar(
+    "ezclaw_session_id", default=None
+)
+
+
+def set_session_context(session_id):
+    """Called by the agent at session start. Pass None to clear."""
+    _session_id_var.set(session_id)
+
+
+def get_session_context():
+    """Return the current session id, or None if unset."""
+    return _session_id_var.get()
+
 
 class ToolRegistry:
     def __init__(self):
@@ -1079,6 +1108,38 @@ def create_memory_tools(db: Any):
         deleted = db.delete_memory(query)
         if not deleted: return f"No memories found matching '{query}' to forget."
         return "Deleted memories:\n- " + "\n- ".join(deleted)
+
+
+def create_action_tracking_tools(db: Any):
+    """Register the `recall_actions` tool. Bound to `db`; reads the current
+    session id from the module-level contextvar set by the agent."""
+
+    @registry.register
+    def recall_actions(query: str, limit: int = 5) -> str:
+        """Search this session's past mutating actions by what they did or why.
+
+        Call when the user asks about a past action — 'what did you do
+        about X', 'did you fix Y', 'which files did you edit earlier'.
+        Returns one line per matching action: time, summary, why, outcome.
+        """
+        session_id = get_session_context()
+        if session_id is None:
+            return "No active session — action history unavailable."
+        rows = db.search_actions(session_id=session_id, query=query, limit=limit)
+        if not rows:
+            return "No matching actions in this session."
+        lines = []
+        for r in rows:
+            ts = (r.get("created_at") or "")[-8:-3] or "??:??"
+            head = f"[{ts}] {r['summary']}"
+            if r.get("why"):
+                head += f" — why: \"{r['why']}\""
+            head += f" — {r['outcome']}"
+            if r.get("error_excerpt"):
+                head += f": {r['error_excerpt'][:120]}"
+            lines.append(head)
+        return "\n".join(lines)
+
 
 @registry.register
 def delegate(agent_key: str, instruction: str) -> str:
