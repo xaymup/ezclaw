@@ -217,6 +217,10 @@ class ChatUI:
         # via the session's input_queue instead of being sent to the agent.
         self._interactive_session = None
 
+        # Tracks the last status string we sent a desktop notification for
+        # so identical consecutive statuses don't fire twice.
+        self._last_notified_status = None
+
     def _wrap_tools(self):
         from tools import registry
         original_run_shell = registry.tools.get('run_shell')
@@ -1042,6 +1046,7 @@ class ChatUI:
         # sees their own message and the start of the reply, even if they had
         # scrolled up while reading older history.
         self._force_scroll_next_update = True
+        self._last_notified_status = None  # fresh turn, allow notifications again
         self.history_ansi.append(render_to_ansi(Panel(text, title="User", border_style=PRIMARY)))
         self.is_generating = True
         self.current_response_parts = []
@@ -1294,6 +1299,12 @@ class ChatUI:
                 elif chunk["type"] == "status":
                     self.current_status = chunk["content"].strip()
                     self.side_messages.append(self.current_status)
+                    # Attention triggers: any status starting with ⚠ blocker
+                    # means the architect has stopped and needs user input.
+                    # Long-running task completion is also a notify
+                    # candidate so the user can come back from another
+                    # window when ezclaw is done.
+                    self._maybe_notify_from_status(self.current_status)
                 elif chunk["type"] == "auth_required":
                     self.auth_active = True
                     self._update_ui()
@@ -1332,12 +1343,65 @@ class ChatUI:
         self.side_messages = []
         self._update_ui()
 
+    def _maybe_notify_from_status(self, status: str) -> None:
+        """Send a desktop notification when a status string signals that
+        ezclaw needs the user's attention or has finished a long run.
+
+        Three trigger families:
+          - "⚠ blocker" prefix          → critical (loop halted, needs input)
+          - "🦀 all snipped and shipped" → low (long task done, may have stepped away)
+          - "🦀 …" success variants       → low (same, alternate wording)
+        Notifications are throttled so the same status doesn't fire twice
+        in a row, and the "completed" notify only fires when the turn
+        actually took >30s (otherwise it's just a chat reply, no need).
+        """
+        from notifications import notify, URGENCY_CRITICAL, URGENCY_LOW
+        if status == getattr(self, "_last_notified_status", None):
+            return
+        self._last_notified_status = status
+
+        if status.startswith("⚠ blocker"):
+            notify(
+                "🦀 ezclaw blocked",
+                status.lstrip("⚠ ").strip(),
+                urgency=URGENCY_CRITICAL,
+            )
+            return
+
+        # Completion notifications only for runs that took some time.
+        # A 2-second greeting reply doesn't need an OS notification.
+        completion_markers = (
+            "all snipped and shipped",
+            "catch landed",
+            "back to the shore",
+            "shell sealed",
+        )
+        if any(m in status for m in completion_markers):
+            elapsed = time.time() - self.generation_start_time if self.generation_start_time else 0
+            if elapsed >= 30:
+                notify(
+                    "🦀 ezclaw finished",
+                    f"Task done in {elapsed:.0f}s. Check the chat for details.",
+                    urgency=URGENCY_LOW,
+                )
+
     def _ask_auth(self, chunk):
         self.current_auth_chunk = chunk
         self.auth_active = True
         self.input_field.read_only = True
         self._update_ui()
-        
+
+        # The auth prompt blocks all further agent progress until the
+        # user responds. Ping them via the OS notification system so
+        # they can come back to ezclaw from another window.
+        from notifications import notify, URGENCY_CRITICAL
+        tool_name = chunk.get("name", "tool")
+        notify(
+            f"🦀 ezclaw needs approval",
+            f"Run `{tool_name}`?  Switch to ezclaw to answer.",
+            urgency=URGENCY_CRITICAL,
+        )
+
         choice = self.auth_queue.get()
         
         self.auth_active = False
@@ -1397,6 +1461,18 @@ class ChatUI:
         the agent as if it were a user prompt. Status moves Notified → Done
         when the agent finishes, or Failed if it raises."""
         from rich.panel import Panel as _Panel
+        from notifications import notify, URGENCY_NORMAL
+
+        # OS-level desktop notification — the user may have stepped away
+        # from ezclaw when this fires. Title says what's happening; body
+        # carries the task description so they can decide if it needs
+        # their attention or if they can let it run.
+        notify(
+            f"🦀 ezclaw scheduled task #{task.id}",
+            task.description,
+            urgency=URGENCY_NORMAL,
+        )
+
         banner = _Panel(
             Text(f"🔔 [#{task.id}] {task.description}", style=f"bold {WARN}"),
             title=f"[bold {WARN}]Scheduled task auto-running[/bold {WARN}]",
