@@ -1048,6 +1048,11 @@ class ChatUI:
             line_text.append(task.description, style=f"{weight}{line_color}")
             body_lines.append(line_text)
 
+            # If this task is in_progress, nest the architect's most recent
+            # intent under it (Spec D — replaces the standalone chip).
+            if task.status == "in_progress" and self.architect_intent:
+                body_lines.extend(self._render_intent_lines(self.architect_intent))
+
             # Tool rows nested under this task. Compact one-line summary
             # per tool: indented branch glyph + kind icon + name + first
             # arg + result status. Tools awaiting a result get a spinner
