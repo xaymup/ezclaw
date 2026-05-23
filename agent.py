@@ -300,7 +300,9 @@ Respond with JSON only:
             augment_prefix = f"{memory_block}{skills_block}\n---\n"
 
         iteration_count = 0
-        max_iterations = 15
+        # Generous default cap for extensive research / multi-fetch chains.
+        # Override with EZCLAW_MAX_ITERATIONS if you need more (or less).
+        max_iterations = int(os.getenv("EZCLAW_MAX_ITERATIONS", "50"))
         last_tool_hash = None
         repeat_count = 0
         # Allow up to this many *consecutive* identical tool batches before
@@ -308,9 +310,17 @@ Respond with JSON only:
         #   - re-reading a file after a write to verify the change
         #   - re-running `make` after a fix
         #   - retrying a web_fetch through transient server timeouts
-        # Web-fetch chains in particular can produce 3-4 identical retries
-        # before transient network issues clear, so this needs headroom.
         REPEAT_LIMIT = 5
+
+        # URL-specific loop detector for web_fetch: tracks the last 10
+        # fetched URLs in a sliding window. If any URL appears 3+ times
+        # in that window, the model is fetching the same page repeatedly
+        # — likely confused about results — and we halt. Catches both
+        # consecutive (A, A, A) and interleaved (A, B, A, B, A) patterns
+        # while leaving genuinely diverse research uninterrupted.
+        from collections import deque, Counter
+        recent_fetched_urls = deque(maxlen=10)
+        URL_REPEAT_LIMIT = 3
 
         # Tool pre-selection: only pass tools relevant to the current query
         selected_tools = self._select_relevant_tools(user_input, top_n=20) if len(self.tools) > 20 else self.tools
@@ -420,6 +430,36 @@ Respond with JSON only:
                 repeat_count = 0
             last_tool_hash = current_hash
 
+            # URL-specific loop detector for web_fetch — diverse research
+            # with many DIFFERENT URLs slides through this freely, but if
+            # the model fetches the SAME URL 3+ times within the last 10
+            # calls (consecutive or interleaved), it's stuck.
+            for tc in tool_calls:
+                if tc.function.name == "web_fetch":
+                    args = tc.function.arguments
+                    if isinstance(args, dict):
+                        url = str(args.get("url", ""))
+                    else:
+                        # ollama sometimes serializes arguments as JSON string
+                        try:
+                            url = str(json.loads(args).get("url", ""))
+                        except Exception:
+                            url = str(args)
+                    if url:
+                        recent_fetched_urls.append(url)
+            if recent_fetched_urls:
+                most_common_url, most_common_count = Counter(recent_fetched_urls).most_common(1)[0]
+                if most_common_count >= URL_REPEAT_LIMIT:
+                    yield {
+                        "type": "content",
+                        "content": (
+                            f"\n[System: same URL fetched {most_common_count}× in the last "
+                            f"{len(recent_fetched_urls)} web_fetch calls "
+                            f"({most_common_url[:80]}…) — likely a loop. Stopping.]"
+                        ),
+                    }
+                    break
+
             if not tool_calls:
                 if full_response.strip() or full_reasoning.strip():
                     msg = {"role": "assistant", "content": full_response}
@@ -464,4 +504,8 @@ Respond with JSON only:
                 yield {"type": "tool_end", "name": tool.function.name, "result": full_result}
 
         if iteration_count >= max_iterations:
-            yield {"type": "content", "content": "\n[System: Action limit reached.]"}
+            yield {"type": "content", "content": (
+                f"\n[System: agent ran {max_iterations} tool-call iterations "
+                f"— pausing here. If the goal still needs more work, ask me to "
+                f"continue, or bump EZCLAW_MAX_ITERATIONS in your env.]"
+            )}
