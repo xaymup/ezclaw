@@ -521,11 +521,11 @@ class ChatUI:
             body.append("⚡ Multi-agent\n", style=f"bold {PRIMARY}")
             arch_model = getattr(self.agent.architect, "model", "?") if hasattr(self.agent, "architect") else "?"
             arch_style = THEME.role("architect")
-            body.append(f"  {arch_style.icon} architect   ", style=f"bold {arch_style.color}")
+            body.append(f"  {arch_style.icon} {'architect':<10} ", style=f"bold {arch_style.color}")
             body.append(f"{arch_model}\n", style=SECONDARY)
             for role, sub_agent in self.agent.agents.items():
                 rs = THEME.role(role)
-                body.append(f"  {rs.icon} {role:<9} ", style=f"bold {rs.color}")
+                body.append(f"  {rs.icon} {role:<10} ", style=f"bold {rs.color}")
                 body.append(f"{sub_agent.model}\n", style=SECONDARY)
         else:
             body.append("● Single-agent\n", style=f"bold {PRIMARY}")
