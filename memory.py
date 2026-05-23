@@ -320,3 +320,77 @@ class Database:
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("UPDATE messages SET embedding=? WHERE id=?", (embedding, msg_id))
             conn.commit()
+
+    # ── Actions (mutating-tool audit trail) ──────────────────────────
+
+    def add_action(
+        self,
+        session_id: int,
+        tool: str,
+        args_json: str,
+        summary: str,
+        why: Optional[str],
+        outcome: str,
+        error_excerpt: Optional[str],
+        embedding: Optional[bytes],
+    ) -> None:
+        """Insert one mutating tool call into the actions table.
+
+        All five recording-side fields are best-effort and may be None
+        except session_id/tool/args_json/summary/outcome.
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """INSERT INTO actions
+                   (session_id, tool, args_json, summary, why, outcome, error_excerpt, embedding)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (session_id, tool, args_json, summary, why, outcome, error_excerpt, embedding),
+            )
+            conn.commit()
+
+    def search_actions(
+        self,
+        session_id: int,
+        query: str,
+        limit: int = 5,
+        threshold: float = 0.0,
+    ) -> List[Dict[str, Any]]:
+        """Semantic search over this session's actions. Returns top `limit`
+        rows above `threshold`, ranked by cosine similarity to `query`.
+        """
+        from embed import embed, cosine_similarity
+
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """SELECT id, tool, summary, why, outcome, error_excerpt,
+                          embedding, created_at
+                   FROM actions WHERE session_id = ?""",
+                (session_id,),
+            )
+            rows = cursor.fetchall()
+
+        if not rows:
+            return []
+
+        q_vec = embed(query)
+        scored = []
+        for row_id, tool, summary, why, outcome, error_excerpt, emb_blob, created_at in rows:
+            if not emb_blob:
+                continue
+            a_vec = pickle.loads(emb_blob)
+            sim = cosine_similarity(q_vec, a_vec)
+            if sim >= threshold:
+                scored.append((sim, {
+                    "id": row_id,
+                    "tool": tool,
+                    "summary": summary,
+                    "why": why,
+                    "outcome": outcome,
+                    "error_excerpt": error_excerpt,
+                    "created_at": created_at,
+                }))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [r for _, r in scored[:limit]]
