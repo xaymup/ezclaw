@@ -501,7 +501,8 @@ Rules for execution:
 - `current_task_id` must reference an existing task in the plan (not yet `done`/`failed`/`skipped`).
 - `task_updates` is for tasks finishing in the current step. Only mark `done` after a successful verification. Mark `failed` only after retries are exhausted. Mark `skipped` only when the task is genuinely no longer needed.
 - `new_tasks` is for genuinely-new work discovered during execution. Leave empty most of the time. Each entry's `after_id` must reference an existing task.
-- **After a `debugger` step:** the debugger returns a diagnosis plus a numbered "Proposed Fix". DO NOT re-narrate that diagnosis or paste its steps into `plan`. Convert each step of the Proposed Fix into a `new_tasks` entry (`after_id` = the debugger task's id, one entry per concrete step), mark the debugger task `done`, route the NEXT turn to the agent that should execute the first new step (usually `executor`). Keep `reflection.observation` to one short sentence — the actual fix steps belong in the plan, not in chat.
+- **After a `debugger` step:** the debugger returns a diagnosis plus a numbered "Proposed Fix". This output is INTERNAL — the user never sees it. DO NOT re-narrate that diagnosis or paste its steps into `plan`. Convert each step of the Proposed Fix into a `new_tasks` entry (`after_id` = the debugger task's id, one entry per concrete step), mark the debugger task `done`, route the NEXT turn to the agent that should execute the first new step (usually `executor`). Keep `reflection.observation` to one short sentence.
+- **The user's chat only ever shows what addresses their original prompt.** When you set `complete: true`, the LAST visible step's output is what the user reads as the answer. Route the final step to an agent whose output naturally responds to the user (executor for "did it work?" recaps; researcher/general for explanatory questions). Never let the debugger be the final visible step — its content is suppressed from chat by design.
 - Set `complete: true` ONLY when every task in the plan is `done` or `skipped` AND the user's full original intent is verifiably satisfied. Premature completion is forbidden.
 - `plan` is the step-by-step instruction the routed agent will execute this turn. Make it concrete and actionable: "Read sse_handler.py, find the handle_disconnect function, add a `connection.cleanup()` call before the return." Not "Work on the leak."
 - `reflection.observation` is one short sentence describing what actually happened in the previous step. Skip if first step.
@@ -1287,12 +1288,24 @@ No fluff. No "In this task...". Just facts."""
                 f"## Original Request\n{user_input}{prev_step_summary}"
             )
 
+            # The debugger's job is to hand a diagnosis to the ARCHITECT, not
+            # to the user. Suppress its content chunks from the chat stream
+            # (the architect still sees them via step_output_parts so it can
+            # turn the Proposed Fix into new_tasks). Tool calls and status
+            # still surface so the user sees that work is happening.
+            suppress_user_visible = (agent_key == "debugger")
+
             step_output_parts = []
             step_tool_results = []
             step_tool_names = []
             for chunk in agent.chat_stream(agent_context):
                 if chunk["type"] == "content":
                     step_output_parts.append(chunk["content"])
+                    if suppress_user_visible:
+                        # Capture-only: architect needs this in its next
+                        # prompt, but the user never sees raw debugger
+                        # analysis as the response to their question.
+                        continue
                 elif chunk["type"] == "tool_end":
                     step_tool_names.append(chunk["name"])
                     step_tool_results.append(f"  [{chunk['name']}]: {str(chunk['result'])[:500]}")
@@ -1301,9 +1314,21 @@ No fluff. No "In this task...". Just facts."""
             step_output = "".join(step_output_parts)
             if not step_output.strip() and step_tool_results:
                 step_output = "Done."
-                yield {"type": "content", "content": "Done."}
-            if step_output.strip():
+                if not suppress_user_visible:
+                    yield {"type": "content", "content": "Done."}
+            if step_output.strip() and not suppress_user_visible:
+                # Only update final_response from agents whose output is
+                # meant for the user. Otherwise the debugger's diagnosis
+                # would become the answer when the run completes.
                 final_response = step_output.strip()
+
+            if suppress_user_visible:
+                # Tell the user the debugger handed off so they can see
+                # something happened — without exposing the analysis.
+                yield {
+                    "type": "status",
+                    "content": "debugger: analysis complete → architect updating plan",
+                }
 
             agent_has_responded = bool(step_output.strip() or step_tool_results)
 
