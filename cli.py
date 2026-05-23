@@ -206,6 +206,12 @@ class ChatUI:
         # shows args in their own panel and the redundant ↳ summary line.
         self.compact_tools = True
 
+        # When True, the next _update_ui will auto-scroll to bottom even if
+        # the user has scrolled up. Set on new-prompt submit and on End-key
+        # press so the user always sees their own message + the start of
+        # the agent's reply.
+        self._force_scroll_next_update = False
+
     def _wrap_tools(self):
         from tools import registry
         original_run_shell = registry.tools.get('run_shell')
@@ -329,6 +335,35 @@ class ChatUI:
                 # But we can just increment and prompt_toolkit will clamp it
                 self.history_window.vertical_scroll += 3
 
+        @self.kb.add('end')
+        def _(event):
+            # Jump to bottom and re-enable auto-scroll.
+            self._force_scroll_next_update = True
+            self._scroll_to_bottom()
+            event.app.invalidate()
+
+        @self.kb.add('home')
+        def _(event):
+            # Jump to top of history.
+            self.history_window.vertical_scroll = 0
+            event.app.invalidate()
+
+        @self.kb.add('pageup')
+        def _(event):
+            info = self.history_window.render_info
+            jump = info.window_height - 1 if info else 10
+            self.history_window.vertical_scroll = max(
+                0, self.history_window.vertical_scroll - jump
+            )
+            event.app.invalidate()
+
+        @self.kb.add('pagedown')
+        def _(event):
+            info = self.history_window.render_info
+            jump = info.window_height - 1 if info else 10
+            self.history_window.vertical_scroll += jump
+            event.app.invalidate()
+
     def _create_layout(self):
         self.history_control = BufferControl(
             buffer=self.history_buffer,
@@ -368,15 +403,35 @@ class ChatUI:
             full_ansi = "\n".join(self.history_ansi)
             full_ansi += "\n" + self._get_current_renderable_ansi()
 
+            # Only auto-scroll to bottom if the user was already there.
+            # Otherwise preserve their scroll position so they can read
+            # earlier content while generation continues. Anchored via
+            # render_info from the previous render — accurate enough.
+            was_at_bottom = self._is_at_bottom()
+
             self._history_read_only -= 1  # 1 -> 0, now writable
             try:
                 self.history_buffer.text = full_ansi
             finally:
                 self._history_read_only += 1  # back to read-only
 
-            self._scroll_to_bottom()
+            if was_at_bottom or self._force_scroll_next_update:
+                self._scroll_to_bottom()
+                self._force_scroll_next_update = False
             if self.app.is_running:
                 self.app.invalidate()
+
+    def _is_at_bottom(self) -> bool:
+        """Return True iff the chat window is scrolled to (or within 2 lines
+        of) the bottom on the last render. Used to decide whether the next
+        `_update_ui` should auto-scroll — if the user has scrolled up to
+        read earlier content, we preserve their position."""
+        info = self.history_window.render_info
+        if info is None:
+            return True  # first paint — default to auto-scroll
+        total_lines = info.ui_content.line_count
+        last_visible = info.vertical_scroll + info.window_height
+        return last_visible >= total_lines - 2
     def _get_status_text(self):
         auth_icon = "◉" if self.agent.session_authorized else "○"
         mode = "⚡" if ENABLE_MULTI_AGENT else "●"
@@ -402,7 +457,7 @@ class ChatUI:
         tools_badge = "  ╱  ⊞ FULL TOOLS" if not self.compact_tools else ""
         return (
             f"  {activity}  {auth_icon}  {mode} {model_info}  ╱  {msg_count} msgs"
-            f"{live}{copy_badge}{arch_badge}{tools_badge}  │  [Ctrl+C] Exit  [F2] Copy  [F3] Strategy  [F4] Tools  [Arrows] Scroll"
+            f"{live}{copy_badge}{arch_badge}{tools_badge}  │  [Ctrl+C] Exit  [F2] Copy  [F3] Strategy  [F4] Tools  [PgUp/PgDn/End] Scroll"
         )
 
     def _spinner_for(self, role):
@@ -820,7 +875,10 @@ class ChatUI:
             self._handle_command(text)
             return
 
-        # Regular message
+        # Regular message — always snap to bottom on new prompt so the user
+        # sees their own message and the start of the reply, even if they had
+        # scrolled up while reading older history.
+        self._force_scroll_next_update = True
         self.history_ansi.append(render_to_ansi(Panel(text, title="User", border_style=PRIMARY)))
         self.is_generating = True
         self.current_response_parts = []
@@ -895,6 +953,8 @@ class ChatUI:
                 "| `[F2]` | Toggle copy mode (terminal-native selection) |\n"
                 "| `[F3]` | Toggle architect strategy/reflection panel |\n"
                 "| `[F4]` | Toggle compact / full tool panel layout |\n"
+                "| `[PgUp]` / `[PgDn]` | Scroll chat by one screen |\n"
+                "| `[Home]` / `[End]` | Jump to top / bottom of chat |\n"
                 "| `exit` / `quit` | Exit EzClaw |\n"
             )
             self.history_ansi.append(render_to_ansi(Panel(Markdown(help_text), title="help", border_style=DIM)))
