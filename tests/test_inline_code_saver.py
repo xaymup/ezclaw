@@ -228,3 +228,18 @@ def test_apply_overwrite_replaces_existing_file(tmp_path):
     result = apply_save(plan, "write")
     assert result.status == "succeeded"
     assert (tmp_path / "foo.py").read_text() == "NEW"
+
+
+def test_executor_prompt_mentions_tagged_blocks():
+    import multi_agent
+    prompt = multi_agent.AGENT_DEFS["executor"]["system_prompt"]
+    assert ("python:src/" in prompt
+            or "lang:path" in prompt
+            or "tag the code fence" in prompt.lower())
+
+
+def test_chat_agent_source_contains_tagged_block_nudge():
+    import inspect
+    from agent import ChatAgent
+    src = inspect.getsource(ChatAgent.__init__)
+    assert "tag the code fence" in src.lower() or "python:src/foo.py" in src

@@ -127,7 +127,22 @@ When the user asks what you did about a past task, file, bug, or feature
 ("what did you do about X", "did you fix Y", "earlier you changed
 something in Z"), call `recall_actions(query)` BEFORE answering.
 `recall_actions` is authoritative for this session's mutating actions —
-don't reconstruct from memory or guess.""",
+don't reconstruct from memory or guess.
+
+═══════════════════════════════════════════════════════════════
+## Emitting code in your response
+
+When you output a complete file for the user, tag the code fence with the
+destination path:
+
+  ```python:src/auth.py
+  # file body
+  ```
+
+The CLI saves tagged blocks to `workspace/<path>` automatically. Untagged
+fences (just ```python) stay inline and are NOT saved — use untagged for
+short illustrative snippets only. For files you'll then manipulate via
+tools, use `write_file` or `apply_diff` instead of an inline tagged block.""",
     },
     "researcher": {
         "model": os.getenv("OLLAMA_RESEARCHER_MODEL", "qwen3.5:9b"),

@@ -137,6 +137,20 @@ class ChatAgent:
             "feature, call `recall_actions(query)` BEFORE answering. It is "
             "authoritative for this session's mutating actions."
         )
+        self.system_prompt += (
+            "\n\n## Emitting code in your response\n"
+            "When you output a complete file for the user, tag the code "
+            "fence with the destination path:\n"
+            "\n"
+            "  ```python:src/foo.py\n"
+            "  # file body\n"
+            "  ```\n"
+            "\n"
+            "The CLI saves tagged blocks to `workspace/<path>` automatically. "
+            "Untagged fences (just ```python) stay inline and are NOT saved — "
+            "use untagged for short illustrative snippets only. For files you'll "
+            "then manipulate via tools, use `write_file` or `apply_diff` instead."
+        )
         self._ensure_system_message()
         self.session_authorized = False
 
