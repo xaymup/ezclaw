@@ -610,7 +610,7 @@ Return:
   "reasoning": "<one short line on the routing choice>",
   "plan": "<numbered step-by-step instructions for the routed agent, addressing the current task>",
   "task_updates": [{"id": <int>, "status": "done|failed|skipped"}],
-  "new_tasks": [{"after_id": <int>, "description": "<short line>"}],
+  "new_tasks": [{"after_id": <int>, "description": "<short line>", "parent_id": <int, optional — set when this is a sub-step of an existing task; omit for siblings>}],
   "complete": false,
   "reflection": {
     "goal": "<noun phrase>",
@@ -1325,7 +1325,16 @@ Return ONLY the JSON object."""
                 self.current_plan.advance(upd["id"], upd["status"])
         for new in intent.get("new_tasks", []) or []:
             if isinstance(new, dict) and "after_id" in new and "description" in new:
-                self.current_plan.insert(new["after_id"], new["description"])
+                # Tier 2.2: honor an optional `parent_id` so the new task
+                # nests under the step that spawned it instead of sitting
+                # as a sibling. Architect prompt updated to emit this
+                # when a discovered task IS a follow-up of an existing one.
+                parent_id = new.get("parent_id")
+                self.current_plan.insert(
+                    new["after_id"],
+                    new["description"],
+                    parent_id=parent_id,
+                )
         current_id = intent.get("current_task_id")
         if current_id and self.current_plan.get_task(current_id):
             self.current_plan.advance(current_id, "in_progress")

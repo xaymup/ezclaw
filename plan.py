@@ -19,6 +19,10 @@ class Task:
     id: int                # 1-based, stable across plan lifetime
     description: str       # short user-facing line
     status: str = "pending"
+    # Tier 2.2: when set, this task is a sub-task of `parent_id`. The
+    # renderer walks the tree and indents sub-tasks under their parent.
+    # None means top-level (the default).
+    parent_id: Optional[int] = None
 
 
 @dataclass
@@ -47,17 +51,39 @@ class Plan:
         elif status in ("done", "failed", "skipped") and self.current_task_id == task_id:
             self.current_task_id = None
 
-    def insert(self, after_id: int, description: str) -> Task:
+    def insert(
+        self,
+        after_id: int,
+        description: str,
+        parent_id: Optional[int] = None,
+    ) -> Task:
         """Insert a new task after the given task id. If after_id is unknown,
-        appends to the end. Returns the new task. The new id is `max(existing) + 1`."""
+        appends to the end. Returns the new task. The new id is `max(existing) + 1`.
+
+        When `parent_id` is provided, the task is marked as a sub-task of
+        that parent (renderer indents it). The architect emits this field
+        in `new_tasks` entries when a step discovers concrete follow-ups.
+        Convention: if parent_id is omitted but after_id refers to an
+        existing task, treat the new task as a SIBLING (not a child) —
+        explicit parent_id is required to nest."""
         new_id = max((t.id for t in self.tasks), default=0) + 1
-        new_task = Task(id=new_id, description=description)
+        new_task = Task(id=new_id, description=description, parent_id=parent_id)
         idx = next((i for i, t in enumerate(self.tasks) if t.id == after_id), None)
         if idx is None:
             self.tasks.append(new_task)
         else:
             self.tasks.insert(idx + 1, new_task)
         return new_task
+
+    def children_of(self, task_id: int) -> list:
+        """Return the list of tasks whose parent_id == task_id, in plan
+        order. Used by the renderer to walk the tree."""
+        return [t for t in self.tasks if t.parent_id == task_id]
+
+    def roots(self) -> list:
+        """Return the top-level (parent_id is None) tasks, in plan order.
+        The renderer starts from these and recurses via children_of."""
+        return [t for t in self.tasks if t.parent_id is None]
 
     def is_complete(self) -> bool:
         return all(t.status in ("done", "skipped") for t in self.tasks)

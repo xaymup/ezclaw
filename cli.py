@@ -1103,39 +1103,53 @@ class ChatUI:
             tools_by_task.setdefault(tid, []).append((idx, tool))
 
         body_lines = []
-        for task in plan.tasks:
+
+        # Tier 2.2: walk the plan as a tree so sub-tasks (Task.parent_id
+        # is set) render INDENTED under their parent instead of as flat
+        # siblings. Sub-tasks indent by 4 spaces per depth level and get
+        # a ↳ connector to make the hierarchy obvious. The renderer for
+        # a single task row stays the same shape; depth only changes
+        # the indent prefix and the connector glyph.
+        def render_subtree(task, depth: int) -> None:
             icon, color = TASK_STATE_STYLE.get(task.status, ("•", DIM))
             flashing = now < self._task_flash_until.get(task.id, 0.0)
             line_color = TASK_STATE_FLASH.get(task.status, color) if flashing else color
 
-            # Celebrate `done` transitions: during the 150ms flash window
-            # after a task lands on `done`, swap the icon for a sparkle ✨
-            # and animate its color through the gradient. The eye catches
-            # it for one tick, then it settles back to the green ● dot.
             display_icon = icon
             if flashing and task.status == "done":
                 display_icon = "✨"
                 line_color = self._cycle_palette_color(TITLE_GRADIENT, period_sec=0.15)
 
-            # Bold for in_progress so the eye finds it immediately.
             weight = "bold " if task.status == "in_progress" else ""
+
+            indent = "  " + ("    " * depth)
+            connector = "↳ " if depth > 0 else ""
+
             line_text = Text()
-            line_text.append(f"  {display_icon} ", style=f"{weight}{line_color}")
+            line_text.append(f"{indent}", style="")
+            if connector:
+                line_text.append(connector, style=f"dim {DIM}")
+            line_text.append(f"{display_icon} ", style=f"{weight}{line_color}")
             line_text.append(f"{task.id}. ", style=f"dim {DIM}")
             line_text.append(task.description, style=f"{weight}{line_color}")
             body_lines.append(line_text)
 
-            # If this task is in_progress, nest the architect's most recent
-            # intent under it (Spec D — replaces the standalone chip).
+            # Architect intent nests under the in_progress task (Spec D).
             if task.status == "in_progress" and self.architect_intent:
                 body_lines.extend(self._render_intent_lines(self.architect_intent))
 
-            # Tool rows nested under this task. Compact one-line summary
-            # per tool: indented branch glyph + kind icon + name + first
-            # arg + result status. Tools awaiting a result get a spinner
-            # dot; tools that errored get a red ✗.
+            # Tool rows under this task.
             for tidx, tool in tools_by_task.get(task.id, []):
                 body_lines.append(self._render_nested_tool_row(tidx, tool))
+
+            # Recurse into child sub-tasks.
+            for child in plan.children_of(task.id):
+                render_subtree(child, depth + 1)
+
+        # Roots only — descendants are pulled in by render_subtree.
+        roots = plan.roots() if hasattr(plan, "roots") else plan.tasks
+        for root in roots:
+            render_subtree(root, 0)
 
         # Title color shifts through the sunset palette every ~1.5s so the
         # plan panel reads as actively alive. Border breathes between dim
