@@ -1016,35 +1016,95 @@ class ChatUI:
             return ""
         return s
 
-    def _render_reasoning_panel(self):
-        """Unified Reasoning panel — replaces the architect chip + the
-        SHOW_THINKING <think> panel + the F3-expanded architect panel.
+    def _group_reasoning_into_steps(self) -> list:
+        """Group the flat reasoning_log into a TODO-style list of steps.
 
-        Returns a rich.Panel containing chronological reasoning entries
-        from all sources (architect reflections, sub-agent <think>,
-        skill matches, self-check verdicts). Returns None when:
-          - the user has collapsed the panel (`self.show_reasoning = False`)
-          - there's nothing to show yet
+        Each `architect` entry starts a new step. Subsequent non-architect
+        entries (agent <think>, skill matches, self-check verdicts) are
+        attached as substeps of the latest step. Pre-architect events
+        get a synthetic placeholder so they don't get dropped.
 
-        Each entry is rendered as one line:
-            ◈ architect → executor  goal: Add the function · observation: ...
-            ✦ general                think: A morning routine could include...
-            ⚐ self-check             missing 'specific exercises'
+        Returns: list[{head: entry, subs: [entries], status: str}]
+        where status is "done" for all but the last, which is "in_progress"
+        (or "complete" if the last substep was a self-check that passed).
         """
+        steps: list = []
+        for entry in self.reasoning_log:
+            if entry["kind"] == "architect":
+                steps.append({"head": entry, "subs": []})
+            else:
+                if not steps:
+                    # Edge case: a sub-agent emitted thinking before any
+                    # architect step (fast-route path). Synthesize a head
+                    # so the substep still has somewhere to attach.
+                    steps.append({
+                        "head": {
+                            "kind": "agent",
+                            "label": entry.get("label", "agent"),
+                            "body": "(direct route — no architect plan)",
+                            "time": entry.get("time", 0),
+                        },
+                        "subs": [],
+                    })
+                steps[-1]["subs"].append(entry)
+
+        # Status assignment. Last step is in_progress while the run is
+        # ongoing; everything before it is done.
+        for i, step in enumerate(steps):
+            if i < len(steps) - 1:
+                step["status"] = "done"
+            else:
+                # If the last substep was a self_check with an 'ok'
+                # verdict, the step itself completed cleanly.
+                last_sub = step["subs"][-1] if step["subs"] else None
+                if (
+                    last_sub is not None
+                    and last_sub["kind"] == "self_check"
+                    and "ok" in (last_sub["body"] or "").lower()
+                    and "missing" not in (last_sub["body"] or "").lower()
+                ):
+                    step["status"] = "done"
+                elif not self.is_generating:
+                    # Run finished — the last step is also done.
+                    step["status"] = "done"
+                else:
+                    step["status"] = "in_progress"
+        return steps
+
+    def _render_reasoning_panel(self):
+        """Unified Reasoning panel rendered as a TODO list.
+
+        Each step (one architect decision + the sub-agent activity that
+        followed) is a numbered row with a status icon:
+            ● 1. architect → executor — Add foo() to bar.py
+            ● 2. architect → executor — Run the tests
+            ▸ 3. architect → executor — Apply the fix      ← current
+                ✦ executor: think: need to handle the empty-input edge
+                ⚐ self-check: ok
+
+        Pending future steps aren't shown because they aren't known
+        ahead of time — the architect picks the next step adaptively.
+        The title shows the running step counter so progress is obvious.
+
+        Returns None when the user has collapsed the panel and the log
+        is empty; returns a one-line chip when collapsed but the log
+        has entries.
+        """
+        REASON_COLOR = "#9999cc"
+
         if not self.show_reasoning:
-            # Even when collapsed, show a one-line summary chip so the
-            # user knows reasoning IS happening — otherwise the panel
-            # vanishes and the chat feels like the agent is silent.
+            # Collapsed: a one-line chip so the user knows reasoning IS
+            # happening. Shows the latest step's headline.
             if not self.reasoning_log:
                 return None
-            n = len(self.reasoning_log)
-            latest = self.reasoning_log[-1]
-            preview = latest["body"]
+            steps = self._group_reasoning_into_steps()
+            n = len(steps)
+            head = steps[-1]["head"] if steps else {"body": "", "label": ""}
+            preview = head["body"].split("·")[0].strip()
             if len(preview) > 80:
                 preview = preview[:77] + "…"
-            REASON_COLOR = "#9999cc"
             line = Text()
-            line.append(f"🧠 reasoning ({n}) · ", style=f"dim {REASON_COLOR}")
+            line.append(f"🧠 reasoning · step {n} · ", style=f"dim {REASON_COLOR}")
             line.append(preview, style=f"italic dim {REASON_COLOR}")
             line.append("   [Ctrl+R] expand", style=f"dim {DIM}")
             return line
@@ -1052,29 +1112,84 @@ class ChatUI:
         if not self.reasoning_log:
             return None
 
-        REASON_COLOR = "#9999cc"
-        # Icon per source kind. Architect/agent borrow the role icon
-        # via the theme; skills and self-check have fixed glyphs.
-        kind_icons = {
-            "architect": "◈",
-            "agent": "✦",
-            "skill": "⚑",
+        steps = self._group_reasoning_into_steps()
+        n_steps = len(steps)
+
+        # Status icons mirror the plan panel's vocabulary so the user
+        # learns ONE visual language for "step state" across the UI.
+        status_glyphs = {
+            "done":        ("●", "#5fd75f"),    # green
+            "in_progress": ("▸", "#5fafff"),    # executor-blue
+            "failed":      ("✗", "#e85a5a"),
+        }
+        sub_glyphs = {
+            "agent":      "✦",
+            "skill":      "⚑",
             "self_check": "⚐",
         }
+
+        # Cap to the last 12 steps so a runaway architect doesn't blow
+        # out the panel. Earlier steps roll off the top of the panel —
+        # the conversation history already has the full record.
+        visible_steps = steps[-12:]
+        truncated = len(steps) - len(visible_steps)
+
         body = Text()
-        for i, entry in enumerate(self.reasoning_log[-15:]):  # cap to last 15
-            icon = kind_icons.get(entry["kind"], "·")
-            label = entry["label"]
-            text = entry["body"]
-            if len(text) > 240:
-                text = text[:237] + "…"
-            body.append(f"{icon} ", style=f"bold {REASON_COLOR}")
-            body.append(f"{label:<18}", style=f"bold dim {REASON_COLOR}")
-            body.append(text, style=f"italic {REASON_COLOR}")
-            if i < min(len(self.reasoning_log), 15) - 1:
+        if truncated > 0:
+            body.append(f"  … ({truncated} earlier step{'s' if truncated != 1 else ''} hidden)\n",
+                        style=f"dim {DIM}")
+
+        # Step numbering starts at the original (un-trimmed) index so
+        # the user still sees "step 7", "step 8" even after rolling.
+        start_n = truncated + 1
+        for offset, step in enumerate(visible_steps):
+            step_n = start_n + offset
+            head = step["head"]
+            status = step["status"]
+            glyph, gcolor = status_glyphs.get(status, ("○", DIM))
+            weight = "bold " if status == "in_progress" else ""
+
+            # Compact headline from the architect entry: prefer just
+            # the goal field if we can isolate it, else the full body
+            # truncated.
+            headline = head["body"]
+            # The architect-entry format is "goal: X · observation: Y · critical_thinking: Z"
+            # — yank just "goal: X" when present so the row stays scannable.
+            if "goal:" in headline:
+                # Take the goal segment, drop the leading "goal: " prefix
+                goal_part = headline.split("·")[0].strip()
+                if goal_part.startswith("goal:"):
+                    goal_part = goal_part[len("goal:"):].strip()
+                headline = goal_part
+            if len(headline) > 110:
+                headline = headline[:107] + "…"
+
+            body.append(f"  {glyph} ", style=f"{weight}{gcolor}")
+            body.append(f"{step_n}. ", style=f"dim {DIM}")
+            body.append(f"{head['label']} ", style=f"{weight}dim {REASON_COLOR}")
+            body.append("— ", style=f"dim {DIM}")
+            body.append(headline, style=f"{weight}italic {REASON_COLOR}")
+            body.append("\n")
+
+            # Substeps: shown for the CURRENT step always, and for
+            # earlier steps only when they carry meaningful detail
+            # (skill matches and self-check verdicts — agent <think>
+            # blocks roll off to keep the panel compact).
+            for sub in step["subs"]:
+                if status == "done" and sub["kind"] == "agent":
+                    continue  # roll off old <think> blocks
+                sub_glyph = sub_glyphs.get(sub["kind"], "·")
+                sub_text = sub["body"]
+                if len(sub_text) > 140:
+                    sub_text = sub_text[:137] + "…"
+                body.append("       ", style="")  # 7-space indent for substep
+                body.append(f"{sub_glyph} ", style=f"{REASON_COLOR}")
+                body.append(f"{sub['label']}: ", style=f"dim {REASON_COLOR}")
+                body.append(sub_text, style=f"italic dim {REASON_COLOR}")
                 body.append("\n")
-        n = len(self.reasoning_log)
-        title = f"🧠 Reasoning  ·  {n} entr{'y' if n == 1 else 'ies'}"
+
+        # Title: count + current step indicator
+        title = f"🧠 Reasoning  ·  step {n_steps}  ·  {len(steps)} total"
         return Panel(
             body,
             title=f"[bold {REASON_COLOR}]{title}[/bold {REASON_COLOR}]  [dim {DIM}](Ctrl+R / /reasoning)[/dim {DIM}]",

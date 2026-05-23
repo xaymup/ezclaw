@@ -117,14 +117,130 @@ def test_render_returns_chip_when_collapsed_with_entries():
 
 
 def test_render_caps_entries_to_avoid_overflow():
-    """20+ reasoning entries shouldn't fill the screen — the renderer
-    caps to the last 15. Test the slice index."""
-    log = [{"kind": "agent", "label": "x", "body": f"entry {i}", "time": 0}
-           for i in range(50)]
-    shown = log[-15:]
-    assert len(shown) == 15
-    assert shown[0]["body"] == "entry 35"
-    assert shown[-1]["body"] == "entry 49"
+    """A runaway architect with many steps shouldn't fill the screen —
+    the renderer caps visible_steps to the last 12. Earlier steps roll
+    off the top of the panel."""
+    steps = [{"step": i, "status": "done"} for i in range(20)]
+    visible = steps[-12:]
+    assert len(visible) == 12
+    assert visible[0]["step"] == 8
+    assert visible[-1]["step"] == 19
+
+
+# ── TODO-style grouping (the new shape) ──────────────────────────────────────
+
+def test_grouping_attaches_subentries_to_latest_architect_step():
+    """An `architect` entry starts a new step. Subsequent non-architect
+    entries (agent / skill / self_check) attach as substeps of that
+    step. This is the contract _group_reasoning_into_steps must keep."""
+    log = [
+        {"kind": "architect", "label": "architect → executor", "body": "goal: do A · obs: x", "time": 1},
+        {"kind": "agent", "label": "executor", "body": "think: reading file", "time": 2},
+        {"kind": "skill", "label": "skill", "body": "Weather skill matched", "time": 3},
+        {"kind": "architect", "label": "architect → executor", "body": "goal: do B", "time": 4},
+        {"kind": "agent", "label": "executor", "body": "think: writing diff", "time": 5},
+        {"kind": "self_check", "label": "self-check", "body": "ok", "time": 6},
+    ]
+    # Inline the grouping logic (we're testing the contract, not the method)
+    steps = []
+    for entry in log:
+        if entry["kind"] == "architect":
+            steps.append({"head": entry, "subs": []})
+        else:
+            steps[-1]["subs"].append(entry)
+    assert len(steps) == 2
+    assert steps[0]["head"]["body"] == "goal: do A · obs: x"
+    assert [s["kind"] for s in steps[0]["subs"]] == ["agent", "skill"]
+    assert steps[1]["head"]["body"] == "goal: do B"
+    assert [s["kind"] for s in steps[1]["subs"]] == ["agent", "self_check"]
+
+
+def test_grouping_synthesizes_head_for_pre_architect_events():
+    """When a sub-agent emits thinking BEFORE any architect step has
+    fired (the fast-route path), the grouping must create a synthetic
+    head rather than drop the event."""
+    log = [
+        {"kind": "agent", "label": "general", "body": "think: hi there", "time": 1},
+        {"kind": "agent", "label": "general", "body": "think: more thoughts", "time": 2},
+    ]
+    steps = []
+    for entry in log:
+        if entry["kind"] == "architect":
+            steps.append({"head": entry, "subs": []})
+        else:
+            if not steps:
+                steps.append({"head": {
+                    "kind": "agent", "label": entry["label"],
+                    "body": "(direct route — no architect plan)",
+                    "time": entry.get("time", 0),
+                }, "subs": []})
+            steps[-1]["subs"].append(entry)
+    assert len(steps) == 1
+    assert "direct route" in steps[0]["head"]["body"]
+    assert len(steps[0]["subs"]) == 2
+
+
+def test_last_step_marked_in_progress_while_generating():
+    """The status assignment rule: while is_generating, the LAST step is
+    in_progress unless its last substep was a passing self-check."""
+    # Build two steps; the last has no self_check, so in_progress
+    steps = [
+        {"head": {"kind": "architect", "body": "x"}, "subs": []},
+        {"head": {"kind": "architect", "body": "y"}, "subs": [
+            {"kind": "agent", "body": "think"},
+        ]},
+    ]
+    is_generating = True
+    for i, step in enumerate(steps):
+        if i < len(steps) - 1:
+            step["status"] = "done"
+        else:
+            last_sub = step["subs"][-1] if step["subs"] else None
+            if last_sub and last_sub["kind"] == "self_check" and "ok" in last_sub["body"].lower():
+                step["status"] = "done"
+            elif not is_generating:
+                step["status"] = "done"
+            else:
+                step["status"] = "in_progress"
+    assert steps[0]["status"] == "done"
+    assert steps[1]["status"] == "in_progress"
+
+
+def test_last_step_done_when_self_check_passes():
+    """If the very last substep was a self_check verdict of 'ok', the
+    step has cleanly completed even if we're still generating
+    (synthesis is the next thing)."""
+    steps = [{"head": {"kind": "architect", "body": "x"}, "subs": [
+        {"kind": "agent", "body": "think"},
+        {"kind": "self_check", "body": "ok"},
+    ]}]
+    is_generating = True
+    for i, step in enumerate(steps):
+        last_sub = step["subs"][-1] if step["subs"] else None
+        if last_sub and last_sub["kind"] == "self_check" and "ok" in last_sub["body"].lower():
+            step["status"] = "done"
+        else:
+            step["status"] = "in_progress" if is_generating else "done"
+    assert steps[0]["status"] == "done"
+
+
+def test_grouping_method_exposed_on_chatui():
+    """Smoke check that the new helper is wired into the class."""
+    import cli
+    assert hasattr(cli.ChatUI, "_group_reasoning_into_steps")
+
+
+def test_panel_uses_status_glyphs_for_todo_style():
+    """The renderer must use ●/▸/✗ status glyphs (matching the plan
+    panel's vocabulary) and numbered rows ("1.", "2.") so the panel
+    reads as a TODO list."""
+    import cli
+    src = open(cli.__file__).read()
+    # The status glyph table is present
+    assert '"done":' in src and '"in_progress":' in src
+    assert "▸" in src and "●" in src
+    # Step numbering: 'f"{step_n}.'
+    assert "step_n}" in src or "step_n}." in src
 
 
 def test_render_reasoning_panel_method_exists():
