@@ -18,6 +18,7 @@ from tools import (
     _build_sandbox_env,
     _ENV_ALLOWLIST,
     _ensure_workspace_self_symlink,
+    _run_shell_interactive,
     _skill_filename,
     run_shell,
     WORKSPACE_DIR,
@@ -183,6 +184,55 @@ def test_workspace_workspace_path_resolves_through_symlink_to_workspace():
     # Cleanup
     if os.path.lexists(canary_at_root):
         os.remove(canary_at_root)
+
+
+# ── Interactive shell: structured output for the agent ────────────────────
+
+@pytest.mark.skipif(os.name == "nt", reason="pty is POSIX-only")
+def test_interactive_returns_structured_header_with_output():
+    """The agent's next turn sees a clear summary: command + exit code +
+    duration + captured output. Used to be just the raw stream which
+    made empty output indistinguishable from a failed command."""
+    workspace = os.path.abspath(WORKSPACE_DIR)
+    os.makedirs(workspace, exist_ok=True)
+    env = _build_sandbox_env()
+    out = _run_shell_interactive(
+        "echo 'hello' && echo 'world'",
+        workspace_cwd=workspace,
+        sandbox_env=env,
+    )
+    assert "[Interactive shell session" in out
+    assert "succeeded" in out
+    assert "Exit code: 0" in out
+    assert "Duration:" in out
+    assert "hello" in out
+    assert "world" in out
+
+
+@pytest.mark.skipif(os.name == "nt", reason="pty is POSIX-only")
+def test_interactive_explains_empty_output_case():
+    """Commands like `true` produce zero stdout. The result must STILL
+    tell the agent it succeeded, not return a bare 'Interactive command
+    completed' that hides the exit code."""
+    workspace = os.path.abspath(WORKSPACE_DIR)
+    os.makedirs(workspace, exist_ok=True)
+    env = _build_sandbox_env()
+    out = _run_shell_interactive("true", workspace_cwd=workspace, sandbox_env=env)
+    assert "Exit code: 0" in out
+    assert "succeeded" in out
+    assert "no terminal output captured" in out
+
+
+@pytest.mark.skipif(os.name == "nt", reason="pty is POSIX-only")
+def test_interactive_surfaces_nonzero_exit_code():
+    """A failing command must be marked failed in the header so the agent
+    knows to retry or escalate, not silently treat it as success."""
+    workspace = os.path.abspath(WORKSPACE_DIR)
+    os.makedirs(workspace, exist_ok=True)
+    env = _build_sandbox_env()
+    out = _run_shell_interactive("false", workspace_cwd=workspace, sandbox_env=env)
+    assert "Exit code: 1" in out
+    assert "failed" in out
 
 
 # ── Skill path-traversal protection ────────────────────────────────────────

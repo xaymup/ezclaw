@@ -359,11 +359,20 @@ def _run_shell_interactive(command: str, workspace_cwd: str, sandbox_env: dict) 
     """Interactive shell via a pty pair, with the same sandboxing as the
     non-interactive path. The parent's cwd is NEVER mutated — cwd flows
     through Popen's `cwd=` kwarg directly to the forked child.
+
+    The returned string is a structured report — header with command,
+    exit code, duration, and byte count, followed by the cleaned terminal
+    output. The structured form lets the agent's next turn reason about
+    whether the interactive session actually succeeded; the old format
+    was just the raw stream which was easy to mis-interpret (especially
+    when the subprocess produced no output, like a successful `sudo true`).
     """
     import pty
     import select
     import sys
+    import time as _time
 
+    start_time = _time.time()
     master_fd, slave_fd = pty.openpty()
     output_data: list[bytes] = []
     proc = None
@@ -458,7 +467,39 @@ def _run_shell_interactive(command: str, workspace_cwd: str, sandbox_env: dict) 
 
     full_output = b"".join(output_data).decode("utf-8", errors="ignore")
     clean_output = re.sub(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])", "", full_output)
-    return clean_output or "Interactive command completed."
+    # Also strip carriage-return-only lines that leak through cursor moves
+    # (e.g. progress bars), and trim trailing blank lines.
+    clean_output = "\n".join(
+        line.rstrip("\r") for line in clean_output.splitlines()
+        if line.strip("\r")
+    ).strip()
+
+    duration = _time.time() - start_time
+    exit_code = proc.returncode if proc is not None else None
+    status = (
+        "succeeded" if exit_code == 0
+        else f"failed (exit code {exit_code})" if exit_code is not None
+        else "did not exit cleanly"
+    )
+
+    # Structured report so the agent's next turn can reason about what
+    # happened. Without this, an empty output stream + missing exit code
+    # made successful interactive commands look indistinguishable from
+    # failed ones in the model's context.
+    header = (
+        f"[Interactive shell session — {status}]\n"
+        f"Command: {command}\n"
+        f"Exit code: {exit_code}\n"
+        f"Duration: {duration:.1f}s\n"
+        f"Captured terminal output ({len(clean_output)} chars):\n"
+        f"───\n"
+    )
+    body = clean_output if clean_output else (
+        "(no terminal output captured — common for commands that exit "
+        "silently like a successful `sudo true`, a background daemon "
+        "launch, or a command whose only side effect is filesystem changes)"
+    )
+    return header + body
 
 @registry.register(auth_required=True)
 def read_file(path: str) -> str:
