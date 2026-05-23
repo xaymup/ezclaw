@@ -145,3 +145,86 @@ def test_plan_handles_multiple_blocks_in_order(tmp_path):
     assert len(plans) == 2
     assert plans[0].block.path == "a.py"
     assert plans[1].block.path == "b.py"
+
+
+# ── apply_save ──────────────────────────────────────────────────────────────
+
+from inline_code_saver import SaveResult, apply_save
+
+
+def test_apply_write_creates_new_file(tmp_path):
+    block = ParsedBlock(
+        raw_open_fence="```python:foo.py", lang="python",
+        path="foo.py", body="x = 1", start=0, end=0,
+    )
+    plan = PlannedSave(block=block, abs_target=str(tmp_path / "foo.py"), exists=False, error=None)
+    result = apply_save(plan, "write")
+    assert result.status == "succeeded"
+    assert result.final_path == str(tmp_path / "foo.py")
+    assert (tmp_path / "foo.py").read_text() == "x = 1"
+
+
+def test_apply_skip_does_not_touch_disk(tmp_path):
+    (tmp_path / "existing.py").write_text("OLD")
+    block = ParsedBlock(
+        raw_open_fence="```python:existing.py", lang="python",
+        path="existing.py", body="NEW", start=0, end=0,
+    )
+    plan = PlannedSave(block=block, abs_target=str(tmp_path / "existing.py"), exists=True, error=None)
+    result = apply_save(plan, "skip")
+    assert result.status == "skipped"
+    assert (tmp_path / "existing.py").read_text() == "OLD"
+
+
+def test_apply_rename_writes_to_next_free_suffix(tmp_path):
+    (tmp_path / "foo.py").write_text("OLD")
+    block = ParsedBlock(
+        raw_open_fence="```python:foo.py", lang="python",
+        path="foo.py", body="NEW", start=0, end=0,
+    )
+    plan = PlannedSave(block=block, abs_target=str(tmp_path / "foo.py"), exists=True, error=None)
+    result = apply_save(plan, "rename")
+    assert result.status == "renamed"
+    assert result.final_path == str(tmp_path / "foo.1.py")
+    assert (tmp_path / "foo.1.py").read_text() == "NEW"
+    assert (tmp_path / "foo.py").read_text() == "OLD"
+
+
+def test_apply_rename_finds_next_free_when_dot1_taken(tmp_path):
+    (tmp_path / "foo.py").write_text("OLD")
+    (tmp_path / "foo.1.py").write_text("OLDER")
+    block = ParsedBlock(
+        raw_open_fence="```python:foo.py", lang="python",
+        path="foo.py", body="NEW", start=0, end=0,
+    )
+    plan = PlannedSave(block=block, abs_target=str(tmp_path / "foo.py"), exists=True, error=None)
+    result = apply_save(plan, "rename")
+    assert result.status == "renamed"
+    assert result.final_path == str(tmp_path / "foo.2.py")
+
+
+def test_apply_creates_parent_dirs(tmp_path):
+    block = ParsedBlock(
+        raw_open_fence="```python:src/nested/foo.py", lang="python",
+        path="src/nested/foo.py", body="x", start=0, end=0,
+    )
+    plan = PlannedSave(
+        block=block,
+        abs_target=str(tmp_path / "src" / "nested" / "foo.py"),
+        exists=False, error=None,
+    )
+    result = apply_save(plan, "write")
+    assert result.status == "succeeded"
+    assert (tmp_path / "src" / "nested" / "foo.py").exists()
+
+
+def test_apply_overwrite_replaces_existing_file(tmp_path):
+    (tmp_path / "foo.py").write_text("OLD")
+    block = ParsedBlock(
+        raw_open_fence="```python:foo.py", lang="python",
+        path="foo.py", body="NEW", start=0, end=0,
+    )
+    plan = PlannedSave(block=block, abs_target=str(tmp_path / "foo.py"), exists=True, error=None)
+    result = apply_save(plan, "write")
+    assert result.status == "succeeded"
+    assert (tmp_path / "foo.py").read_text() == "NEW"

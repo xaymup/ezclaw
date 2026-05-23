@@ -96,3 +96,43 @@ def plan_saves(blocks: List[ParsedBlock], workspace_root: str) -> List[PlannedSa
             error=None,
         ))
     return result
+
+
+@dataclass(frozen=True)
+class SaveResult:
+    plan: PlannedSave
+    status: str                  # 'succeeded' | 'skipped' | 'renamed' | 'rejected'
+    final_path: Optional[str]
+
+
+def _next_free_suffix(abs_target: str) -> str:
+    """Return abs_target with a `.N.ext` suffix where N is the smallest
+    positive integer such that the resulting path does not exist."""
+    base, ext = os.path.splitext(abs_target)
+    n = 1
+    while True:
+        candidate = f"{base}.{n}{ext}"
+        if not os.path.exists(candidate):
+            return candidate
+        n += 1
+
+
+def apply_save(plan: PlannedSave, choice: str) -> SaveResult:
+    """Execute the save per the user's choice. Returns a SaveResult."""
+    if plan.error is not None or plan.abs_target is None:
+        return SaveResult(plan=plan, status="rejected", final_path=None)
+
+    if choice == "skip":
+        return SaveResult(plan=plan, status="skipped", final_path=None)
+
+    if choice == "rename" and plan.exists:
+        target = _next_free_suffix(plan.abs_target)
+        status = "renamed"
+    else:
+        target = plan.abs_target
+        status = "succeeded"
+
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    with open(target, "w") as f:
+        f.write(plan.block.body)
+    return SaveResult(plan=plan, status=status, final_path=target)
