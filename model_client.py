@@ -23,7 +23,7 @@ def build_architect_client():
             timeout=timeout,
         ), os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
     import ollama
-    return ollama.Client(host=OLLAMA_HOST, timeout=timeout), os.getenv("OLLAMA_ARCHITECT_MODEL", "phi4-reasoning:plus")
+    return ollama.Client(host=OLLAMA_HOST, timeout=timeout), os.getenv("OLLAMA_ARCHITECT_MODEL", "qwen3:14b")
 
 def build_agent_client():
     import ollama

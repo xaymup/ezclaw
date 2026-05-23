@@ -16,23 +16,33 @@ OLLAMA_HOST = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 
 AGENT_DEFS = {
     "executor": {
-        "model": os.getenv("OLLAMA_MODEL", "qwen3:14b"),
+        "model": os.getenv("OLLAMA_MODEL", "qwen2.5-coder:14b"),
         "system_prompt": """You are EzClaw's **Executor** — you receive a numbered plan and execute it step by step using tools.
 
 ## Core Rules
-- The user message contains ## Instructions with a numbered plan. Follow it in order.
-- After each tool result, proceed to the NEXT step. Do NOT repeat a step.
+- **Verification-Driven Autonomy (Test-First)**: For every coding task or bug fix:
+    1. **Reproduce**: Create or identify a test/script that fails due to the issue.
+    2. **Fix**: Implement the changes.
+    3. **Verify**: Run the test/script to confirm the fix works.
+    - A task is NOT complete until the verification command passes.
+- **Environment Awareness**: At the start of a task, use `get_system_info` to understand the OS, user permissions, and available package managers.
+- **Interactive Shell Handling**: 
+    - ALWAYS use `interactive=True` for commands that require user input (e.g., `sudo`, `pacman`, `apt`, `pip` installs that might prompt, `vim`, `ssh`).
+    - When running an interactive command, tell the user in your reasoning that they may need to provide input (like a password).
+- **Workspace Awareness**: Files are usually in the root or a `workspace/` folder. Always check both if a file is not found.
+- **Verification First**: Before modifying or copying a file, verify its existence and content to avoid redundant work.
+- After each tool result, proceed to the NEXT step. Do NOT repeat a step unless it failed and you have a new approach.
 - Do NOT ask questions. Do NOT say "how can I help". Just execute.
 - If a step fails, retry once with adjusted input, then report and move on.
-- When all steps are done, summarize what was accomplished in 2-3 sentences.
+- When all steps are done, provide a comprehensive summary of what was accomplished and the final state of the task.
 
 ## Output
-- Lead with results, not commentary.
+- **Be Verbose**: Provide detailed commentary on your progress. Explain what you found in tool results and why you are moving to the next step.
 - Show diffs for edits, summaries for long output.
 - After running a command, include relevant output (errors, key lines).""",
     },
     "researcher": {
-        "model": os.getenv("OLLAMA_RESEARCHER_MODEL", "qwen3:14b"),
+        "model": os.getenv("OLLAMA_RESEARCHER_MODEL", "qwen3.5:9b"),
         "system_prompt": """You are EzClaw's **Researcher** — gather and synthesize information from the web.
 
 Rules:
@@ -54,24 +64,26 @@ Source quality: Prefer official docs, reputable sources, recent dates. Note when
 
 Rules:
 - Respond in plain text. No JSON.
-- Lead with the root cause, then the fix.
+- Provide a clear, actionable fix that an Executor can apply.
 
 Debug methodology:
 1. **Reproduce**: Run the code/command to see the error yourself.
 2. **Isolate**: Read relevant files. Identify the exact line/component failing.
-3. **Root cause**: What is the fundamental issue? (wrong logic, missing case, type error, race condition, API change)
-4. **Fix**: Minimal, targeted change. Fix the cause, not the symptom.
-5. **Verify**: Run again to confirm the fix works.
+3. **Root cause**: What is the fundamental issue?
+4. **Fix**: Provide a minimal, targeted, and VERIFIABLE fix.
 
-Format:
+## Output Format:
 ## Analysis
-(what you examined, the flow, your reasoning)
+(What you examined, the flow, your reasoning)
 
 ## Root Cause
-(one sentence: what, where, why)
+(One sentence: what, where, why)
 
-## Fix
-(exact change needed, with file path and line references)""",
+## Proposed Fix
+(The EXACT change needed, with file path and line references. Provide the code block clearly.)
+
+## Verification
+(How the executor should verify the fix works)""",
     },
     "general": {
         "model": os.getenv("OLLAMA_GENERAL_MODEL", "qwen3.5:9b"),
@@ -362,29 +374,43 @@ class Architect:
         self.use_deepseek = os.getenv("ARCHITECT_PROVIDER", "ollama") == "deepseek"
         self.messages: List[Dict] = [{
             "role": "system",
-            "content": """You are the **Architect** — a senior systems designer and orchestrator. Your job is to maintain the global state of the conversation and route specific tasks to specialized agents.
+            "content": """You are the **Architect** — a senior systems designer and the COMMUNICATIONS HUB for EzClaw. Your job is to orchestrate a seamless workflow between specialized agents using advanced **Chain-of-Thought (CoT)** reasoning.
 
-## Your Responsibilities:
-1. **Context Tracking**: Always consider the ## Conversation History. Understand if the current request is a follow-up, a correction, or a new task.
-2. **State Management**: Track what has already been done in the current session. Do not repeat failed steps without a new strategy.
-3. **Decomposition**: Break complex requests into concrete, numbered plans.
-4. **Validation**: Review results from specialized agents to decide if the task is truly complete or needs further refinement.
+## Your Critical Thinking Protocol:
+Before deciding on an action, you must perform a mandatory reflection:
+1. **Goal Analysis**: What is the ultimate objective? Are we closer to it than in the previous step?
+2. **Observation**: What EXACTLY happened in the latest step? Did it return [SUCCESS] or [FAILURE]? What were the tool results?
+3. **Critical Pivot**: Is the current agent or plan working? If we see [FAILURE] or repetition, why is it happening, and how must the strategy change?
+4. **Verification**: How will we know the final result is actually correct?
 
-## Agents:
-All agents have access to ALL tools. Route based on their expertise:
-- **executor**: File edits, shell commands, code implementation, memory management.
-- **researcher**: Web searching, documentation gathering, information synthesis.
-- **debugger**: Root-cause analysis of errors found during execution.
-- **general**: Conversational responses, greetings, simple advice.
+## Routing Protocol:
+- **executor**: File edits, shell commands, code implementation, memory management, verification runs.
+- **researcher**: Web searching, documentation gathering.
+- **debugger**: Root-cause analysis. Only route here for UNEXPECTED errors.
+- **general**: Conversational responses.
+
+## Handoff Protocol:
+- YOU handle all handoffs. Summarize the findings of the previous agent for the next one.
+- If the current agent failed ([FAILURE]), diagnose the cause. Route to `debugger` if needed, or to `executor` with a REFINED strategy.
 
 ## Completion Rules:
-- Set `complete:true` ONLY when the user's FULL original intent is satisfied.
-- If an agent failed but provided a partial answer that is sufficient for the user, you may complete.
-- If more steps are needed to verify a fix or polish a result, keep `complete:false`.
+- Set `complete:true` ONLY when the user's FULL original intent is satisfied AND verified.
 
 ## Response Format:
 Return ONLY valid JSON:
-{"category": "technical|research|chat", "reasoning": "Internal logic for this routing choice", "recommended_agent": "executor|general|researcher|debugger", "plan": "Numbered steps for the agent", "complete": false}""",
+{
+  "reflection": {
+    "goal": "Current objective",
+    "observation": "What was learned in the last step",
+    "critical_thinking": "Analysis of progress and why the next action is chosen"
+  },
+  "category": "technical|research|chat",
+  "reasoning": "Internal logic for this routing choice",
+  "recommended_agent": "executor|general|researcher|debugger",
+  "plan": "Numbered steps for the agent",
+  "pivot_reasoning": "If strategy changed",
+  "complete": false
+}""",
         }]
 
     def _prune_messages(self):
@@ -420,45 +446,62 @@ Return ONLY valid JSON:
         )
         return resp["message"]["content"].strip()
 
-    def analyze(self, task_context: str, memory_block: str = "", skills_block: str = "", experiences_block: str = "", routing_block: str = "", history_block: str = "") -> Dict[str, Any]:
+    def analyze(self, task_context: str, memory_block: str = "", skills_block: str = "", experiences_block: str = "", routing_block: str = "", history_block: str = "", map_block: str = "") -> Dict[str, Any]:
         max_prompt_len = 12000
-        blocks = [task_context, memory_block, skills_block, experiences_block, routing_block, history_block]
+        blocks = [task_context, memory_block, skills_block, experiences_block, routing_block, history_block, map_block]
         total = sum(len(b) for b in blocks)
+        
         if total > max_prompt_len:
             overflow = total - max_prompt_len
-            if overflow > 0 and len(task_context) > overflow + 500:
-                task_context = task_context[:-(overflow + 100)] + "\n... (truncated)"
+            if len(task_context) > overflow + 1000:
+                parts = task_context.split("\n\n--- Step ")
+                if len(parts) > 3:
+                     task_context = parts[0] + "\n\n... (earlier steps truncated) ...\n\n--- Step " + "\n\n--- Step ".join(parts[-2:])
+                else:
+                     task_context = task_context[:1000] + "\n... (middle truncated) ...\n" + task_context[-(len(task_context)-overflow-1500):]
 
-        has_steps = "--- Step " in task_context
-        last_had_error = any(w in task_context[-800:].lower() for w in ["error", "exception", "traceback", "failed"]) if has_steps else False
-        debugger_ran = "debugger" in task_context.split("--- Step")[-1] if has_steps else False
+        # Improved error detection: look for [FAILURE] tag in the LATEST step
+        latest_step_split = task_context.split("--- Step")
+        latest_step_content = latest_step_split[-1] if len(latest_step_split) > 1 else task_context
+        has_failure = "[FAILURE]" in latest_step_content
+        debugger_ran = "(debugger)" in latest_step_content
 
         situation = "initial"
-        if debugger_ran:
-            situation = "debugger_done"
-        elif last_had_error and has_steps:
+        if debugger_ran and not has_failure:
+            situation = "debugger_finished_fix"
+        elif has_failure:
             situation = "error_detected"
-        elif has_steps:
+        elif "--- Step" in task_context:
             situation = "mid_pipeline"
 
-        prompt = f"""## Current State: {situation}
+        prompt = f"""## Task State: {situation}
 
-{history_block}
+## Current Task Overview
 {task_context}
-{memory_block}{skills_block}{experiences_block}{routing_block}
+
+## Task History & State
+{history_block}
+
+## Auxiliary Context (For Reference Only)
+### Codebase Map
+{map_block}
+### Past Experiences
+{experiences_block}
+{memory_block}{skills_block}{routing_block}
 
 ## Decision Required
-Analyze the state above and decide the NEXT action.
+Analyze the CURRENT state using the Critical Thinking Protocol. Decide the NEXT action.
 
-Routing logic:
-- {situation} == "initial": Route based on what the user asked, considering past turns.
-- {situation} == "error_detected": Route to debugger with the error context.
-- {situation} == "debugger_done": Route to executor to apply the debugger's fix.
-- {situation} == "mid_pipeline": Check if the user's request is fully handled. If yes, complete. If no, plan next step.
-
-Your plan MUST be concrete numbered steps with specific file paths, commands, or actions.
-
-Return ONLY JSON: {{"category": "technical|research|chat", "reasoning": "1-2 sentences", "recommended_agent": "executor|general|researcher|debugger", "plan": "numbered concrete steps", "complete": false}}"""
+Return ONLY JSON: 
+{{
+  "reflection": {{"goal": "...", "observation": "...", "critical_thinking": "..."}},
+  "category": "technical|research|chat",
+  "reasoning": "...",
+  "recommended_agent": "executor|general|researcher|debugger",
+  "plan": "numbered steps",
+  "pivot_reasoning": "if needed",
+  "complete": false
+}}"""
 
         for attempt in range(2):
             try:
@@ -468,18 +511,11 @@ Return ONLY JSON: {{"category": "technical|research|chat", "reasoning": "1-2 sen
                 intent.setdefault("plan", "")
                 intent.setdefault("reasoning", "")
                 intent.setdefault("complete", False)
+                intent.setdefault("reflection", {})
 
                 valid_agents = {"executor", "general", "researcher", "debugger"}
                 if intent.get("recommended_agent") not in valid_agents:
                     intent["recommended_agent"] = "executor"
-
-                if intent["recommended_agent"] == "debugger" and not has_steps:
-                    intent["recommended_agent"] = "executor"
-                    intent["plan"] = "1. Read the relevant files and gather context\n2. Reproduce the error\n3. Pass findings to debugger"
-
-                if situation == "debugger_done" and intent["recommended_agent"] != "executor":
-                    intent["recommended_agent"] = "executor"
-                    intent["plan"] = "Apply the debugger's recommended fix and verify it works."
 
                 self.messages.append({"role": "assistant", "content": json.dumps(intent)})
                 return intent
@@ -489,8 +525,9 @@ Return ONLY JSON: {{"category": "technical|research|chat", "reasoning": "1-2 sen
                         "category": "technical",
                         "reasoning": "Fallback routing",
                         "recommended_agent": "executor",
-                        "plan": "",
+                        "plan": "Continue with the task.",
                         "complete": False,
+                        "reflection": {"critical_thinking": "Parsing failed, falling back to execution."}
                     }
                 continue
 
@@ -559,16 +596,42 @@ class MultiAgentSystem:
     # ── Routing Enhancements ──────────────────────────────────
 
     ROUTING_EXAMPLES = [
+        # General chat
         ("hello", "general"), ("hi how are you", "general"), ("thanks", "general"),
         ("goodbye", "general"), ("good morning", "general"),
+        # Research / web lookup
         ("search the web for", "researcher"), ("look up information about", "researcher"),
         ("find documentation for", "researcher"), ("what is the latest news", "researcher"),
+        # Memory operations (executor handles via memory tools)
         ("remember that my favorite color is blue", "executor"),
         ("remember my name is John", "executor"),
         ("do you remember anything about me", "executor"),
         ("what do you know about me", "executor"),
         ("what is my favorite color", "executor"),
         ("what is my name", "executor"),
+        # Development tasks — go straight to executor, skip architect cycle
+        ("write a function that", "executor"),
+        ("write a python script to", "executor"),
+        ("implement a function", "executor"),
+        ("add a new function to", "executor"),
+        ("edit the file", "executor"),
+        ("modify this file", "executor"),
+        ("update the code in", "executor"),
+        ("refactor this function", "executor"),
+        ("read the file", "executor"),
+        ("show me the contents of", "executor"),
+        ("list files in", "executor"),
+        ("run this command", "executor"),
+        ("run the tests", "executor"),
+        ("execute pytest", "executor"),
+        ("install this package", "executor"),
+        ("git status", "executor"),
+        ("git diff", "executor"),
+        ("commit these changes", "executor"),
+        ("fix the bug in", "executor"),
+        ("there is an error when", "executor"),
+        ("this is failing with", "executor"),
+        ("traceback shows", "executor"),
     ]
 
     def _short_circuit_classify(self, user_input: str) -> Optional[str]:
@@ -584,13 +647,34 @@ class MultiAgentSystem:
             lines.append(f"- Query: '{p['query'][:80]}' → {p['agent']} (success={p['success']})")
         return "\n".join(lines) + "\n"
 
+    def _summarize_experience(self, task: str, task_context: str):
+        """Generates a concise summary of a successful task for episodic memory."""
+        try:
+            prompt = f"""Summarize this successful task for future reference.
+Task: {task}
+Steps taken:
+{task_context}
+
+Return a concise summary (2-3 sentences) focused on the PROBLEM and the SOLUTION pattern.
+No fluff. No "In this task...". Just facts."""
+            
+            resp = self.architect.client.chat(
+                model=self.architect.model,
+                messages=[{"role": "user", "content": prompt}],
+                options={"temperature": 0.0, "num_ctx": 4096}
+            )
+            summary = resp["message"]["content"].strip()
+            self.db.add_experience(task, summary)
+        except Exception as e:
+            pass
+
     # ── Orchestration ──────────────────────────────────────────
 
     def run(self, user_input: str) -> Iterator[Dict[str, Any]]:
         if len(user_input) > 4000:
             user_input = user_input[:4000] + "\n... (truncated)"
         task_context = f"User Request: {user_input}"
-        max_steps = 7
+        max_steps = 15
         loop_hashes = set()
         agent_has_responded = False
         step_history = []
@@ -601,6 +685,14 @@ class MultiAgentSystem:
 
         recent_history = self._format_history()
         history_block = f"\n## Conversation History\n{recent_history}\n" if recent_history else ""
+
+        # Pillar 2: Initial Codebase Map (Generated ONCE per run)
+        codebase_map = ""
+        try:
+            from tools import generate_codebase_map
+            codebase_map = generate_codebase_map(".")
+        except: pass
+        map_block = f"\n## Codebase Map\n{codebase_map[:3000]}\n" if codebase_map else ""
 
         short_circuit_agent = self._short_circuit_classify(user_input)
         if short_circuit_agent and short_circuit_agent != "debugger":
@@ -629,7 +721,7 @@ class MultiAgentSystem:
                 return
 
         for step in range(1, max_steps + 1):
-            yield {"type": "status", "content": f"[Architect] Step {step}/{max_steps}\n"}
+            yield {"type": "status", "content": f"Architect: Analyzing task state (Step {step}/{max_steps})..."}
 
             memory_facts = self.db.search_memories_hybrid(user_input[:1000], alpha=0.6)
             memory_block = f"\n[Memory]: {memory_facts}\n" if memory_facts else ""
@@ -639,27 +731,60 @@ class MultiAgentSystem:
             routing_priors = self.db.search_similar_routing(user_input[:1000], limit=3)
             routing_block = self._format_routing_priors(routing_priors)
 
+            # Pillar 1: Lessons Learned (Experiences)
+            experiences = self.db.search_experiences(user_input[:1000], limit=2)
+            exp_block = "\n## Lessons Learned from Past Tasks\n" + "\n".join([f"- Task: {e['task']}\n  Result: {e['trace']}" for e in experiences]) + "\n" if experiences else ""
+
             self._prune_architect()
-            intent = self.architect.analyze(task_context, memory_block, skills_block, routing_block=routing_block, history_block=history_block)
+            intent = self.architect.analyze(task_context, memory_block, skills_block, routing_block=routing_block, history_block=history_block, map_block=map_block, experiences_block=exp_block)
+            
+            # Yield the full intent for UI display (Reflection + Plan)
+            yield {
+                "type": "intent",
+                "reflection": intent.get("reflection"),
+                "reasoning": intent.get("reasoning"),
+                "plan": intent.get("plan"),
+                "agent": intent.get("recommended_agent"),
+                "complete": intent.get("complete")
+            }
 
             if intent.get("complete") and agent_has_responded:
-                yield {"type": "status", "content": "Done.\n"}
-                self._conversation_history.append({"user": user_input, "assistant": final_response.strip()})
+                yield {"type": "status", "content": "Task completed successfully."}
+                final_text = final_response.strip() if final_response else "Task completed."
+                self._conversation_history.append({"user": user_input, "assistant": final_text})
+                
+                # PILLAR 1: Store experience
+                self._summarize_experience(user_input, task_context)
                 break
 
             agent_key = intent.get("recommended_agent", "executor")
             agent = self.agents.get(agent_key)
             if not agent:
-                yield {"type": "status", "content": "Done.\n"}
+                yield {"type": "status", "content": "Architect: Finalizing response..."}
                 self._conversation_history.append({"user": user_input, "assistant": final_response.strip()})
                 break
 
             plan = intent.get("plan") or intent.get("reasoning", "") or "Executing..."
+            
+            # Ensure plan is hashable (it might be a list of steps)
+            plan_str = str(plan)
+            
+            # IMPROVED LOOP DETECTION: Hash (agent_key, plan)
+            # This detects if the architect is stuck sending the same agent the same plan.
+            agent_plan_hash = hash((agent_key, plan_str))
+            if agent_plan_hash in loop_hashes:
+                yield {"type": "status", "content": "System: Loop detected, stopping execution."}
+                break
+            loop_hashes.add(agent_plan_hash)
+
             yield {
                 "type": "reasoning",
                 "content": f"[{agent_key}] {plan}\n",
             }
-            yield {"type": "status", "content": f"[{agent_key}]\n"}
+            if intent.get("pivot_reasoning"):
+                 yield {"type": "reasoning", "content": f"[Pivot] {intent['pivot_reasoning']}\n"}
+
+            yield {"type": "status", "content": f"{agent_key.capitalize()}: Working..."}
 
             instruction = intent.get("plan") or intent.get("reasoning", "Execute the next step.")
 
@@ -691,43 +816,19 @@ class MultiAgentSystem:
             if step_output.strip():
                 final_response = step_output.strip()
 
-            delegate_match = None
-            for r in step_tool_results:
-                m = re.search(r'\[DELEGATE:(\w+)\](.*?)\[/DELEGATE\]', r)
-                if m:
-                    delegate_match = (m.group(1), m.group(2))
-                    break
-
-            if delegate_match:
-                target_key, delegate_instruction = delegate_match
-                target_agent = self.agents.get(target_key)
-                if target_agent:
-                    yield {"type": "status", "content": f"{agent_key} -> {target_key}\n"}
-                    del_output_parts = []
-                    del_tool_results = []
-                    for chunk in target_agent.chat_stream(
-                        f"## Instructions\n{delegate_instruction}\n\n## Original Request\n{user_input}"
-                    ):
-                        if chunk["type"] == "content":
-                            del_output_parts.append(chunk["content"])
-                        elif chunk["type"] == "tool_end":
-                            del_tool_results.append(f"  [{chunk['name']}]: {str(chunk['result'])[:500]}")
-                        yield chunk
-                    del_output = "".join(del_output_parts)
-                    if not del_output.strip() and del_tool_results:
-                        del_output = "Done."
-                        yield {"type": "content", "content": "Done."}
-                    step_output += f"\n\n[Delegated to {target_key}]: {del_output}"
-                    step_tool_results.extend(del_tool_results)
-                    agent_key = target_key
-
             agent_has_responded = bool(step_output.strip() or step_tool_results)
 
+            # Determine if step was a success or failure
+            had_error = any(w in step_output.lower() for w in ["error:", "exception:", "traceback", "failed to"]) or \
+                        any("error" in r.lower() or "not found" in r.lower() for r in step_tool_results)
+            
+            outcome = "FAILURE" if had_error else "SUCCESS"
+            
             step_record = {
                 "agent": agent_key,
                 "output": step_output[:3000],
                 "tools": step_tool_names,
-                "had_error": any(w in step_output.lower() for w in ["error", "exception", "traceback"]),
+                "outcome": outcome,
             }
             step_history.append(step_record)
 
@@ -735,37 +836,18 @@ class MultiAgentSystem:
             if step_tool_results:
                 step_ctx += "\n\nTool results:\n" + "\n".join(step_tool_results[:10])
 
-            task_context += f"\n\n--- Step {step} ({agent_key}) ---\n{step_ctx}"
+            task_context += f"\n\n--- Step {step} ({agent_key}) [{outcome}] ---\n{step_ctx}"
+            
+            # Prune task_context if it's getting too long
             parts = task_context.split("\n\n--- Step ")
-            if len(parts) > 4:
-                task_context = parts[0] + "\n\n--- Step " + "\n\n--- Step ".join(parts[-3:])
+            if len(parts) > 5:
+                task_context = parts[0] + "\n\n... (earlier steps omitted) ...\n\n--- Step " + "\n\n--- Step ".join(parts[-4:])
 
             step_success = bool(step_output.strip() or step_tool_results)
             self.db.store_routing_decision(
                 user_input if step == 1 else task_context[:300],
                 agent_key, step_success
             )
-
-            is_debugger_output = agent_key == "debugger" and step_output.strip()
-            has_error = step_record["had_error"]
-            debugger_ran_recently = any(h["agent"] == "debugger" for h in step_history[-2:])
-
-            if step_output.strip() or step_tool_results:
-                if has_error and agent_key != "debugger" and not debugger_ran_recently:
-                    yield {"type": "status", "content": "Error detected, routing to debugger.\n"}
-                    continue
-                if is_debugger_output:
-                    yield {"type": "status", "content": "Fix identified, routing to executor.\n"}
-                    continue
-                yield {"type": "status", "content": "Done.\n"}
-                self._conversation_history.append({"user": user_input, "assistant": final_response})
-                break
-
-            agent_hash = hash((agent_key, step))
-            if agent_hash in loop_hashes:
-                yield {"type": "status", "content": "Loop detected. Stopping.\n"}
-                break
-            loop_hashes.add(agent_hash)
 
         if step >= max_steps:
             yield {"type": "status", "content": "Step limit reached.\n"}
