@@ -10,6 +10,9 @@ from action_tracking import classify_outcome, extract_why, summarize_action
 from agent import load_skills, match_skills, format_skills_block
 from embed import embed, cosine_similarity, classify_by_similarity
 from model_client import build_architect_client, build_agent_client, extract_json
+from dotenv import load_dotenv
+
+load_dotenv()
 
 
 # Phrases that, when present in recent user messages, indicate the user
@@ -69,10 +72,6 @@ def _parse_tool_lines(text: str) -> set:
             result.add(token)
     return result
 
-
-from dotenv import load_dotenv
-
-load_dotenv()
 
 OLLAMA_HOST = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 
