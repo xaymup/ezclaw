@@ -55,3 +55,44 @@ def parse_tagged_blocks(text: str) -> List[ParsedBlock]:
             end=m.end(),
         ))
     return result
+
+
+@dataclass(frozen=True)
+class PlannedSave:
+    block: ParsedBlock
+    abs_target: Optional[str]
+    exists: bool
+    error: Optional[str]
+
+
+def _validate_path(rel_path: str, workspace_root: str) -> Optional[str]:
+    """Return the absolute target path if valid; None if not."""
+    if not rel_path or rel_path.startswith("/") or rel_path.startswith("\\"):
+        return None
+    if ".." in rel_path.replace("\\", "/").split("/"):
+        return None
+    workspace_abs = os.path.abspath(workspace_root)
+    candidate = os.path.abspath(os.path.join(workspace_abs, rel_path))
+    if not candidate.startswith(workspace_abs + os.sep) and candidate != workspace_abs:
+        return None
+    return candidate
+
+
+def plan_saves(blocks: List[ParsedBlock], workspace_root: str) -> List[PlannedSave]:
+    """Validate paths and probe disk. Returns one PlannedSave per block."""
+    result: List[PlannedSave] = []
+    for block in blocks:
+        abs_target = _validate_path(block.path, workspace_root)
+        if abs_target is None:
+            result.append(PlannedSave(
+                block=block, abs_target=None, exists=False,
+                error=f"invalid path: {block.path!r} (absolute, traversal, or outside workspace)",
+            ))
+            continue
+        result.append(PlannedSave(
+            block=block,
+            abs_target=abs_target,
+            exists=os.path.exists(abs_target),
+            error=None,
+        ))
+    return result

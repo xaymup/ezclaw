@@ -80,3 +80,68 @@ def test_block_offsets_captured():
 def test_unclosed_block_skipped():
     text = "```python:foo.py\nbody but no closing fence"
     assert parse_tagged_blocks(text) == []
+
+
+# ── plan_saves ──────────────────────────────────────────────────────────────
+
+from inline_code_saver import PlannedSave, plan_saves
+
+
+def test_plan_rejects_absolute_path(tmp_path):
+    block = ParsedBlock(
+        raw_open_fence="```python:/etc/passwd",
+        lang="python", path="/etc/passwd", body="x",
+        start=0, end=0,
+    )
+    plans = plan_saves([block], workspace_root=str(tmp_path))
+    assert len(plans) == 1
+    assert plans[0].error is not None
+    assert plans[0].abs_target is None
+
+
+def test_plan_rejects_dotdot_traversal(tmp_path):
+    block = ParsedBlock(
+        raw_open_fence="```python:../escape.py",
+        lang="python", path="../escape.py", body="x",
+        start=0, end=0,
+    )
+    plans = plan_saves([block], workspace_root=str(tmp_path))
+    assert plans[0].error is not None
+
+
+def test_plan_accepts_clean_relative_path(tmp_path):
+    block = ParsedBlock(
+        raw_open_fence="```python:src/foo.py",
+        lang="python", path="src/foo.py", body="x",
+        start=0, end=0,
+    )
+    plans = plan_saves([block], workspace_root=str(tmp_path))
+    assert plans[0].error is None
+    assert plans[0].abs_target == str(tmp_path / "src" / "foo.py")
+    assert plans[0].exists is False
+
+
+def test_plan_flags_collision(tmp_path):
+    target = tmp_path / "existing.py"
+    target.write_text("old content")
+    block = ParsedBlock(
+        raw_open_fence="```python:existing.py",
+        lang="python", path="existing.py", body="new",
+        start=0, end=0,
+    )
+    plans = plan_saves([block], workspace_root=str(tmp_path))
+    assert plans[0].error is None
+    assert plans[0].exists is True
+
+
+def test_plan_handles_multiple_blocks_in_order(tmp_path):
+    blocks = [
+        ParsedBlock(raw_open_fence="```python:a.py", lang="python",
+                    path="a.py", body="A", start=0, end=0),
+        ParsedBlock(raw_open_fence="```python:b.py", lang="python",
+                    path="b.py", body="B", start=0, end=0),
+    ]
+    plans = plan_saves(blocks, workspace_root=str(tmp_path))
+    assert len(plans) == 2
+    assert plans[0].block.path == "a.py"
+    assert plans[1].block.path == "b.py"
