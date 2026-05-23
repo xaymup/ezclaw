@@ -1188,6 +1188,37 @@ class ChatUI:
             padding=(0, 1),
         )
 
+    def _render_intent_lines(self, intent: dict) -> list:
+        """Return a list of Text lines representing the architect's intent,
+        indented to sit under the active plan task row.
+
+        The format mirrors the standalone architect chip but as inline
+        lines rather than a Panel. Empty fields are omitted.
+        """
+        lines = []
+        if not intent:
+            return lines
+        agent = intent.get("agent")
+        if agent:
+            role_color = THEME.role(agent).color
+            t = Text()
+            t.append("        agent: ", style=f"dim {DIM}")
+            t.append(agent, style=f"bold {role_color}")
+            lines.append(t)
+        for field, label, style, italic in (
+            ("goal", "goal", PRIMARY, False),
+            ("observation", "observation", WARN, False),
+            ("critical_thinking", "critical", ACCENT, False),
+            ("reasoning", "reasoning", DIM, True),
+        ):
+            value = intent.get(field)
+            if value:
+                t = Text()
+                t.append(f"        {label}: ", style=f"bold {style}")
+                t.append(value, style="italic" if italic else "")
+                lines.append(t)
+        return lines
+
     def _get_welcome_panel(self):
         body = Text()
 
