@@ -35,7 +35,18 @@ def _short(s, n=200):
 
 
 def main():
-    prompt = " ".join(sys.argv[1:]) or "Help me create a morning routine for myself"
+    args = list(sys.argv[1:])
+    validate = False
+    if "--validate" in args:
+        validate = True
+        args.remove("--validate")
+    prompt = " ".join(args) or "Help me create a morning routine for myself"
+    if validate:
+        # Strict chunk schema validation — raises ChunkValidationError on
+        # the first malformed chunk. Use this to catch contract drift
+        # between the orchestrator and the UI.
+        os.environ["EZCLAW_VALIDATE_CHUNKS"] = "1"
+        _flush_print(f"[--validate enabled: strict chunk-schema validation]")
     print("══════════════════════════════════════════════════════════════════")
     print(f"PROMPT: {prompt}")
     print("══════════════════════════════════════════════════════════════════")
@@ -62,7 +73,10 @@ def main():
 
     print("── stream ────────────────────────────────────────────────────────")
     try:
-        for chunk in mas.run(prompt):
+        # Wrap with validate_stream when --validate is on. Outside that
+        # mode it's a pass-through with zero overhead.
+        from orchestration import validate_stream
+        for chunk in validate_stream(mas.run(prompt)):
             now = time.time()
             dt = (now - last_chunk_time) * 1000
             last_chunk_time = now
