@@ -338,6 +338,14 @@ class ChatUI:
         def _(event):
             event.app.layout.focus_next()
 
+        @self.kb.add('f1')
+        def _(event):
+            # Instant help — same as typing /help but doesn't disturb a
+            # prompt the user may already be composing.
+            self._show_help()
+            self._update_ui()
+            event.app.invalidate()
+
         @self.kb.add('f2')
         def _(event):
             # Toggle terminal-native text selection. With mouse capture off,
@@ -544,7 +552,7 @@ class ChatUI:
             segments.append((BG + "bold #7fd070", "⊞ FULL TOOLS"))
 
         segments.append((BG + "#5a4a3a", "  │  "))
-        segments.append((BG + "#a89884", "[^C] exit  [F2] copy  [F3] strategy  [F4] tools  [PgUp/Dn] scroll"))
+        segments.append((BG + "#a89884", "[F1] help  [^C] exit  [F2] copy  [F3] strategy  [F4] tools"))
         return segments
 
     def _spinner_for(self, role):
@@ -836,7 +844,7 @@ class ChatUI:
         body.append(f"./workspace\n", style=f"dim {DIM}")
         body.append("\n", "")
         body.append("Commands: ", style="bold")
-        body.append("/help  /diagnose  /clear  /thinking  /settings  /authorize  /expand  /collapse",
+        body.append("/help [F1]  /settings  /queue  /skills  /memory  /diagnose  /clear  /thinking  /notify",
                     style=f"dim {DIM}")
         return Panel(
             body,
@@ -1179,49 +1187,39 @@ class ChatUI:
             SHOW_THINKING = "on" in cmd or ("off" not in cmd and not SHOW_THINKING)
             msg = f"Thinking visualization: {'ON' if SHOW_THINKING else 'OFF'}"
             self.history_ansi.append(render_to_ansi(Text(msg, style=DIM)))
+        elif cmd.startswith("/notify"):
+            # Runtime toggle for desktop notifications. Mirrors /thinking.
+            current = os.environ.get("EZCLAW_NOTIFY", "1") != "0"
+            if "on" in cmd:
+                target = True
+            elif "off" in cmd:
+                target = False
+            else:
+                target = not current
+            os.environ["EZCLAW_NOTIFY"] = "1" if target else "0"
+            self.history_ansi.append(render_to_ansi(
+                Text(f"Desktop notifications: {'ON' if target else 'OFF'}", style=DIM)
+            ))
         elif cmd == "/authorize":
             self.agent.session_authorized = not self.agent.session_authorized
             status = "ENABLED (Always Allow)" if self.agent.session_authorized else "DISABLED (Ask per tool)"
             self.history_ansi.append(render_to_ansi(Text(f"Session authorization: {status}", style=ACCENT)))
         elif cmd == "/settings":
-            model_info = self.agent.model
-            auth = "Always Allow" if self.agent.session_authorized else "Ask per tool"
-            history_size = len(self.agent.messages) if hasattr(self.agent, 'messages') and self.agent.messages else 0
-            info = (
-                f"**Model:** `{model_info}`\n"
-                f"**Thinking:** `{'Enabled' if SHOW_THINKING else 'Disabled'}`\n"
-                f"**Session Auth:** `{auth}`\n"
-                f"**History Size:** `{history_size}` messages"
-            )
-            self.history_ansi.append(render_to_ansi(Panel(Markdown(info), title="settings", border_style=DIM)))
+            self._show_settings()
+        elif cmd == "/queue":
+            self._show_scheduled_queue()
+        elif cmd == "/skills":
+            self._show_skills()
+        elif cmd.startswith("/memory"):
+            query = cmd[len("/memory"):].strip()
+            self._show_memory(query)
         elif cmd == "/help":
-            help_text = (
-                "## Commands\n\n"
-                "| Command | Description |\n"
-                "|---------|-------------|\n"
-                "| `/help` | Show this help message |\n"
-                "| `/diagnose` | Run GPU and Ollama diagnostics |\n"
-                "| `/clear` | Clear current session history |\n"
-                "| `/thinking [on|off]` | Toggle thinking visualization |\n"
-                "| `/settings` | Show system settings |\n"
-                "| `/authorize` | Toggle session-wide tool authorization |\n"
-                "| `/expand [N|last|all]` | Expand a truncated tool panel (defaults to last) |\n"
-                "| `/collapse [N|all]` | Re-collapse an expanded tool panel (defaults to all) |\n"
-                "| `/copy [last\\|all\\|N]` | Copy assistant text to clipboard (OSC52) |\n"
-                "| `[F2]` | Toggle copy mode (terminal-native selection) |\n"
-                "| `[F3]` | Toggle architect strategy/reflection panel |\n"
-                "| `[F4]` | Toggle compact / full tool panel layout |\n"
-                "| `[PgUp]` / `[PgDn]` | Scroll chat by one screen |\n"
-                "| `[Home]` / `[End]` | Jump to top / bottom of chat |\n"
-                "| `exit` / `quit` | Exit EzClaw |\n"
-            )
-            self.history_ansi.append(render_to_ansi(Panel(Markdown(help_text), title="help", border_style=DIM)))
+            self._show_help()
         elif cmd == "/diagnose":
             self.history_ansi.append(render_to_ansi(run_diagnostics_raw()))
         elif cmd == "/clear":
             self.agent.clear_session_history()
             self.history_ansi = []
-            self.welcome_shown = False
         elif cmd.startswith("/expand") or cmd.startswith("/collapse"):
             self._toggle_tool_expansion(cmd)
         elif cmd.startswith("/copy"):
@@ -1230,6 +1228,178 @@ class ChatUI:
             self.history_ansi.append(render_to_ansi(Text(f"Unknown command: {cmd}", style=ERR)))
 
         self._update_ui()
+
+    def _show_settings(self) -> None:
+        """Reorganized settings view — grouped by concern, each row shows
+        the current value AND the command/keybind to change it."""
+        from rich.table import Table
+        notify_on = os.environ.get("EZCLAW_NOTIFY", "1") != "0"
+        sound_on = bool(os.environ.get("EZCLAW_NOTIFY_SOUND", "default").strip())
+        history_size = (
+            len(self.agent.messages)
+            if hasattr(self.agent, "messages") and self.agent.messages else 0
+        )
+
+        sections = [
+            ("Display", [
+                ("Thinking panel",     "on" if SHOW_THINKING else "off", "/thinking"),
+                ("Strategy panel",     "expanded" if self.show_architect else "compact chip", "F3"),
+                ("Tool panels",        "full" if not self.compact_tools else "compact (one-line)", "F4"),
+                ("Mouse copy mode",    "on" if not self._mouse_capture else "off", "F2"),
+            ]),
+            ("Behavior", [
+                ("Session auth",       "always allow" if self.agent.session_authorized else "ask per tool", "/authorize"),
+                ("User name",          self.user_name, "EZCLAW_USER env"),
+            ]),
+            ("Agents & models", [
+                ("Mode",               "multi-agent" if ENABLE_MULTI_AGENT else "single-agent", "ENABLE_MULTI_AGENT env"),
+                ("Primary model",      self.agent.model, "OLLAMA_MODEL env"),
+                ("History",            f"{history_size} messages", "/clear to reset"),
+            ]),
+            ("Notifications", [
+                ("Desktop alerts",     "on" if notify_on else "off", "/notify"),
+                ("Sound",              "on" if (notify_on and sound_on) else "off", "EZCLAW_NOTIFY_SOUND env"),
+            ]),
+            ("Scheduling", [
+                ("Heartbeat poll",     "every 30s", "(automatic)"),
+                ("View queue",         "—", "/queue"),
+            ]),
+        ]
+        for title, rows in sections:
+            t = Table.grid(padding=(0, 2))
+            t.add_column(style=f"bold {PRIMARY}")
+            t.add_column(style="")
+            t.add_column(style=f"dim {DIM} italic")
+            for label, value, control in rows:
+                t.add_row(label, str(value), control)
+            self.history_ansi.append(render_to_ansi(Panel(
+                t, title=f"[bold]{title}[/bold]", border_style=f"dim {PRIMARY}", box=ROUNDED,
+            )))
+
+    def _show_scheduled_queue(self) -> None:
+        """List active (Pending/Notified) scheduled tasks from heartbeat.md."""
+        try:
+            from scheduler import Scheduler
+            tasks = Scheduler().list_pending()
+        except Exception as e:
+            self.history_ansi.append(render_to_ansi(
+                Text(f"Error reading scheduler: {e}", style=ERR)
+            ))
+            return
+        if not tasks:
+            self.history_ansi.append(render_to_ansi(
+                Panel(Text("No scheduled tasks pending.", style=f"dim {DIM} italic"),
+                      title="queue", border_style=f"dim {PRIMARY}", box=ROUNDED)
+            ))
+            return
+        from rich.table import Table
+        t = Table.grid(padding=(0, 2))
+        t.add_column(style=f"bold {PRIMARY}")
+        t.add_column()
+        t.add_column(style=f"dim {DIM}")
+        t.add_column()
+        for task in sorted(tasks, key=lambda x: x.time):
+            t.add_row(f"#{task.id}", task.time_str, task.status, task.description)
+        self.history_ansi.append(render_to_ansi(Panel(
+            t, title=f"[bold]{len(tasks)} scheduled task{'s' if len(tasks) != 1 else ''}[/bold]",
+            border_style=f"dim {PRIMARY}", box=ROUNDED,
+        )))
+
+    def _show_skills(self) -> None:
+        """List skills the agent has learned (in ~/.ezclaw/skills/)."""
+        try:
+            from tools import SKILLS_DIR, _migrate_legacy_skills_once
+            _migrate_legacy_skills_once()
+            if not os.path.isdir(SKILLS_DIR):
+                names = []
+            else:
+                names = sorted(
+                    f[:-3] for f in os.listdir(SKILLS_DIR) if f.endswith(".md")
+                )
+        except Exception as e:
+            self.history_ansi.append(render_to_ansi(
+                Text(f"Error reading skills: {e}", style=ERR)
+            ))
+            return
+        if not names:
+            body = Text("No skills learned yet. Tell the agent to remember a procedure and it'll save one here.",
+                        style=f"dim {DIM} italic")
+        else:
+            body = Text("\n".join(f"• {n}" for n in names), style="")
+        self.history_ansi.append(render_to_ansi(Panel(
+            body, title=f"[bold]{len(names)} learned skill{'s' if len(names) != 1 else ''}[/bold]",
+            border_style=f"dim {PRIMARY}", box=ROUNDED,
+        )))
+
+    def _show_memory(self, query: str) -> None:
+        """Inspect the agent's memory store. With no query, show recent
+        facts. With a query, run hybrid semantic search and show matches."""
+        try:
+            db = self.agent.db
+            if query:
+                results = db.search_memories_hybrid(query, alpha=0.6, threshold=0.2)
+                heading = f"memory search: \"{query[:60]}\""
+            else:
+                results = db.search_memories("", limit=20)
+                heading = "recent memories"
+        except Exception as e:
+            self.history_ansi.append(render_to_ansi(
+                Text(f"Error reading memory: {e}", style=ERR)
+            ))
+            return
+        if not results:
+            body = Text("No matching memories." if query else "Memory is empty.",
+                        style=f"dim {DIM} italic")
+        else:
+            body = Text("\n".join(f"• {m}" for m in results[:20]), style="")
+        self.history_ansi.append(render_to_ansi(Panel(
+            body, title=f"[bold]{heading}[/bold]",
+            border_style=f"dim {PRIMARY}", box=ROUNDED,
+        )))
+
+    def _show_help(self) -> None:
+        """Help grouped by category — easier to scan than a flat command list."""
+        sections = [
+            ("Navigation", [
+                ("[PgUp] / [PgDn]",    "scroll one screen"),
+                ("[Home] / [End]",     "jump to top / bottom"),
+                ("[F1]",               "open this help"),
+                ("[Arrows] / mouse",   "scroll"),
+            ]),
+            ("Display toggles", [
+                ("[F2]",               "copy mode (terminal-native selection)"),
+                ("[F3]",               "expanded strategy / reflection panel"),
+                ("[F4]",               "compact / full tool panel layout"),
+                ("/thinking [on|off]", "show / hide reasoning panel"),
+                ("/notify  [on|off]",  "desktop notification on/off"),
+            ]),
+            ("Inspection", [
+                ("/settings",          "show all settings + how to change each"),
+                ("/queue",             "list active scheduled tasks"),
+                ("/skills",            "list learned skills"),
+                ("/memory [query]",    "show stored memories (with optional search)"),
+                ("/diagnose",          "GPU / Ollama / system probe"),
+            ]),
+            ("Session", [
+                ("/clear",             "wipe current session history"),
+                ("/authorize",         "toggle session-wide tool authorization"),
+                ("/expand [N|all]",    "expand a tool panel (defaults to last)"),
+                ("/collapse [N|all]",  "re-collapse a tool panel"),
+                ("/copy [last|all|N]", "copy assistant text (OSC52 clipboard)"),
+                ("exit / quit",        "leave EzClaw"),
+            ]),
+        ]
+        from rich.table import Table
+        for title, rows in sections:
+            t = Table.grid(padding=(0, 2))
+            t.add_column(style=f"bold {PRIMARY}")
+            t.add_column(style=f"dim {DIM}")
+            for k, v in rows:
+                t.add_row(k, v)
+            self.history_ansi.append(render_to_ansi(Panel(
+                t, title=f"[bold]{title}[/bold]",
+                border_style=f"dim {PRIMARY}", box=ROUNDED,
+            )))
 
     def _copy_to_clipboard(self, cmd: str):
         """Push content to the system clipboard via OSC52.
