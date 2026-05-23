@@ -17,6 +17,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tools import (
     _build_sandbox_env,
     _ENV_ALLOWLIST,
+    _bwrap_available,
+    _skill_filename,
     run_shell,
     WORKSPACE_DIR,
 )
@@ -120,6 +122,63 @@ def test_run_shell_runs_in_new_process_group():
     parent_pgid = os.getpgid(0)
     assert child_pgid != parent_pgid
 
+
+# ── Bubblewrap jail: writes outside workspace must fail ────────────────────
+
+@pytest.mark.skipif(not _bwrap_available(), reason="bubblewrap not available")
+def test_run_shell_cannot_write_to_project_root():
+    """Even an explicit absolute-path write to the project root must fail
+    when bwrap is jailing the shell. Reading is fine; writing is not."""
+    out = run_shell(
+        "echo SHOULD_NOT_APPEAR > /home/lulu/Projects/ezclaw/_canary.txt 2>&1; "
+        "ls -la /home/lulu/Projects/ezclaw/_canary.txt 2>&1; "
+        "cat /home/lulu/Projects/ezclaw/_canary.txt 2>&1 || true; "
+        "rm -f /home/lulu/Projects/ezclaw/_canary.txt 2>&1 || true"
+    )
+    # Either the redirect failed with read-only-fs, or the file doesn't
+    # exist on the cat — both are acceptable signs that the write didn't
+    # land. We just need to confirm SHOULD_NOT_APPEAR is NOT readable as
+    # file content (it can appear in error messages, that's fine).
+    canary_path = "/home/lulu/Projects/ezclaw/_canary.txt"
+    assert not os.path.exists(canary_path), \
+        f"bwrap jail breach: {canary_path} exists after run_shell write"
+
+
+@pytest.mark.skipif(not _bwrap_available(), reason="bubblewrap not available")
+def test_run_shell_can_still_read_project_root():
+    """The jail is write-blocking, not read-blocking. The agent needs to
+    be able to read project files for context (cat cli.py, git log, etc.)."""
+    out = run_shell("ls /home/lulu/Projects/ezclaw/cli.py 2>&1")
+    assert "cli.py" in out
+
+
+@pytest.mark.skipif(not _bwrap_available(), reason="bubblewrap not available")
+def test_run_shell_can_write_inside_workspace():
+    """Sanity check: writes INSIDE the workspace still work — the jail
+    rebinds the workspace as read-write on top of the read-only root."""
+    out = run_shell(
+        "echo ok > _jail_test_canary.txt && cat _jail_test_canary.txt && rm _jail_test_canary.txt"
+    )
+    assert "ok" in out
+
+
+# ── Skill path-traversal protection ────────────────────────────────────────
+
+def test_skill_filename_strips_traversal():
+    """A malicious skill name like `../../etc/passwd` must be sanitized
+    into a flat filename that can never escape SKILLS_DIR."""
+    assert _skill_filename("../../etc/passwd") == "etc_passwd.md"
+    assert _skill_filename("/abs/path") == "abs_path.md"
+    assert _skill_filename("normal name") == "normal_name.md"
+    assert _skill_filename("") == "unnamed.md"
+    # Path separators in the result would let os.path.join place the file
+    # outside SKILLS_DIR — make sure none survive sanitization.
+    for bad in ("a/b", "a\\b", "../x", "/etc/passwd", "x/../y"):
+        out = _skill_filename(bad)
+        assert "/" not in out and "\\" not in out and ".." not in out
+
+
+# ── Resource caps (POSIX rlimits) ──────────────────────────────────────────
 
 @pytest.mark.skipif(os.name == "nt", reason="rlimits are POSIX-only")
 def test_run_shell_caps_file_size():

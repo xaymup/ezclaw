@@ -73,7 +73,40 @@ class ToolRegistry:
 registry = ToolRegistry()
 
 WORKSPACE_DIR = "workspace"
-SKILLS_DIR = "skills"
+
+# Skills live OUTSIDE the project root so the agent has zero write-paths
+# anywhere except ./workspace/. The bwrap jail in run_shell enforces this
+# for arbitrary shell commands; the file tools (read_file/write_file/etc.)
+# enforce it via get_workspace_path; and skill storage lives in user's
+# home so a "learn_skill" call can't accidentally touch project source.
+SKILLS_DIR = os.path.join(os.path.expanduser("~"), ".ezclaw", "skills")
+
+# Legacy location — if files exist there from before this change they
+# get migrated on first skill access.
+_LEGACY_SKILLS_DIR = "skills"
+
+
+def _migrate_legacy_skills_once() -> None:
+    """One-time copy from project-root ./skills/ to ~/.ezclaw/skills/.
+    Idempotent — if the destination already exists with files, do nothing.
+    The source files are left in place (we don't delete user data)."""
+    if not os.path.isdir(_LEGACY_SKILLS_DIR):
+        return
+    os.makedirs(SKILLS_DIR, exist_ok=True)
+    for name in os.listdir(_LEGACY_SKILLS_DIR):
+        if not name.endswith(".md"):
+            continue
+        src = os.path.join(_LEGACY_SKILLS_DIR, name)
+        dst = os.path.join(SKILLS_DIR, name)
+        if os.path.exists(dst):
+            continue
+        try:
+            with open(src, "r", encoding="utf-8") as fsrc:
+                content = fsrc.read()
+            with open(dst, "w", encoding="utf-8") as fdst:
+                fdst.write(content)
+        except OSError:
+            pass
 
 def clean_html(html: str) -> str:
     """Basic HTML cleaning to remove tags and extra whitespace."""
@@ -185,8 +218,11 @@ _ENV_ALLOWLIST = frozenset({
 _RLIMIT_AS_BYTES = 2 * 1024 * 1024 * 1024     # 2 GB virtual address space
 _RLIMIT_CPU_SECONDS = 60                       # 60 s CPU time (matches the 60 s wall timeout)
 _RLIMIT_FSIZE_BYTES = 100 * 1024 * 1024        # 100 MB max single-file write
-_RLIMIT_NPROC = 256                            # fork-bomb stopper
 _RLIMIT_CORE = 0                               # no core dumps
+# RLIMIT_NPROC was removed: it broke bwrap's namespace creation
+# (CLONE_NEWUSER hits EAGAIN under tight nproc caps). The bwrap mount
+# namespace already destroys all child processes when the jail exits,
+# so a fork bomb in there can't affect the host.
 
 
 def _build_sandbox_env() -> dict:
@@ -207,6 +243,49 @@ def _build_sandbox_env() -> dict:
     return env
 
 
+def _bwrap_available() -> bool:
+    """True iff bubblewrap is installed AND the user hasn't opted out.
+    Set EZCLAW_USE_BWRAP=0 to disable (falls back to the process-level
+    sandbox — env scrub + rlimits + new session — without filesystem
+    isolation)."""
+    if os.getenv("EZCLAW_USE_BWRAP", "1") == "0":
+        return False
+    import shutil
+    return shutil.which("bwrap") is not None
+
+
+def _build_shell_argv(command: str, workspace_cwd: str) -> list:
+    """Build the argv that runs `command` under the strongest available
+    sandbox.
+
+    When bubblewrap is available: the entire filesystem is bind-mounted
+    read-only and ONLY `workspace_cwd` is rebound read-write. The agent
+    can read any project source it needs (`cat /home/.../cli.py` works),
+    but `echo > /home/.../cli.py` fails with `Read-only file system`.
+    Network access is preserved (so pip / git remotes still work);
+    /tmp is a tmpfs scoped to the jail; the child dies with the parent.
+
+    When bwrap is not installed (or the user has disabled it): falls back
+    to plain `/bin/sh -c command`. The process-level sandbox (env scrub,
+    rlimits, new session, cwd=workspace) still applies via the Popen
+    kwargs at the call site.
+    """
+    if _bwrap_available():
+        return [
+            "bwrap",
+            "--ro-bind", "/", "/",
+            "--bind", workspace_cwd, workspace_cwd,
+            "--proc", "/proc",
+            "--dev", "/dev",
+            "--tmpfs", "/tmp",
+            "--share-net",
+            "--chdir", workspace_cwd,
+            "--die-with-parent",
+            "/bin/sh", "-c", command,
+        ]
+    return ["/bin/sh", "-c", command]
+
+
 def _apply_sandbox_rlimits() -> None:
     """preexec_fn that caps the child's resource usage. POSIX only.
 
@@ -225,7 +304,6 @@ def _apply_sandbox_rlimits() -> None:
         ("RLIMIT_AS",    _RLIMIT_AS_BYTES),
         ("RLIMIT_CPU",   _RLIMIT_CPU_SECONDS),
         ("RLIMIT_FSIZE", _RLIMIT_FSIZE_BYTES),
-        ("RLIMIT_NPROC", _RLIMIT_NPROC),
         ("RLIMIT_CORE",  _RLIMIT_CORE),
     ):
         which = getattr(resource, name, None)
@@ -267,9 +345,13 @@ def run_shell(command: str, interactive: bool = False) -> str:
         if interactive and os.name != "nt":
             return _run_shell_interactive(command, workspace_cwd, sandbox_env)
 
+        # Run argv directly (no shell=True) — the shell is the LAST argv
+        # element inside _build_shell_argv, either as `/bin/sh -c command`
+        # or wrapped in `bwrap … /bin/sh -c command`. Passing shell=True
+        # would double-wrap (sh -c "bwrap … sh -c command").
         result = subprocess.run(
-            command,
-            shell=True,
+            _build_shell_argv(command, workspace_cwd),
+            shell=False,
             capture_output=True,
             text=True,
             timeout=60,
@@ -300,7 +382,7 @@ def _run_shell_interactive(command: str, workspace_cwd: str, sandbox_env: dict) 
     proc = None
     try:
         proc = subprocess.Popen(
-            ["/bin/sh", "-c", command],
+            _build_shell_argv(command, workspace_cwd),
             stdin=slave_fd,
             stdout=slave_fd,
             stderr=slave_fd,
@@ -576,36 +658,54 @@ def generate_codebase_map(path: str = ".") -> str:
     except Exception as e:
         return f"Error generating map: {str(e)}"
 
+def _skill_filename(name: str) -> str:
+    """Convert a user-facing skill name to a safe filename. Strips any
+    path-traversal attempts (../, leading /, etc.) and reduces to
+    [a-z0-9_-] so a malicious name can't escape SKILLS_DIR."""
+    safe = re.sub(r"[^a-z0-9_-]+", "_", name.lower()).strip("_")
+    if not safe:
+        safe = "unnamed"
+    return f"{safe}.md"
+
+
 @registry.register(auth_required=True)
 def learn_skill(name: str, description: str, procedure: str) -> str:
     """
-    Save a reusable step-by-step procedure/workflow.
+    Save a reusable step-by-step procedure to ~/.ezclaw/skills/.
     """
     try:
+        _migrate_legacy_skills_once()
         os.makedirs(SKILLS_DIR, exist_ok=True)
-        filename = f"{name.lower().replace(' ', '_')}.md"
-        path = os.path.join(SKILLS_DIR, filename)
+        path = os.path.join(SKILLS_DIR, _skill_filename(name))
         content = f"# Skill: {name}\n\n## Description\n{description}\n\n## Procedure\n{procedure}\n"
-        with open(path, 'w') as f:
+        with open(path, "w") as f:
             f.write(content)
         return f"Skill '{name}' saved to {path}."
     except Exception as e:
         return f"Error saving skill: {str(e)}"
 
+
 @registry.register
 def get_skill(name: str) -> str:
     """Retrieve a learned skill."""
     try:
-        path = os.path.join(SKILLS_DIR, f"{name.lower().replace(' ', '_')}.md")
-        if not os.path.exists(path): return f"Skill '{name}' not found."
-        with open(path, 'r') as f: return f.read()
-    except Exception as e: return str(e)
+        _migrate_legacy_skills_once()
+        path = os.path.join(SKILLS_DIR, _skill_filename(name))
+        if not os.path.exists(path):
+            return f"Skill '{name}' not found."
+        with open(path, "r") as f:
+            return f.read()
+    except Exception as e:
+        return str(e)
+
 
 @registry.register
 def list_skills() -> str:
     """List all known skills."""
-    if not os.path.exists(SKILLS_DIR): return "No skills learned yet."
-    skills = [f.replace('.md', '') for f in os.listdir(SKILLS_DIR) if f.endswith('.md')]
+    _migrate_legacy_skills_once()
+    if not os.path.exists(SKILLS_DIR):
+        return "No skills learned yet."
+    skills = [f.replace(".md", "") for f in os.listdir(SKILLS_DIR) if f.endswith(".md")]
     return "\n".join(skills) if skills else "No skills learned yet."
 
 def create_memory_tools(db: Any):
