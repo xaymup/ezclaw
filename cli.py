@@ -201,6 +201,11 @@ class ChatUI:
         # still shows the routing decision; F3 toggles the full panels back.
         self.show_architect = False
 
+        # Tool panels: compact (inline args in title, no args sub-panel,
+        # no summary line) by default. F4 toggles to the full layout that
+        # shows args in their own panel and the redundant ↳ summary line.
+        self.compact_tools = True
+
     def _wrap_tools(self):
         from tools import registry
         original_run_shell = registry.tools.get('run_shell')
@@ -280,6 +285,12 @@ class ChatUI:
         @self.kb.add('f3')
         def _(event):
             self.show_architect = not self.show_architect
+            self._update_ui()
+            event.app.invalidate()
+
+        @self.kb.add('f4')
+        def _(event):
+            self.compact_tools = not self.compact_tools
             self._update_ui()
             event.app.invalidate()
 
@@ -388,9 +399,10 @@ class ChatUI:
 
         copy_badge = "  ╱  ✂ COPY MODE" if not self._mouse_capture else ""
         arch_badge = "  ╱  🧠 STRATEGY" if self.show_architect else ""
+        tools_badge = "  ╱  ⊞ FULL TOOLS" if not self.compact_tools else ""
         return (
             f"  {activity}  {auth_icon}  {mode} {model_info}  ╱  {msg_count} msgs"
-            f"{live}{copy_badge}{arch_badge}  │  [Ctrl+C] Exit  [F2] Copy  [F3] Strategy  [Arrows] Scroll"
+            f"{live}{copy_badge}{arch_badge}{tools_badge}  │  [Ctrl+C] Exit  [F2] Copy  [F3] Strategy  [F4] Tools  [Arrows] Scroll"
         )
 
     def _spinner_for(self, role):
@@ -633,11 +645,36 @@ class ChatUI:
             title=f"[bold {PRIMARY}]EzClaw[/bold {PRIMARY}]",
         )
 
+    @staticmethod
+    def _format_args_inline(args, max_len=60):
+        """Render an args dict as a function-call signature for the title.
+
+        Quotes strings, leaves numbers/bools bare, truncates long values, and
+        caps the total length so the title stays on one line.
+        """
+        if not args:
+            return ""
+        parts = []
+        for k, v in args.items():
+            if isinstance(v, (bool, int, float)):
+                rendered = str(v)
+            else:
+                s = str(v).replace("\n", "\\n")
+                if len(s) > 30:
+                    s = s[:27] + "…"
+                rendered = f'"{s}"'
+            parts.append(f"{k}={rendered}")
+        sig = ", ".join(parts)
+        if len(sig) > max_len:
+            sig = sig[: max_len - 1] + "…"
+        return sig
+
     def _build_tool_panel(self, tool, index=None):
         tool_name = tool["name"]
         args = tool.get("args", {})
         result = tool.get("result")
         expanded = tool.get("expanded", False)
+        compact = self.compact_tools
 
         # Truncation limits flex based on expand state. Expanded uses a generous
         # cap so we still avoid runaway 10MB dumps, but show effectively all
@@ -650,14 +687,24 @@ class ChatUI:
         tool_kind = THEME.tool_kind(tool_name)
         idx_label = f"[{index}] " if index is not None else ""
         state_label = "  ⇣ expanded" if expanded else ""
-        header = Text.assemble(
+
+        # Compact mode inlines args into the title as a function-call signature;
+        # full mode keeps the standalone "args" sub-panel below.
+        header_parts = [
             (f"{tool_kind.icon} ", f"bold {tool_kind.color}"),
             (idx_label, f"dim {DIM}"),
             (tool_name, f"bold {tool_kind.color}"),
-            (state_label, f"dim {ACCENT}"),
-        )
+        ]
+        if compact and args:
+            sig = self._format_args_inline(args)
+            header_parts.append(("(", f"dim {DIM}"))
+            header_parts.append((sig, f"dim {DIM}"))
+            header_parts.append((")", f"dim {DIM}"))
+        header_parts.append((state_label, f"dim {ACCENT}"))
+        header = Text.assemble(*header_parts)
+
         tool_parts = []
-        if args:
+        if not compact and args:
             arg_lines = []
             for k, v in args.items():
                 arg_lines.append(Text.assemble((f"{k}: ", "bold"), (str(v), "")))
@@ -675,7 +722,10 @@ class ChatUI:
                         diff_content = diff_content.plain
                     tool_parts.append(Syntax(diff_content, "diff", theme="monokai", background_color="default"))
                 else:
-                    tool_parts.append(Panel(self._truncate_text(renderable_result, max_lines=output_cap), title="output", border_style=DIM))
+                    # In compact mode, drop the outer "output" sub-panel and
+                    # render the text directly inside the tool panel.
+                    truncated = self._truncate_text(renderable_result, max_lines=output_cap)
+                    tool_parts.append(truncated if compact else Panel(truncated, title="output", border_style=DIM))
             elif tool_name == "read_file":
                 path_arg = str(args.get("path", "")) if args else ""
                 lang = self._detect_lang(path_arg)
@@ -684,12 +734,12 @@ class ChatUI:
                     file_content = file_content.plain
                 tool_parts.append(Syntax(file_content, lang, theme="monokai", background_color="default"))
             else:
-                tool_parts.append(Panel(self._truncate_text(Text(renderable_result), max_lines=output_cap), title="output", border_style=DIM))
+                truncated = self._truncate_text(Text(renderable_result), max_lines=output_cap)
+                tool_parts.append(truncated if compact else Panel(truncated, title="output", border_style=DIM))
 
             # Hint only when truncation could have hidden something AND not expanded.
             if not expanded and index is not None:
                 result_lines = renderable_result.count("\n") + 1
-                # Heuristic: if result is multi-line and likely above caps, surface the hint.
                 if result_lines > 20:
                     tool_parts.append(Text(f"  /expand {index}  to show full output", style=f"dim {DIM} italic"))
         else:
@@ -697,22 +747,21 @@ class ChatUI:
             elapsed = time.time() - start_time if start_time else 0
             label = f"running... ({elapsed:.1f}s)" if elapsed > 1 else "running..."
             tool_parts.append(Text(label, style=f"dim {DIM}"))
-        # Collapsed panels gain a single-line summary pulled from the first
-        # non-empty stripped line of the tool result. Helps scan a long
-        # transcript without expanding every panel.
-        summary = None
-        if not expanded and result:
+
+        # Full mode shows the redundant ↳ summary line above the output. Compact
+        # mode drops it — the output is right there and the title already names
+        # the call.
+        if not compact and not expanded and result:
+            summary = None
             for line in str(result).splitlines():
                 stripped = line.strip()
                 if stripped:
                     summary = stripped[:80] + ("…" if len(stripped) > 80 else "")
                     break
-        if summary:
-            summary_text = Text(f"  ↳ {summary}", style=f"dim {DIM} italic")
-            # Place summary after the args panel so the call signature shows
-            # first; if no args were added, the summary goes to the top.
-            insert_at = 1 if args else 0
-            tool_parts.insert(insert_at, summary_text)
+            if summary:
+                summary_text = Text(f"  ↳ {summary}", style=f"dim {DIM} italic")
+                insert_at = 1 if args else 0
+                tool_parts.insert(insert_at, summary_text)
 
         return Panel(
             Group(*tool_parts),
@@ -845,6 +894,7 @@ class ChatUI:
                 "| `/copy [last\\|all\\|N]` | Copy assistant text to clipboard (OSC52) |\n"
                 "| `[F2]` | Toggle copy mode (terminal-native selection) |\n"
                 "| `[F3]` | Toggle architect strategy/reflection panel |\n"
+                "| `[F4]` | Toggle compact / full tool panel layout |\n"
                 "| `exit` / `quit` | Exit EzClaw |\n"
             )
             self.history_ansi.append(render_to_ansi(Panel(Markdown(help_text), title="help", border_style=DIM)))
