@@ -139,9 +139,13 @@ class ChatUI:
         self.history_file = os.path.expanduser("~/.ezclaw_history")
         self.prompt_history = FileHistory(self.history_file)
 
-        # Native buffer for history
-        self._history_read_only = True
-        self.history_buffer = Buffer(read_only=Condition(lambda: self._history_read_only))
+        # Native buffer for history.
+        # `_history_read_only` is a depth counter (not a boolean) so the
+        # read-only state is correctly maintained across overlapping
+        # _update_ui calls from the worker thread and the animation tick.
+        self._history_read_only = 1  # >0 means read-only
+        self._update_lock = threading.RLock()
+        self.history_buffer = Buffer(read_only=Condition(lambda: self._history_read_only > 0))
 
         self.kb = KeyBindings()
 
@@ -299,17 +303,22 @@ class ChatUI:
         )
 
     def _update_ui(self):
-        # Update the buffer text
-        full_ansi = "\n".join(self.history_ansi)
-        full_ansi += "\n" + self._get_current_renderable_ansi()
+        # Serialize across threads — the worker thread and the asyncio
+        # animation tick both call this; without the lock, they race on
+        # the read-only flag and the buffer write raises EditReadOnlyBuffer.
+        with self._update_lock:
+            full_ansi = "\n".join(self.history_ansi)
+            full_ansi += "\n" + self._get_current_renderable_ansi()
 
-        self._history_read_only = False
-        self.history_buffer.text = full_ansi
-        self._history_read_only = True
+            self._history_read_only -= 1  # 1 -> 0, now writable
+            try:
+                self.history_buffer.text = full_ansi
+            finally:
+                self._history_read_only += 1  # back to read-only
 
-        self._scroll_to_bottom()
-        if self.app.is_running:
-            self.app.invalidate()
+            self._scroll_to_bottom()
+            if self.app.is_running:
+                self.app.invalidate()
     def _get_status_text(self):
         auth_icon = "◉" if self.agent.session_authorized else "○"
         mode = "⚡" if ENABLE_MULTI_AGENT else "●"
