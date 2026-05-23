@@ -39,6 +39,7 @@ from prompt_toolkit.filters import Condition
 from prompt_toolkit.lexers import Lexer
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.layout.margins import ScrollbarMargin
+from prompt_toolkit.keys import Keys
 
 class SimpleAnsiLexer(Lexer):
     def lex_document(self, document):
@@ -103,6 +104,15 @@ def run_diagnostics_raw():
         output.append(f"[{WARN}]Ollama CLI (ollama ps) not found or failed.[/{WARN}]")
     return Group(*output)
 
+from rich.console import Console
+from rich.panel import Panel
+from rich.markdown import Markdown
+from rich.text import Text
+from rich.syntax import Syntax
+from rich.spinner import Spinner
+from rich.console import Group
+from rich.box import ROUNDED
+
 class ChatUI:
     def __init__(self):
         self.agent = MultiAgentSystem() if ENABLE_MULTI_AGENT else ChatAgent()
@@ -117,6 +127,14 @@ class ChatUI:
         self.auth_active = False
         self.current_auth_chunk = None
         self._auth_requests = queue.Queue()
+        
+        # Persistent rich objects for animations
+        self.r_console = Console(file=io.StringIO(), force_terminal=True, width=100)
+        self.spinner = Spinner("dots", style=f"bold {ACCENT}")
+
+        # Generation timing & health tracking
+        self.generation_start_time = 0.0
+        self.last_chunk_time = 0.0
 
         self.history_file = os.path.expanduser("~/.ezclaw_history")
         self.prompt_history = FileHistory(self.history_file)
@@ -156,13 +174,48 @@ class ChatUI:
                     def _trigger():
                         async def _run_async():
                             def _run():
-                                return original_run_shell(command, interactive=True)
-                            result = await run_in_terminal(_run, render_cli_done=True)
+                                from rich.console import Console
+                                from rich.panel import Panel
+                                from rich.text import Text
+                                r_console = Console()
+                                
+                                r_console.print("\n")
+                                r_console.print(Panel(
+                                    Text.assemble(
+                                        ("EZCLAW SUSPENDED\n\n", "bold yellow"),
+                                        ("Command: ", ""), (command, "bold cyan"),
+                                        ("\n\nInstructions: ", "bold"), 
+                                        ("Provide any required input (password, confirmation, etc.).\n", ""),
+                                        ("Wait for the command to finish completely.\n", ""),
+                                        ("If the command hangs after finishing, press [Enter].", "italic dim")
+                                    ),
+                                    title="[bold yellow]Interactive Shell Session[/bold yellow]",
+                                    border_style="yellow",
+                                    expand=False
+                                ))
+                                
+                                result = original_run_shell(command, interactive=True)
+                                
+                                r_console.print(Panel(
+                                    "Interactive session finished. Resuming EzClaw TUI...",
+                                    title="[bold green]Success[/bold green]",
+                                    border_style="green",
+                                    expand=False
+                                ))
+                                r_console.print("\n")
+                                return result
+                            
+                            # run_in_terminal suspends the TUI and gives control to the terminal
+                            result = await run_in_terminal(_run, render_cli_done=False)
                             res_queue.put(result)
+                        
+                        # Create background task on the main event loop
                         self.app.create_background_task(_run_async())
                     
                     loop = getattr(self.app, 'loop', None)
                     call_soon_threadsafe(_trigger, loop=loop)
+                    
+                    # Block the agent thread until the user is done with the terminal
                     return res_queue.get()
                 return original_run_shell(command, interactive=False)
             registry.tools['run_shell'] = wrapped_run_shell
@@ -199,6 +252,20 @@ class ChatUI:
                 self.input_field.buffer.append_to_history()
                 self.input_field.text = ""
                 self.handle_input(text)
+
+        # Mouse scroll speed improvements
+        @self.kb.add(Keys.ScrollUp)
+        def _(event):
+            # Scroll the history window up by 3 lines
+            self.history_window.vertical_scroll = max(0, self.history_window.vertical_scroll - 3)
+
+        @self.kb.add(Keys.ScrollDown)
+        def _(event):
+            # Scroll the history window down by 3 lines
+            if self.history_window.render_info:
+                # We can't easily know the max scroll without render_info
+                # But we can just increment and prompt_toolkit will clamp it
+                self.history_window.vertical_scroll += 3
 
     def _create_layout(self):
         self.history_control = BufferControl(
@@ -270,8 +337,8 @@ class ChatUI:
                 border_style=DIM, box=ROUNDED,
             ))
             
-        for tool in self.tool_executions:
-            parts.append(self._build_tool_panel(tool))
+        for idx, tool in enumerate(self.tool_executions, 1):
+            parts.append(self._build_tool_panel(tool, idx))
             
         if self.auth_active and self.current_auth_chunk:
              parts.append(Panel(
@@ -289,14 +356,61 @@ class ChatUI:
                  padding=(1, 2)
              ))
 
+        if self.architect_intent:
+            reflection = self.architect_intent.get("reflection", {})
+            if reflection:
+                goal = reflection.get("goal", "N/A")
+                obs = reflection.get("observation", "N/A")
+                ct = reflection.get("critical_thinking", "N/A")
+                
+                parts.append(Panel(
+                    Text.assemble(
+                        ("GOAL: ", f"bold {PRIMARY}"), (f"{goal}\n", ""),
+                        ("OBSERVATION: ", f"bold {WARN}"), (f"{obs}\n", ""),
+                        ("CRITICAL THINKING: ", f"bold {ACCENT}"), (ct, "")
+                    ),
+                    title="[bold blue]Architect Reflection[/bold blue]",
+                    border_style="blue",
+                    padding=(1, 2)
+                ))
+            
+            # Also show plan/reasoning
+            reasoning = self.architect_intent.get("reasoning", "")
+            plan = self.architect_intent.get("plan", "")
+            if reasoning or plan:
+                header = Text.assemble(("Strategy & Plan", "bold blue"))
+                plan_parts = []
+                if reasoning:
+                    plan_parts.append(Text(f"{reasoning}\n", style="italic"))
+                if plan:
+                    # Plan might be a string or list
+                    plan_str = "\n".join(plan) if isinstance(plan, list) else plan
+                    plan_parts.append(Markdown(plan_str))
+                
+                parts.append(Panel(Group(*plan_parts), title=header, border_style="blue"))
+
         current_content = "".join(self.current_response_parts)
         if current_content:
             parts.append(Markdown(current_content))
             
-        if not parts and self.is_generating:
-            parts.append(Spinner("dots", text=f"[dim {DIM}]connecting...[/dim {DIM}]"))
+        if self.is_generating:
+            elapsed = time.time() - self.generation_start_time
+            idle_time = time.time() - self.last_chunk_time
+            status_text = f" {self.current_status}  [{elapsed:.1f}s]"
+            if idle_time > 15:
+                status_text += f"  ⚠ idle {idle_time:.0f}s"
+            self.spinner.text = Text(status_text, style=f"bold {ACCENT}")
+            parts.append(self.spinner)
             
-        return render_to_ansi(Group(*parts))
+        return self._render_to_ansi(Group(*parts))
+
+    def _render_to_ansi(self, renderable):
+        """Helper to render a rich object to ANSI using a persistent console."""
+        # Clear the internal buffer
+        self.r_console.file.seek(0)
+        self.r_console.file.truncate()
+        self.r_console.print(renderable)
+        return self.r_console.file.getvalue()
 
     def _get_welcome_panel(self):
         return Panel(
@@ -316,39 +430,110 @@ class ChatUI:
             title=f"[bold {PRIMARY}]EzClaw[/bold {PRIMARY}]",
         )
 
-    def _build_tool_panel(self, tool):
+    def _build_tool_panel(self, tool, index=None):
         tool_name = tool["name"]
         args = tool.get("args", {})
         result = tool.get("result")
+        expanded = tool.get("expanded", False)
+
+        # Truncation limits flex based on expand state. Expanded uses a generous
+        # cap so we still avoid runaway 10MB dumps, but show effectively all
+        # normal tool output.
+        args_cap = 200 if expanded else 5
+        diff_cap = 2000 if expanded else 20
+        read_cap = 5000 if expanded else 25
+        output_cap = 5000 if expanded else 100
+
+        idx_label = f"[{index}] " if index is not None else ""
+        state_label = "  ⇣ expanded" if expanded else ""
         header = Text.assemble(
             ("▸ ", f"bold {WARN}"),
-            (tool_name, f"bold"),
+            (idx_label, f"dim {DIM}"),
+            (tool_name, "bold"),
+            (state_label, f"dim {ACCENT}"),
         )
         tool_parts = []
         if args:
-            arg_str = "\n".join([f"[bold]{k}:[/bold] {v}" for k, v in args.items()])
-            tool_parts.append(Panel(self._truncate_text(arg_str, max_lines=5), title="args", border_style=f"dim {DIM}"))
+            arg_lines = []
+            for k, v in args.items():
+                arg_lines.append(Text.assemble((f"{k}: ", "bold"), (str(v), "")))
+            arg_text = Text("\n").join(arg_lines)
+            tool_parts.append(Panel(self._truncate_text(arg_text, max_lines=args_cap), title="args", border_style=f"dim {DIM}"))
+
         if result:
             renderable_result = str(result)
             if tool_name == "write_file" and "Diff:" in renderable_result:
                 parts_of_result = renderable_result.split("Diff:\n", 1)
                 if len(parts_of_result) > 1:
                     tool_parts.append(Text(parts_of_result[0]))
-                    tool_parts.append(Syntax(self._truncate_text(parts_of_result[1], 20), "diff", theme="monokai", background_color="default"))
+                    diff_content = self._truncate_text(parts_of_result[1], diff_cap)
+                    if isinstance(diff_content, Text):
+                        diff_content = diff_content.plain
+                    tool_parts.append(Syntax(diff_content, "diff", theme="monokai", background_color="default"))
                 else:
-                    tool_parts.append(Panel(self._truncate_text(renderable_result), title="output", border_style=DIM))
+                    tool_parts.append(Panel(self._truncate_text(renderable_result, max_lines=output_cap), title="output", border_style=DIM))
             elif tool_name == "read_file":
-                tool_parts.append(Syntax(self._truncate_text(renderable_result, 25), "python", theme="monokai", background_color="default"))
+                path_arg = str(args.get("path", "")) if args else ""
+                lang = self._detect_lang(path_arg)
+                file_content = self._truncate_text(renderable_result, read_cap)
+                if isinstance(file_content, Text):
+                    file_content = file_content.plain
+                tool_parts.append(Syntax(file_content, lang, theme="monokai", background_color="default"))
             else:
-                tool_parts.append(Panel(self._truncate_text(renderable_result), title="output", border_style=DIM))
+                tool_parts.append(Panel(self._truncate_text(Text(renderable_result), max_lines=output_cap), title="output", border_style=DIM))
+
+            # Hint only when truncation could have hidden something AND not expanded.
+            if not expanded and index is not None:
+                result_lines = renderable_result.count("\n") + 1
+                # Heuristic: if result is multi-line and likely above caps, surface the hint.
+                if result_lines > 20:
+                    tool_parts.append(Text(f"  /expand {index}  to show full output", style=f"dim {DIM} italic"))
         else:
-            tool_parts.append(Text("running...", style=f"dim {DIM}"))
+            start_time = tool.get("start_time")
+            elapsed = time.time() - start_time if start_time else 0
+            label = f"running... ({elapsed:.1f}s)" if elapsed > 1 else "running..."
+            tool_parts.append(Text(label, style=f"dim {DIM}"))
         return Panel(Group(*tool_parts), title=header, border_style=DIM, box=ROUNDED)
 
-    def _truncate_text(self, text: str, max_lines: int = 1000) -> str:
+    _LANG_BY_EXT = {
+        ".py": "python", ".js": "javascript", ".ts": "typescript",
+        ".tsx": "tsx", ".jsx": "jsx", ".rs": "rust", ".go": "go",
+        ".rb": "ruby", ".sh": "bash", ".bash": "bash", ".zsh": "bash",
+        ".fish": "fish", ".json": "json", ".yaml": "yaml", ".yml": "yaml",
+        ".toml": "toml", ".md": "markdown", ".sql": "sql", ".html": "html",
+        ".css": "css", ".c": "c", ".cc": "cpp", ".cpp": "cpp", ".h": "c",
+        ".hpp": "cpp", ".java": "java", ".kt": "kotlin", ".swift": "swift",
+        ".lua": "lua", ".vim": "vim", ".env": "ini", ".cfg": "ini",
+        ".ini": "ini", ".dockerfile": "dockerfile",
+    }
+
+    @classmethod
+    def _detect_lang(cls, path: str) -> str:
+        path_lower = path.lower()
+        if path_lower.endswith(("dockerfile",)):
+            return "dockerfile"
+        for ext, lang in cls._LANG_BY_EXT.items():
+            if path_lower.endswith(ext):
+                return lang
+        return "text"
+
+    def _truncate_text(self, content: Any, max_lines: int = 1000) -> Any:
+        """Truncates text or Text objects and appends a styled notice."""
+        if isinstance(content, Text):
+            lines = content.split("\n")
+            if len(lines) > max_lines:
+                new_content = Text("\n").join(lines[:max_lines])
+                new_content.append(f"\n\n... (Output truncated at {max_lines} lines) ...", style=f"bold {WARN}")
+                return new_content
+            return content
+            
+        # Fallback for strings
+        text = str(content)
         lines = text.splitlines()
         if len(lines) > max_lines:
-            return "\n".join(lines[:max_lines]) + f"\n\n[bold {WARN}]... (Output truncated at {max_lines} lines) ...[/bold {WARN}]"
+            # We use Text.from_markup here to ensure the styling is parsed correctly
+            msg = f"\n\n[bold {WARN}]... (Output truncated at {max_lines} lines) ...[/bold {WARN}]"
+            return Text.assemble("\n".join(lines[:max_lines]), Text.from_markup(msg))
         return text
 
     def handle_input(self, text):
@@ -367,9 +552,28 @@ class ChatUI:
         self.reasoning_chunks = []
         self.tool_executions = []
         self.side_messages = []
+        self.architect_intent = None
+        self.current_status = "connecting..."
+        self.generation_start_time = time.time()
+        self.last_chunk_time = time.time()
         
         self._update_ui()
+        # Start redraw loop for animations
+        self._start_animation_loop()
         threading.Thread(target=self._agent_worker, args=(text,), daemon=True).start()
+
+    def _start_animation_loop(self):
+        """Periodically triggers UI updates to animate spinners using the native event loop."""
+        loop = getattr(self.app, 'loop', None)
+        if not loop:
+            return
+
+        def tick():
+            if self.is_generating:
+                self._update_ui()
+                loop.call_later(0.1, tick)
+        
+        loop.call_later(0.1, tick)
 
     def _handle_command(self, cmd):
         global SHOW_THINKING
@@ -404,6 +608,8 @@ class ChatUI:
                 "| `/thinking [on|off]` | Toggle thinking visualization |\n"
                 "| `/settings` | Show system settings |\n"
                 "| `/authorize` | Toggle session-wide tool authorization |\n"
+                "| `/expand [N|last|all]` | Expand a truncated tool panel (defaults to last) |\n"
+                "| `/collapse [N|all]` | Re-collapse an expanded tool panel (defaults to all) |\n"
                 "| `exit` / `quit` | Exit EzClaw |\n"
             )
             self.history_ansi.append(render_to_ansi(Panel(Markdown(help_text), title="help", border_style=DIM)))
@@ -413,22 +619,74 @@ class ChatUI:
             self.agent.clear_session_history()
             self.history_ansi = []
             self.welcome_shown = False
+        elif cmd.startswith("/expand") or cmd.startswith("/collapse"):
+            self._toggle_tool_expansion(cmd)
         else:
             self.history_ansi.append(render_to_ansi(Text(f"Unknown command: {cmd}", style=ERR)))
-        
+
         self._update_ui()
+
+    def _toggle_tool_expansion(self, cmd: str):
+        """Handle /expand and /collapse commands.
+
+        Forms: /expand N | /expand last | /expand all
+               /collapse N | /collapse all
+        Only operates on tools of the currently-rendering turn. Historical
+        tool panels already frozen into history_ansi cannot be re-expanded
+        from here — re-issue the prompt if you need them open.
+        """
+        parts = cmd.split()
+        action = parts[0]
+        target_state = (action == "/expand")
+        if not self.tool_executions:
+            self.history_ansi.append(render_to_ansi(
+                Text("No tools in the current turn to expand. (Historical tools are frozen.)",
+                     style=f"dim {DIM}")
+            ))
+            return
+
+        if len(parts) < 2:
+            # Default target for /expand is "last", for /collapse is "all".
+            target = "last" if target_state else "all"
+        else:
+            target = parts[1].strip()
+
+        if target == "all":
+            for t in self.tool_executions:
+                t["expanded"] = target_state
+        elif target == "last":
+            self.tool_executions[-1]["expanded"] = target_state
+        else:
+            try:
+                idx = int(target) - 1
+                if 0 <= idx < len(self.tool_executions):
+                    self.tool_executions[idx]["expanded"] = target_state
+                else:
+                    self.history_ansi.append(render_to_ansi(
+                        Text(f"No tool with index {target}. (Tools 1..{len(self.tool_executions)})", style=ERR)
+                    ))
+                    return
+            except ValueError:
+                self.history_ansi.append(render_to_ansi(
+                    Text(f"Usage: {action} <N> | {action} last | {action} all", style=ERR)
+                ))
+                return
 
     def _agent_worker(self, user_input):
         gen = self.agent.chat_stream(user_input)
         try:
             chunk = next(gen)
             while True:
-                if chunk["type"] == "reasoning":
+                self.last_chunk_time = time.time()
+                if chunk["type"] == "intent":
+                    self.architect_intent = chunk
+                elif chunk["type"] == "reasoning":
                     self.reasoning_chunks.append(chunk["content"])
                 elif chunk["type"] == "content":
                     self.current_response_parts.append(chunk["content"])
                 elif chunk["type"] == "status":
-                    self.side_messages.append(chunk["content"].strip())
+                    self.current_status = chunk["content"].strip()
+                    self.side_messages.append(self.current_status)
                 elif chunk["type"] == "auth_required":
                     self.auth_active = True
                     self._update_ui()
@@ -443,7 +701,7 @@ class ChatUI:
                         self.side_messages.append(f"📎 {m}")
                 elif chunk["type"] == "tool_start":
                     is_int = chunk.get("interactive", False)
-                    self.tool_executions.append({"name": chunk["name"], "args": chunk["arguments"], "result": None, "interactive": is_int})
+                    self.tool_executions.append({"name": chunk["name"], "args": chunk["arguments"], "result": None, "interactive": is_int, "start_time": time.time(), "expanded": False})
                 elif chunk["type"] == "tool_end":
                     for tool in reversed(self.tool_executions):
                         if tool["name"] == chunk["name"] and tool["result"] is None:
