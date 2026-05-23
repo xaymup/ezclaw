@@ -59,12 +59,14 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ── Theme (opencode-inspired) ───────────────────────────────────
-PRIMARY = "#ffd700"  # gold1
-SECONDARY = "#bdbdbd" # grey74
-ACCENT = "#00ff00"   # green
-WARN = "#ff8c00"     # dark_orange
-ERR = "#ff0000"      # red
-DIM = "#808080"      # grey50
+from theme import THEME, TITLE_GRADIENT, ACTIVITY_FRAMES
+
+PRIMARY = THEME.palette.primary
+SECONDARY = THEME.palette.secondary
+ACCENT = THEME.palette.accent
+WARN = THEME.palette.warn
+ERR = THEME.palette.err
+DIM = THEME.palette.dim
 
 class Theme:
     primary = PRIMARY
@@ -437,14 +439,6 @@ class ChatUI:
         self.r_console.print(renderable)
         return self.r_console.file.getvalue()
 
-    _ROLE_COLOR = {
-        "executor": "#5fafff",   # blue
-        "researcher": "#5fd75f", # green
-        "debugger":   "#ff6f6f", # red
-        "general":    "#d75fd7", # magenta
-        "architect":  "#ffd700", # gold (matches PRIMARY)
-    }
-
     @staticmethod
     def _clean_field(value):
         if value is None:
@@ -465,7 +459,7 @@ class ChatUI:
         reasoning = self._clean_field(intent.get("reasoning"))
         plan = self._clean_field(intent.get("plan"))
 
-        role_color = self._ROLE_COLOR.get(agent, SECONDARY)
+        role_color = THEME.role(agent).color
 
         if not self.show_architect:
             # Compact: dim one-liner — keeps routing context visible without
@@ -521,11 +515,11 @@ class ChatUI:
             # Multi-agent: enumerate each role with its model.
             body.append("⚡ Multi-agent\n", style=f"bold {PRIMARY}")
             arch_model = getattr(self.agent.architect, "model", "?") if hasattr(self.agent, "architect") else "?"
-            color = self._ROLE_COLOR.get("architect", PRIMARY)
+            color = THEME.role("architect").color
             body.append(f"  architect   ", style=f"bold {color}")
             body.append(f"{arch_model}\n", style=SECONDARY)
             for role, sub_agent in self.agent.agents.items():
-                color = self._ROLE_COLOR.get(role, SECONDARY)
+                color = THEME.role(role).color
                 body.append(f"  {role:<11} ", style=f"bold {color}")
                 body.append(f"{sub_agent.model}\n", style=SECONDARY)
         else:
