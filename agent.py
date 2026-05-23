@@ -76,13 +76,25 @@ def match_skills(user_input: str, skills: List[Dict[str, str]], top_n: int = 5, 
     return [by_name[n] for n in matched_names if n in by_name][:top_n]
 
 def format_skills_block(skills: List[Dict[str, str]]) -> str:
-    """Format matched skills into a context block."""
+    """Format matched skills as DIRECTIVE procedures.
+
+    The previous wrapper (`<available_skills>` … `</available_skills>`)
+    read as background context the model often ignored. The new wrapper
+    is imperative: it tells the model these are proven procedures that
+    take precedence over a freshly-invented approach. The model still
+    has discretion when a skill genuinely doesn't fit, but the default
+    is to follow."""
     if not skills:
         return ""
-    block = "\n<available_skills>\n"
+    block = (
+        "\n## ⚑ MATCHED SKILLS — APPLY THESE PROCEDURES (do NOT re-derive)\n"
+        "These are saved, verified procedures that match the current\n"
+        "request. Follow them step-by-step. If you choose NOT to follow\n"
+        "one, name the skill and state why in `reasoning`.\n"
+    )
     for skill in skills:
-        block += f"\n## {skill['name']}\n{skill['content']}\n"
-    block += "</available_skills>\n"
+        block += f"\n### Skill: {skill['name']}\n{skill['content']}\n"
+    block += "\n## (end matched skills)\n"
     return block
 
 class ChatAgent:

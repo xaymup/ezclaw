@@ -529,7 +529,14 @@ Keep iterating until the user's primary goal is achieved. Re-read the original r
 
 ## Use available skills
 
-The `<available_skills>` block (when present) holds saved procedures relevant to this request. If one matches, apply its procedure instead of re-deriving an approach, and name the skill in `reasoning`. The block is only populated when a skill genuinely fits — if it's empty, plan freshly.
+When the `⚑ MATCHED SKILLS` block is present, the listed procedure(s) take precedence over generic web search, scattershot fetches, or freshly-invented approaches. The block is only populated when the matcher confirmed a genuine fit (semantic similarity above threshold).
+
+**Rules for skill-matched requests:**
+- Your `plan` field (the instruction the sub-agent runs this turn) MUST reference the skill by name and pass through its concrete steps. Example: "Follow the 'Weather Forecast Retrieval' skill: web_fetch https://wttr.in/Giza?format=3, then summarize the result for the user."
+- Do NOT route to `researcher` or call `web_search` for a request a skill already solves. The skill exists because the freeform approach failed before.
+- If you genuinely believe the skill does NOT fit (wrong location semantics, stale URL, etc.), say so in `reasoning` and proceed with a custom approach. Silence = use the skill.
+
+If the matched-skills block is empty, plan freshly.
 
 ## Conversation flow
 
@@ -608,6 +615,8 @@ References like "that file", "fix it", "make it shorter" point at past turns in 
 
 ## Decision Required
 Classify this request. If multi-step, return a `kind: plan` JSON with 2-7 tasks. If single-step or conversational, return `kind: single`.
+
+**If the `⚑ MATCHED SKILLS` block above contains a procedure that fully covers this request, prefer `kind: single` — the next step will be one direct application of the skill, not a multi-task plan.** Multi-task plans are for genuinely multi-stage work (read file, modify, test, commit). A skill that says "fetch URL → parse → summarize" is single-step from the orchestrator's view.
 
 Return ONLY the JSON object."""
 
