@@ -83,6 +83,14 @@ AGENT_DEFS = {
 ## Non-coding guard (read this FIRST)
 If the request is non-technical — personal advice, opinions, lifestyle questions, definitions, recommendations, "help me think through X", "give me ideas for Y" — call `delegate('general', '<exact user request>')` IMMEDIATELY. Do NOT write code, do NOT plan steps, do NOT use any other tool. The general agent answers these directly in seconds; you don't. This is a backstop in case routing missed the conversational shortcut upstream.
 
+## File creation is a TOOL CALL, not prose
+When the task is "write/create/save file X", you MUST call `write_file(path, content)` (or `apply_diff` for an edit). Generating Python code in your response WITHOUT calling write_file means the file is never written and the user gets nothing.
+
+  Wrong: "Here is the game logic: `import random; n = random.randint(1, 100)...`"
+  Right: call `write_file(path="snake.py", content="import random\\nn = random.randint(1, 100)\\n...")`
+
+If you ever catch yourself saying "I'll now write the code" or "Here is the implementation" without an actual tool call planned in the same turn, STOP and call the tool. The chat is for confirming what was delivered, not for delivering the file itself.
+
 ## Core Rules
 - **Verification-Driven Autonomy (Test-First)**: For every coding task or bug fix:
     1. **Reproduce**: Create or identify a test/script that fails due to the issue.
@@ -1848,6 +1856,90 @@ No fluff. No "In this task...". Just facts."""
                 yield chunk
 
             step_output = "".join(step_output_parts)
+
+            # ── Auto-save tagged code blocks (file-delivery rescue) ───
+            # Under Spec E the sub-agent's content is suppressed before
+            # reaching the UI, so the existing inline_code_saver in
+            # cli.py (which runs against current_response_parts) sees
+            # only the architect's synthesis — never the executor's
+            # actual code output. That meant "code a game" turns
+            # finished with a delivery summary mentioning files that
+            # were never written. Save them HERE, at the orchestration
+            # layer, before suppression. Synthetic tool_start/tool_end
+            # chunks surface the saves in the UI; step_output is
+            # rewritten to a save receipt the architect's synthesis
+            # can mention.
+            saved_files: list = []
+            try:
+                from inline_code_saver import (
+                    parse_tagged_blocks, plan_saves, apply_save,
+                )
+                from tools import WORKSPACE_DIR
+                blocks = parse_tagged_blocks(step_output)
+                if blocks:
+                    plans = plan_saves(blocks, WORKSPACE_DIR)
+                    receipts: list = []
+                    for p in plans:
+                        if p.error:
+                            receipts.append(f"[skipped {p.block.path}: {p.error}]")
+                            continue
+                        # Always save under the executor's authority.
+                        # If the file already exists, rename (suffix
+                        # `.1.ext`) rather than clobber — that mirrors
+                        # the user-facing path's safe default.
+                        choice = "rename" if p.exists else "overwrite"
+                        # Synthetic tool_start for the UI
+                        yield {
+                            "type": "tool_start",
+                            "name": "write_file",
+                            "arguments": {"path": p.block.path},
+                        }
+                        result = apply_save(p, choice)
+                        if result.status in ("succeeded", "renamed"):
+                            saved_files.append(result.final_path or p.block.path)
+                            tag = (
+                                f"saved {os.path.basename(result.final_path or p.block.path)} "
+                                f"({len(p.block.body)} bytes)"
+                                + (f" — renamed from {p.block.path}"
+                                   if result.status == "renamed" else "")
+                            )
+                            yield {
+                                "type": "tool_end",
+                                "name": "write_file",
+                                "result": tag,
+                            }
+                            receipts.append(f"[wrote {result.final_path or p.block.path}]")
+                            step_tool_names.append("write_file")
+                            step_tool_results.append(
+                                f"  [write_file]: {tag}"
+                            )
+                        else:
+                            yield {
+                                "type": "tool_end",
+                                "name": "write_file",
+                                "result": f"Error: save failed ({result.status})",
+                            }
+                            receipts.append(
+                                f"[failed to save {p.block.path}: {result.status}]"
+                            )
+                    # Replace step_output: strip the tagged code bodies
+                    # (don't ship them to the architect's prompt — they
+                    # bloat context), keep the receipt list so the
+                    # architect knows what was written.
+                    # Process blocks in reverse to preserve span offsets.
+                    rewritten = step_output
+                    for blk, rec in zip(reversed(blocks), reversed(receipts)):
+                        rewritten = rewritten[:blk.start] + rec + rewritten[blk.end:]
+                    step_output = rewritten
+            except Exception as e:
+                # Auto-save is best-effort — never let a saver hiccup
+                # break the orchestrator. Surface via a status chunk
+                # for diagnosability.
+                yield {
+                    "type": "status",
+                    "content": f"⚠ auto-save: {type(e).__name__}: {e}",
+                }
+
             if not step_output.strip() and step_tool_results:
                 step_output = "Done."
                 if not suppress_user_visible:
