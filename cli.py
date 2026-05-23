@@ -113,6 +113,13 @@ from rich.text import Text
 from rich.syntax import Syntax
 from rich.spinner import Spinner
 from rich.console import Group
+
+def _make_custom_spinner(frames, color):
+    """Build a Spinner with a custom frame list and 10fps cadence."""
+    sp = Spinner(name="dots", text="", style=f"bold {color}")
+    sp.frames = list(frames)
+    sp.interval = 0.1
+    return sp
 from rich.box import ROUNDED
 
 class ChatUI:
@@ -132,7 +139,6 @@ class ChatUI:
         
         # Persistent rich objects for animations
         self.r_console = Console(file=io.StringIO(), force_terminal=True, width=100)
-        self.spinner = Spinner("dots", style=f"bold {ACCENT}")
 
         # Generation timing & health tracking
         self.generation_start_time = 0.0
@@ -174,6 +180,10 @@ class ChatUI:
         )
 
         self.welcome_shown = False
+
+        # Track the most recently routed role so the spinner and chip
+        # can pick role-specific visuals.
+        self.current_role: str | None = None
 
         # Architect strategy panels: hidden by default — they dominated the
         # screen with mostly-redundant information. The compact chip below
@@ -361,6 +371,11 @@ class ChatUI:
         arch_badge = "  ·  🧠 STRATEGY" if self.show_architect else ""
         return f"  {auth_icon}  {mode} {model_info}  ·  {msg_count} msgs{live}{copy_badge}{arch_badge}  |  [Ctrl+C] Exit  [F2] Copy  [F3] Strategy  [Arrows] Scroll"
 
+    def _spinner_for(self, role):
+        """Return a Spinner instance using the role's frame list and color."""
+        rs = THEME.role(role or "")
+        return _make_custom_spinner(rs.spinner_frames, rs.color)
+
     def _get_current_renderable_ansi(self):
 
         if not self.is_generating and not self.current_response_parts and not self.reasoning_chunks and not self.tool_executions:
@@ -423,12 +438,14 @@ class ChatUI:
         if self.is_generating:
             elapsed = time.time() - self.generation_start_time
             idle_time = time.time() - self.last_chunk_time
-            status_text = f" {self.current_status}  [{elapsed:.1f}s]"
+            rs = THEME.role(self.current_role or "")
+            status_text = f" {rs.icon} {self.current_status}  [{elapsed:.1f}s]"
             if idle_time > 15:
                 status_text += f"  ⚠ idle {idle_time:.0f}s"
-            self.spinner.text = Text(status_text, style=f"bold {ACCENT}")
-            parts.append(self.spinner)
-            
+            spinner = self._spinner_for(self.current_role)
+            spinner.text = Text(status_text, style=f"bold {rs.color}")
+            parts.append(spinner)
+
         return self._render_to_ansi(Group(*parts))
 
     def _render_to_ansi(self, renderable):
@@ -668,6 +685,7 @@ class ChatUI:
         self.tool_executions = []
         self.side_messages = []
         self.architect_intent = None
+        self.current_role = None
         self.current_status = "connecting..."
         self.generation_start_time = time.time()
         self.last_chunk_time = time.time()
@@ -864,6 +882,9 @@ class ChatUI:
                 self.last_chunk_time = time.time()
                 if chunk["type"] == "intent":
                     self.architect_intent = chunk
+                    new_role = chunk.get("agent")
+                    if new_role:
+                        self.current_role = new_role
                 elif chunk["type"] == "reasoning":
                     self.reasoning_chunks.append(chunk["content"])
                 elif chunk["type"] == "content":
