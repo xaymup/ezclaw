@@ -703,6 +703,22 @@ class ChatUI:
             title=f"[bold {PRIMARY}]{MASCOT} EzClaw[/bold {PRIMARY}]",
         )
 
+    def _one_line_tool_head(self, tool_kind, tool_name, args, index):
+        """Build the icon + index + name + (args) prefix used by the
+        one-line collapsed/running tool entries. Returns a Text that the
+        caller can extend with summary or running-verb tails."""
+        line = Text()
+        line.append(f"{tool_kind.icon} ", style=f"bold {tool_kind.color}")
+        if index is not None:
+            line.append(f"[{index}] ", style=f"dim {DIM}")
+        line.append(tool_name, style=f"bold {tool_kind.color}")
+        if args:
+            sig = self._format_args_inline(args)
+            line.append("(", style=f"dim {DIM}")
+            line.append(sig, style=f"dim {DIM}")
+            line.append(")", style=f"dim {DIM}")
+        return line
+
     @staticmethod
     def _format_args_inline(args, max_len=60):
         """Render an args dict as a function-call signature for the title.
@@ -742,12 +758,51 @@ class ChatUI:
         args_cap = 200
 
         tool_kind = THEME.tool_kind(tool_name)
-        idx_label = f"[{index}] " if index is not None else ""
-        state_label = "  ▴ expanded" if expanded else "  ▾ collapsed"
 
-        # Compact mode inlines args into the title as a function-call signature;
-        # full mode keeps the standalone "args" sub-panel below (only when
-        # expanded — collapsed never shows the args panel either).
+        # ── Running: one-line indicator (no border) ────────────────────────
+        if not result:
+            start_time = tool.get("start_time")
+            elapsed = time.time() - start_time if start_time else 0
+            # The whimsical verb is picked once per tool execution and cached
+            # on the tool dict — without caching, it would shuffle on every
+            # UI tick and produce a vertigo-inducing flicker.
+            verb = tool.get("_running_verb")
+            if verb is None:
+                from phrases import pick as _pick, TOOL_RUNNING as _TR
+                verb = _pick(_TR)
+                tool["_running_verb"] = verb
+            elapsed_str = f" ({elapsed:.1f}s)" if elapsed > 1 else ""
+            line = self._one_line_tool_head(tool_kind, tool_name, args, index)
+            line.append(f"   ⏳ {verb}…{elapsed_str}", style=f"dim {DIM} italic")
+            return line
+
+        # We have a result. Compute the one-line summary and whether the
+        # output has more content than the summary captures.
+        renderable_result = str(result)
+        non_empty_lines = [l for l in renderable_result.splitlines() if l.strip()]
+        summary = None
+        if non_empty_lines:
+            first = non_empty_lines[0].strip()
+            # Cap a bit tighter in one-line view so the row fits without
+            # wrapping on typical terminal widths.
+            summary = first[:60] + ("…" if len(first) > 60 else "")
+        has_more = len(non_empty_lines) > 1 or (
+            bool(non_empty_lines) and len(non_empty_lines[0]) > 60
+        )
+
+        # ── Collapsed: ONE LINE, no border ─────────────────────────────────
+        if not expanded:
+            line = self._one_line_tool_head(tool_kind, tool_name, args, index)
+            if summary:
+                line.append("   ↳ ", style=f"dim {DIM}")
+                line.append(summary, style=f"dim {DIM} italic")
+            if has_more and index is not None:
+                line.append(f"   [/expand {index}]", style=f"dim {DIM} italic")
+            return line
+
+        # ── Expanded: full bordered panel ──────────────────────────────────
+        idx_label = f"[{index}] " if index is not None else ""
+        state_label = "  ▴ expanded"
         header_parts = [
             (f"{tool_kind.icon} ", f"bold {tool_kind.color}"),
             (idx_label, f"dim {DIM}"),
@@ -762,59 +817,6 @@ class ChatUI:
         header = Text.assemble(*header_parts)
 
         tool_parts = []
-
-        # Tool still running — always show the "running" indicator regardless
-        # of expand state. (No body to hide yet.)
-        if not result:
-            start_time = tool.get("start_time")
-            elapsed = time.time() - start_time if start_time else 0
-            # The whimsical verb is picked once per tool execution and cached
-            # on the tool dict — without caching, it would shuffle on every
-            # UI tick and produce a vertigo-inducing flicker.
-            verb = tool.get("_running_verb")
-            if verb is None:
-                from phrases import pick as _pick, TOOL_RUNNING as _TR
-                verb = _pick(_TR)
-                tool["_running_verb"] = verb
-            label = f"{verb}… ({elapsed:.1f}s)" if elapsed > 1 else f"{verb}…"
-            tool_parts.append(Text(label, style=f"dim {DIM}"))
-            return Panel(
-                Group(*tool_parts),
-                title=header,
-                border_style=f"dim {tool_kind.color}",
-                box=ROUNDED,
-            )
-
-        # We have a result. Compute the one-line summary and whether the
-        # output has more content than the summary captures.
-        renderable_result = str(result)
-        non_empty_lines = [l for l in renderable_result.splitlines() if l.strip()]
-        summary = None
-        if non_empty_lines:
-            first = non_empty_lines[0].strip()
-            summary = first[:80] + ("…" if len(first) > 80 else "")
-        # Output has "more" iff there are 2+ non-empty lines OR the first
-        # line itself exceeded the 80-char cap (and thus got truncated).
-        has_more = len(non_empty_lines) > 1 or (
-            bool(non_empty_lines) and len(non_empty_lines[0]) > 80
-        )
-
-        if not expanded:
-            # Collapsed: summary line, then optionally a hint to expand
-            # if there's content the summary couldn't show.
-            if summary:
-                tool_parts.append(Text(f"  ↳ {summary}", style=f"dim {DIM} italic"))
-            if has_more and index is not None:
-                tool_parts.append(Text(
-                    f"  /expand {index}  to show full output",
-                    style=f"dim {DIM} italic",
-                ))
-            return Panel(
-                Group(*tool_parts),
-                title=header,
-                border_style=f"dim {tool_kind.color}",
-                box=ROUNDED,
-            )
 
         # ── Expanded: render the full body ─────────────────────────────────
         if not compact and args:
