@@ -1093,9 +1093,27 @@ Return ONLY the JSON object."""
     # ── Routing Enhancements ──────────────────────────────────
 
     ROUTING_EXAMPLES = [
-        # General chat
+        # General chat — greetings, acks, small talk
         ("hello", "general"), ("hi how are you", "general"), ("thanks", "general"),
         ("goodbye", "general"), ("good morning", "general"),
+        # Advice / wellness / opinion / "help me think through" — route
+        # directly to general; the architect's multi-step plan adds zero
+        # value when the answer is "here's what I'd suggest", and burns
+        # 15s+ per architect turn for no reason.
+        ("help me create a morning routine", "general"),
+        ("help me create a routine for myself", "general"),
+        ("give me ideas for", "general"),
+        ("suggest some tips for", "general"),
+        ("how do I stay motivated", "general"),
+        ("what should I do about", "general"),
+        ("can you advise me on", "general"),
+        ("what's your opinion on", "general"),
+        ("help me think through", "general"),
+        ("explain in simple terms", "general"),
+        ("what does it mean when someone says", "general"),
+        ("how do I deal with", "general"),
+        ("recommend a book about", "general"),
+        ("what are some habits for", "general"),
         # Research / web lookup
         ("search the web for", "researcher"), ("look up information about", "researcher"),
         ("find documentation for", "researcher"), ("what is the latest news", "researcher"),
@@ -1225,6 +1243,50 @@ Return ONLY the JSON object."""
                 yield {"type": "content", "content": last_step_output}
             return
 
+    def _self_check_answer(self, user_input: str, candidate_response: str) -> Optional[dict]:
+        """One-shot LLM gate: does the candidate response address the
+        user's original prompt? Returns {ok: bool, missing: str} or None
+        on any failure.
+
+        Designed to catch the "the agent declared complete but the
+        answer doesn't address the question" case. Used by the
+        completion gate, capped at one retry per turn so a pessimistic
+        checker can't trap the orchestrator."""
+        if not candidate_response or len(candidate_response.strip()) < 20:
+            # Too short to meaningfully address anything; reject without
+            # spending a model call.
+            return {"ok": False, "missing": "response is empty or trivially short"}
+        prompt = (
+            "You are a strict response-quality gate. Decide if the "
+            "candidate response addresses the user's original prompt.\n\n"
+            "Return JSON only:\n"
+            '  {"ok": true}\n'
+            "    when the response answers the prompt directly. Don't be "
+            "pedantic — a reasonable, on-topic answer is OK even if not "
+            "exhaustive.\n"
+            '  {"ok": false, "missing": "<one short phrase: what would '
+            'turn this into an actual answer>"}\n'
+            "    only when the response truly fails to address the "
+            "prompt — generic refusal, off-topic, error message, or "
+            'empty restatement. NEVER respond with missing="more detail" '
+            "or similar vague feedback — the missing field must point "
+            "at a concrete gap.\n\n"
+            f"User prompt:\n{user_input[:600]}\n\n"
+            f"Candidate response:\n{candidate_response[:2000]}\n\n"
+            "Return ONLY the JSON object."
+        )
+        try:
+            content = self.architect._chat(prompt, temperature=0.0)
+            data = extract_json(content)
+        except Exception:
+            return None
+        if not isinstance(data, dict):
+            return None
+        return {
+            "ok": bool(data.get("ok")),
+            "missing": (data.get("missing") or "").strip(),
+        }
+
     def _short_circuit_classify(self, user_input: str) -> Optional[str]:
         # Layer 1: cheap textual heuristic for trivial chat. Anything that
         # looks like a short greeting / acknowledgement / nonsense one-liner
@@ -1323,6 +1385,9 @@ No fluff. No "In this task...". Just facts."""
         agent_has_responded = False
         step_history = []
         final_response = ""
+        # Cap on _self_check_answer retries — without this, a pessimistic
+        # checker could keep extending the plan forever.
+        self_check_attempts = 0
 
         for a in self.agents.values():
             a.messages = [a.messages[0]]
@@ -1496,6 +1561,43 @@ No fluff. No "In this task...". Just facts."""
                     if synthesis_parts:
                         final_response = "".join(synthesis_parts).strip()
                 final_text = final_response.strip() if final_response else "Task completed."
+
+                # Self-check: did the synthesized response actually
+                # address the user's original prompt? Capped at one retry
+                # so the gate can't spin forever even if the checker is
+                # always pessimistic. On "missing", we insert a corrective
+                # task and re-enter the loop; on the next completion
+                # attempt the cap is hit and we accept.
+                if self_check_attempts < 1:
+                    self_check_attempts += 1
+                    verdict = self._self_check_answer(user_input, final_text)
+                    if verdict and not verdict.get("ok") and verdict.get("missing"):
+                        missing = verdict["missing"][:240]
+                        yield {
+                            "type": "status",
+                            "content": f"self-check: missing {missing!r} — extending plan",
+                        }
+                        # If we have an active plan, insert a corrective
+                        # task; otherwise create a tiny single-step plan
+                        # so the architect's next execute() has somewhere
+                        # to attach the corrective step.
+                        if self.current_plan is None:
+                            from plan import Plan, Task
+                            self.current_plan = Plan(
+                                title=user_input[:80],
+                                tasks=[Task(id=1, description=f"Address missing: {missing}", status="pending")],
+                            )
+                            yield {"type": "plan_created", "plan": self.current_plan}
+                        else:
+                            last_id = max((t.id for t in self.current_plan.tasks), default=0)
+                            self.current_plan.insert(last_id, f"Address missing: {missing}")
+                            yield {"type": "plan_update", "plan": self.current_plan}
+                        # Continue the loop so the corrective task runs.
+                        # Reset the local "complete" signal — the architect
+                        # will produce a fresh intent on next iteration.
+                        agent_has_responded = False
+                        continue
+
                 self._append_conversation_turn(user_input, final_text, step_history, self.current_plan)
 
                 # PILLAR 1: Store experience
@@ -1685,12 +1787,18 @@ No fluff. No "In this task...". Just facts."""
             # end-of-loop (Spec E). step_output is captured into step_history
             # below so the synthesis can summarize it.
 
-            if suppress_user_visible:
-                # Tell the user the debugger handed off so they can see
-                # something happened — without exposing the analysis.
+            # Hand-off status: only fire when this sub-agent actually
+            # produced output. Silent steps stay silent — otherwise every
+            # architect iteration emits a confusing handoff line even when
+            # the sub-agent did nothing (the previous bug fired this on
+            # every step including ones that routed to `general` with no
+            # output, claiming the "debugger" was the source). Neutral
+            # phrasing now since Spec E applies to all agents, not just
+            # the debugger.
+            if suppress_user_visible and (step_output.strip() or step_tool_results):
                 yield {
                     "type": "status",
-                    "content": "debugger: analysis complete → architect updating plan",
+                    "content": f"{agent_key}: handing off to architect",
                 }
 
             agent_has_responded = bool(step_output.strip() or step_tool_results)
@@ -1706,8 +1814,32 @@ No fluff. No "In this task...". Just facts."""
                 "output": step_output[:3000],
                 "tools": step_tool_names,
                 "outcome": outcome,
+                "task_id": intent.get("current_task_id"),
             }
             step_history.append(step_record)
+
+            # Auto-advance the just-finished task if the architect didn't
+            # explicitly close it via task_updates. Without this, plans get
+            # stuck on `pending` forever because deepseek-r1 often omits
+            # the field. Conservative: only advance to `done` when the step
+            # produced output AND had no error keywords. Failure cases stay
+            # in_progress so the architect can decide whether to retry or
+            # skip.
+            #
+            # task_updates from THIS turn's intent (already applied above
+            # via _apply_intent_to_plan) take precedence — we never overwrite
+            # an explicit status the architect set.
+            if (
+                self.current_plan is not None
+                and outcome == "SUCCESS"
+                and (step_output.strip() or step_tool_results)
+            ):
+                tid = intent.get("current_task_id")
+                if tid:
+                    task = self.current_plan.get_task(tid)
+                    if task is not None and task.status == "in_progress":
+                        self.current_plan.advance(tid, "done")
+                        yield {"type": "plan_update", "plan": self.current_plan}
 
             step_ctx = step_output[:3000]
             if step_tool_results:

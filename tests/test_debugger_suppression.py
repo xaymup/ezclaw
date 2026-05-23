@@ -131,20 +131,18 @@ def test_final_response_does_not_pick_up_debugger_output():
     assert "tests pass" in final_response
 
 
-def test_debugger_step_still_yields_a_status_handoff_message():
-    """The user shouldn't see the debugger's analysis, but they SHOULD
-    see *something* happening — a short status line confirming the
-    handoff back to the architect, so the chat doesn't look frozen."""
-    # The contract: after a debugger step finishes, the orchestrator
-    # yields a status chunk announcing the handoff.
-    expected_status = "debugger: analysis complete → architect updating plan"
-
-    # We test the literal string the implementation yields. If the
-    # message text changes, update this assertion AND the message in
-    # multi_agent.py — they must match.
+def test_sub_agent_step_yields_neutral_handoff_status():
+    """The user shouldn't see the sub-agent's raw output (Spec E
+    suppresses everyone), but they SHOULD see *something* happening
+    when the sub-agent produced output — a short status line so the
+    chat doesn't look frozen. The phrasing must be neutral (not say
+    'debugger' on a general/executor step), and the handoff must NOT
+    fire on silent steps that produced no output (that bug emitted
+    'debugger: analysis complete' on every architect iteration)."""
     import multi_agent
     src = open(multi_agent.__file__).read()
-    assert expected_status in src, (
-        "The debugger-handoff status message changed in multi_agent.py "
-        "but this test wasn't updated. Keep them in sync."
-    )
+    # Neutral phrasing — parameterized on the actual agent_key, not
+    # hardcoded to "debugger"
+    assert 'f"{agent_key}: handing off to architect"' in src
+    # And the yield is gated on step_output or tool results
+    assert "step_output.strip() or step_tool_results" in src
