@@ -1,10 +1,13 @@
 import ollama
 import os
 import json
+import pickle
 import re
 from typing import List, Dict, Any, Optional, Callable, Iterator
 from memory import Database
 from tools import registry, create_memory_tools
+from tools import MUTATING_TOOLS, create_action_tracking_tools, set_session_context
+from action_tracking import classify_outcome, extract_why, summarize_action
 from embed import embed, cosine_similarity
 from model_client import build_agent_client
 from dotenv import load_dotenv
@@ -114,6 +117,7 @@ class ChatAgent:
         }
         
         create_memory_tools(self.db)
+        create_action_tracking_tools(self.db)
         self.tools = registry.get_tool_definitions()
         self.skills = load_skills()
         self.skill_descriptions = "\n".join([f"- {s['name']}: {s['content'].split('## Description')[1].split('##')[0].strip() if '## Description' in s['content'] else 'No description'}" for s in self.skills])
@@ -123,7 +127,8 @@ class ChatAgent:
             self.session_id = session_id
         else:
             self.session_id = self.db.get_last_session_id() or self.db.create_session()
-            
+
+        set_session_context(self.session_id)
         self.messages = self.db.get_messages(self.session_id)
         self.system_prompt = self._load_system_prompt()
         self._ensure_system_message()
@@ -287,6 +292,37 @@ Respond with JSON only:
                     return
                 yield raw_buffer, ("", True)
                 return
+
+    def _record_action(self, tool_name: str, args: dict, result: str, assistant_text: str) -> None:
+        """Record one mutating tool call to the actions table.
+
+        Best-effort: any failure inside this method is logged to stderr
+        and swallowed — never propagates out and never blocks the tool.
+        """
+        try:
+            from embed import embed as _embed
+            summary = summarize_action(tool_name, args)
+            why = extract_why(assistant_text)
+            outcome, error_excerpt = classify_outcome(result)
+            embed_text = f"{summary} {why or ''}".strip()
+            try:
+                vec = _embed(embed_text)
+                emb_blob = pickle.dumps(vec)
+            except Exception:
+                emb_blob = None
+            self.db.add_action(
+                session_id=self.session_id,
+                tool=tool_name,
+                args_json=json.dumps(args, default=str),
+                summary=summary,
+                why=why,
+                outcome=outcome,
+                error_excerpt=error_excerpt,
+                embedding=emb_blob,
+            )
+        except Exception as e:
+            import sys
+            print(f"[action-tracking] record failed: {e}", file=sys.stderr)
 
     def clear_session_history(self):
         """Restores the chat history to just the system prompt."""
@@ -535,6 +571,13 @@ Respond with JSON only:
                 tool_msg = {'role': 'tool', 'content': result_str, 'name': tool.function.name}
                 self.messages.append(tool_msg)
                 self.db.add_message(self.session_id, "tool", result_str)
+                if tool.function.name in MUTATING_TOOLS:
+                    self._record_action(
+                        tool_name=tool.function.name,
+                        args=tool.function.arguments,
+                        result=full_result,
+                        assistant_text=full_response,
+                    )
                 yield {"type": "tool_end", "name": tool.function.name, "result": full_result}
 
         if iteration_count >= max_iterations:
