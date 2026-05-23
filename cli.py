@@ -183,6 +183,13 @@ class ChatUI:
         self._last_chip_role: str | None = None
         self._chip_flash_until: float = 0.0
 
+        # Active plan from the most recent run. None means "no plan, hide panel".
+        self.current_plan = None
+        # Track previous statuses so we can detect transitions and flash the row.
+        self._last_task_states: dict = {}
+        # task_id → monotonic timestamp at which the flash window expires.
+        self._task_flash_until: dict = {}
+
         # Cache one Spinner per role — rich's Spinner derives its current
         # frame from (now - start_time) / interval, so re-creating a fresh
         # spinner each tick would always reset start_time and freeze the
@@ -738,6 +745,9 @@ class ChatUI:
         self.current_role = None
         self._last_chip_role = None
         self._chip_flash_until = 0.0
+        self.current_plan = None
+        self._last_task_states = {}
+        self._task_flash_until = {}
         self.current_status = "connecting..."
         self.generation_start_time = time.time()
         self.last_chunk_time = time.time()
@@ -932,7 +942,19 @@ class ChatUI:
             chunk = next(gen)
             while True:
                 self.last_chunk_time = time.time()
-                if chunk["type"] == "intent":
+                if chunk["type"] == "plan_created":
+                    self.current_plan = chunk["plan"]
+                    self._last_task_states = {t.id: t.status for t in self.current_plan.tasks}
+                elif chunk["type"] == "plan_update":
+                    new_plan = chunk["plan"]
+                    now = time.time()
+                    for task in new_plan.tasks:
+                        prev = self._last_task_states.get(task.id)
+                        if prev is not None and prev != task.status:
+                            self._task_flash_until[task.id] = now + 0.15
+                        self._last_task_states[task.id] = task.status
+                    self.current_plan = new_plan
+                elif chunk["type"] == "intent":
                     self.architect_intent = chunk
                     new_role = chunk.get("agent")
                     if new_role:
