@@ -29,7 +29,8 @@ AGENT_DEFS = {
 - **Interactive Shell Handling**: 
     - ALWAYS use `interactive=True` for commands that require user input (e.g., `sudo`, `pacman`, `apt`, `pip` installs that might prompt, `vim`, `ssh`).
     - When running an interactive command, tell the user in your reasoning that they may need to provide input (like a password).
-- **Workspace Awareness**: When the user names a file (e.g. "agent.py", "README.md"), ALWAYS try `read_file(path)` with the path EXACTLY as given first. Only if that returns a "does not exist" error should you try alternates like `workspace/<path>`. Do NOT pre-emptively `list_dir` to "verify" the file exists — just attempt the read. List_dir is for discovery, not validation.
+- **Workspace Sandbox (IMPORTANT)**: All `read_file`, `write_file`, and `list_dir` paths are RESOLVED RELATIVE to the `workspace/` directory. So `read_file("foo.py")` reads `workspace/foo.py`. You CANNOT read files outside `workspace/` (e.g. project source like `agent.py` is NOT accessible — if asked about those, say so and use `run_shell` with `cat` if absolutely needed). Pass paths as relative names ("foo.py"), not as `workspace/foo.py` — that would resolve to `workspace/workspace/foo.py`. Use `list_dir(".")` to see what's in the workspace root.
+- **Don't pre-validate**: Just call `read_file(path)` — if it errors, then act. Do NOT `list_dir` first to "check if the file exists."
 - **Verification First**: Before modifying or copying a file, verify its existence and content to avoid redundant work.
 - After each tool result, proceed to the NEXT step. Do NOT repeat a step unless it failed and you have a new approach.
 - Do NOT ask questions. Do NOT say "how can I help". Just execute.
@@ -37,9 +38,10 @@ AGENT_DEFS = {
 - When all steps are done, provide a comprehensive summary of what was accomplished and the final state of the task.
 
 ## Output
-- **Be Verbose**: Provide detailed commentary on your progress. Explain what you found in tool results and why you are moving to the next step.
-- Show diffs for edits, summaries for long output.
-- After running a command, include relevant output (errors, key lines).""",
+- **Lead with the answer.** First line states the result ("Wrote add.py with the add(a,b) function.", "Tests pass: 8/8.", "Found 3 matches: ..."). No preamble, no "In this task I will..." narration.
+- For multi-step work, follow the lead line with a short bulleted recap of what each step did. One line per step. Skip steps that did nothing notable.
+- Show diffs for edits, key lines for command output, summaries for long output. Do NOT paste entire tool outputs back to the user — the TUI already shows tool panels.
+- If something failed, say so directly on the lead line ("Could not X because Y") and stop — don't dress up failures.""",
     },
     "researcher": {
         "model": os.getenv("OLLAMA_RESEARCHER_MODEL", "qwen3.5:9b"),
@@ -736,20 +738,27 @@ No fluff. No "In this task...". Just facts."""
                     self._conversation_history.append({"user": user_input, "assistant": sc_output.strip()})
                     return
 
+        # Hoist constant-per-turn lookups out of the step loop.
+        # These all depend only on user_input, which doesn't change across architect steps —
+        # running them per-step was N embed+search calls per turn for no extra signal.
+        memory_facts = self.db.search_memories_hybrid(user_input[:1000], alpha=0.6)
+        memory_block = f"\n[Memory]: {memory_facts}\n" if memory_facts else ""
+
+        routing_priors = self.db.search_similar_routing(user_input[:1000], limit=3)
+        routing_block = self._format_routing_priors(routing_priors)
+
+        experiences = self.db.search_experiences(user_input[:1000], limit=2)
+        exp_block = "\n## Lessons Learned from Past Tasks\n" + "\n".join(
+            [f"- Task: {e['task']}\n  Result: {e['trace']}" for e in experiences]
+        ) + "\n" if experiences else ""
+
         for step in range(1, max_steps + 1):
             yield {"type": "status", "content": f"Architect: Analyzing task state (Step {step}/{max_steps})..."}
 
-            memory_facts = self.db.search_memories_hybrid(user_input[:1000], alpha=0.6)
-            memory_block = f"\n[Memory]: {memory_facts}\n" if memory_facts else ""
+            # Skills still computed per-step because they match against task_context,
+            # which grows as steps complete.
             matched_skills = match_skills(task_context, self.skills)
             skills_block = format_skills_block(matched_skills)
-
-            routing_priors = self.db.search_similar_routing(user_input[:1000], limit=3)
-            routing_block = self._format_routing_priors(routing_priors)
-
-            # Pillar 1: Lessons Learned (Experiences)
-            experiences = self.db.search_experiences(user_input[:1000], limit=2)
-            exp_block = "\n## Lessons Learned from Past Tasks\n" + "\n".join([f"- Task: {e['task']}\n  Result: {e['trace']}" for e in experiences]) + "\n" if experiences else ""
 
             self._prune_architect()
             intent = self.architect.analyze(task_context, memory_block, skills_block, routing_block=routing_block, history_block=history_block, map_block=map_block, experiences_block=exp_block)
