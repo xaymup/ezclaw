@@ -121,6 +121,7 @@ class ChatUI:
         self.history_ansi = []
         self.current_response_parts = []
         self.reasoning_chunks = []
+        # self.reasoning_log initialized further down (line ~268)
         self.tool_executions = []
         self.side_messages = []
         self.halted = False
@@ -250,6 +251,22 @@ class ChatUI:
         # `skill_offer` chunk. The draft sits here until the user
         # presses Y (save) or N (skip).
         self._pending_skill_offer: dict | None = None
+
+        # ── Unified reasoning log (Tier 2.1) ───────────────────────────
+        # All reasoning-style content flows into this single log,
+        # rendered by _render_reasoning_panel as ONE collapsible panel.
+        # Sources:
+        #   - architect intent reflections (goal / observation /
+        #     critical_thinking, one row per architect step)
+        #   - sub-agent <think> chunks (`reasoning` chunks)
+        #   - skill match notices
+        #   - self-check verdicts
+        #
+        # Each entry: {kind, label, body, time}.
+        # Toggle: Ctrl+R or /reasoning. Default state follows the
+        # SHOW_THINKING env var so existing user config is honored.
+        self.reasoning_log: list[dict] = []
+        self.show_reasoning: bool = SHOW_THINKING
 
         self._wire_tool_callbacks()
 
@@ -609,6 +626,13 @@ class ChatUI:
         def _(event):
             self.auth_queue.put("allow_session")
 
+        # Reasoning panel toggle (Tier 2.1) — Ctrl+R flips
+        # show_reasoning. /reasoning command does the same via _handle_command.
+        @self.kb.add('c-r')
+        def _(event):
+            self.show_reasoning = not self.show_reasoning
+            self._update_ui()
+
         # Skill-offer Y/N — active only when a draft is parked and no
         # auth prompt is competing for the same keys.
         _skill_offer_pending = Condition(
@@ -862,34 +886,20 @@ class ChatUI:
         for msg in self.side_messages[-3:]:
             parts.append(Text(msg, style=f"dim {DIM} italic"))
 
-        # 2. Reasoning / thinking panel
-        current_reasoning = "".join(self.reasoning_chunks)
-        if SHOW_THINKING and current_reasoning:
-            stripped = current_reasoning.strip()
-            char_count = len(stripped)
-            word_count = len(stripped.split())
-            still_thinking = self.is_generating and not self.current_response_parts
-            from phrases import THINKING_BADGE, THOUGHT_BADGE
-            badge = f"{THINKING_BADGE}…" if still_thinking else THOUGHT_BADGE
-            REASON_COLOR = "#9999cc"
-            body_text = Text()
-            body_text.append(stripped, style=f"italic {REASON_COLOR}")
-            parts.append(Panel(
-                body_text,
-                title=f"[bold {REASON_COLOR}]{badge}[/bold {REASON_COLOR}]  [dim {DIM}]({word_count}w · {char_count}c)[/dim {DIM}]",
-                border_style=f"dim {REASON_COLOR}",
-                box=ROUNDED,
-                padding=(0, 1),
-            ))
+        # 2. Unified reasoning panel (Tier 2.1)
+        # Collapses what used to be three separate UI elements:
+        #   - the "thinking" panel (sub-agent <think> blocks)
+        #   - the architect chip (current intent one-liner)
+        #   - the F3-expanded architect panel (per-step reflections)
+        # into one chronological log gated on `self.show_reasoning`.
+        reasoning_panel = self._render_reasoning_panel()
+        if reasoning_panel is not None:
+            parts.append(reasoning_panel)
 
         # 3. Assistant response (model output — moved up from bottom)
         current_content = "".join(self.current_response_parts)
         if current_content:
             parts.append(Markdown(current_content))
-
-        # 4. Architect chip
-        if self.architect_intent and self.current_plan is None:
-            parts.append(self._render_architect_intent(self.architect_intent))
 
         # 5. Tool execution panels.
         #    Tools that ran inside a plan step are nested INSIDE the plan
@@ -1005,6 +1015,73 @@ class ChatUI:
         if not s or s.lower() in ("n/a", "none", "null"):
             return ""
         return s
+
+    def _render_reasoning_panel(self):
+        """Unified Reasoning panel — replaces the architect chip + the
+        SHOW_THINKING <think> panel + the F3-expanded architect panel.
+
+        Returns a rich.Panel containing chronological reasoning entries
+        from all sources (architect reflections, sub-agent <think>,
+        skill matches, self-check verdicts). Returns None when:
+          - the user has collapsed the panel (`self.show_reasoning = False`)
+          - there's nothing to show yet
+
+        Each entry is rendered as one line:
+            ◈ architect → executor  goal: Add the function · observation: ...
+            ✦ general                think: A morning routine could include...
+            ⚐ self-check             missing 'specific exercises'
+        """
+        if not self.show_reasoning:
+            # Even when collapsed, show a one-line summary chip so the
+            # user knows reasoning IS happening — otherwise the panel
+            # vanishes and the chat feels like the agent is silent.
+            if not self.reasoning_log:
+                return None
+            n = len(self.reasoning_log)
+            latest = self.reasoning_log[-1]
+            preview = latest["body"]
+            if len(preview) > 80:
+                preview = preview[:77] + "…"
+            REASON_COLOR = "#9999cc"
+            line = Text()
+            line.append(f"🧠 reasoning ({n}) · ", style=f"dim {REASON_COLOR}")
+            line.append(preview, style=f"italic dim {REASON_COLOR}")
+            line.append("   [Ctrl+R] expand", style=f"dim {DIM}")
+            return line
+
+        if not self.reasoning_log:
+            return None
+
+        REASON_COLOR = "#9999cc"
+        # Icon per source kind. Architect/agent borrow the role icon
+        # via the theme; skills and self-check have fixed glyphs.
+        kind_icons = {
+            "architect": "◈",
+            "agent": "✦",
+            "skill": "⚑",
+            "self_check": "⚐",
+        }
+        body = Text()
+        for i, entry in enumerate(self.reasoning_log[-15:]):  # cap to last 15
+            icon = kind_icons.get(entry["kind"], "·")
+            label = entry["label"]
+            text = entry["body"]
+            if len(text) > 240:
+                text = text[:237] + "…"
+            body.append(f"{icon} ", style=f"bold {REASON_COLOR}")
+            body.append(f"{label:<18}", style=f"bold dim {REASON_COLOR}")
+            body.append(text, style=f"italic {REASON_COLOR}")
+            if i < min(len(self.reasoning_log), 15) - 1:
+                body.append("\n")
+        n = len(self.reasoning_log)
+        title = f"🧠 Reasoning  ·  {n} entr{'y' if n == 1 else 'ies'}"
+        return Panel(
+            body,
+            title=f"[bold {REASON_COLOR}]{title}[/bold {REASON_COLOR}]  [dim {DIM}](Ctrl+R / /reasoning)[/dim {DIM}]",
+            border_style=f"dim {REASON_COLOR}",
+            box=ROUNDED,
+            padding=(0, 1),
+        )
 
     def _render_plan_panel(self):
         """Render the active plan as a sticky panel. Returns None when no plan."""
@@ -1648,6 +1725,7 @@ class ChatUI:
             self.history_ansi.append(final_renderable)
             self.current_response_parts = []
             self.reasoning_chunks = []
+            self.reasoning_log = []
             self.tool_executions = []
             self.side_messages = []
             self.halted = False
@@ -1664,6 +1742,7 @@ class ChatUI:
         self.is_generating = True
         self.current_response_parts = []
         self.reasoning_chunks = []
+        self.reasoning_log = []
         self.tool_executions = []
         self.side_messages = []
         self.architect_intent = None
@@ -1734,6 +1813,19 @@ class ChatUI:
             self.agent.session_authorized = not self.agent.session_authorized
             status = "ENABLED (Always Allow)" if self.agent.session_authorized else "DISABLED (Ask per tool)"
             self.history_ansi.append(render_to_ansi(Text(f"Session authorization: {status}", style=ACCENT)))
+        elif cmd.startswith("/reasoning"):
+            # Toggle the unified reasoning panel (Tier 2.1). Accepts
+            # `on` / `off` argument or no-arg for plain toggle.
+            if " on" in cmd:
+                target = True
+            elif " off" in cmd:
+                target = False
+            else:
+                target = not self.show_reasoning
+            self.show_reasoning = target
+            self.history_ansi.append(render_to_ansi(
+                Text(f"Reasoning panel: {'ON' if target else 'OFF'}", style=DIM)
+            ))
         elif cmd == "/cancel":
             # Escape hatch: unblock a pending ask_user so the user can
             # abandon a question without typing an answer (the agent
@@ -2091,12 +2183,47 @@ class ChatUI:
                             self._chip_flash_until = time.time() + 0.15
                         self._last_chip_role = new_role
                         self.current_role = new_role
+                    # Tier 2.1: archive each architect step into the
+                    # unified reasoning log so we can show the FULL
+                    # history of decisions, not just the latest.
+                    refl = chunk.get("reflection") or {}
+                    summary_bits = []
+                    for k in ("goal", "observation", "critical_thinking"):
+                        v = (refl.get(k) or "").strip()
+                        if v:
+                            summary_bits.append(f"{k}: {v}")
+                    body = " · ".join(summary_bits) or (chunk.get("reasoning") or "")
+                    if body:
+                        self.reasoning_log.append({
+                            "kind": "architect",
+                            "label": f"architect → {new_role or '?'}",
+                            "body": body.strip(),
+                            "time": time.time(),
+                        })
                 elif chunk["type"] == "reasoning":
                     self.reasoning_chunks.append(chunk["content"])
+                    # Also feed into the unified log for the new panel.
+                    text = (chunk.get("content") or "").strip()
+                    if text:
+                        self.reasoning_log.append({
+                            "kind": "agent",
+                            "label": self.current_role or "agent",
+                            "body": text,
+                            "time": time.time(),
+                        })
                 elif chunk["type"] == "content":
                     self.current_response_parts.append(chunk["content"])
                 elif chunk["type"] == "status":
                     self.current_status = chunk["content"].strip()
+                    # Pipe self-check verdicts into the reasoning log so
+                    # users can see why the loop extended a plan.
+                    if self.current_status.startswith("self-check:"):
+                        self.reasoning_log.append({
+                            "kind": "self_check",
+                            "label": "self-check",
+                            "body": self.current_status[len("self-check:"):].strip(),
+                            "time": time.time(),
+                        })
                     # The architect chip / spinner status line already
                     # surface the current status; don't ALSO stack each
                     # one as a dim italic line in side_messages — that
@@ -2183,6 +2310,7 @@ class ChatUI:
             self.history_ansi.append(final_renderable)
             self.current_response_parts = []
             self.reasoning_chunks = []
+            self.reasoning_log = []
             self.tool_executions = []
             self.side_messages = []
         self._update_ui()
@@ -2497,6 +2625,7 @@ class ChatUI:
         self.is_generating = True
         self.current_response_parts = []
         self.reasoning_chunks = []
+        self.reasoning_log = []
         self.tool_executions = []
         self.side_messages = []
         self.architect_intent = None
