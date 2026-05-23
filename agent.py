@@ -300,7 +300,7 @@ Respond with JSON only:
             augment_prefix = f"{memory_block}{skills_block}\n---\n"
 
         iteration_count = 0
-        max_iterations = 8 
+        max_iterations = 15
         last_tool_hash = None
 
         # Tool pre-selection: only pass tools relevant to the current query

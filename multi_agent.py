@@ -29,8 +29,9 @@ AGENT_DEFS = {
 - **Interactive Shell Handling**: 
     - ALWAYS use `interactive=True` for commands that require user input (e.g., `sudo`, `pacman`, `apt`, `pip` installs that might prompt, `vim`, `ssh`).
     - When running an interactive command, tell the user in your reasoning that they may need to provide input (like a password).
-- **Workspace Sandbox (IMPORTANT)**: All `read_file`, `write_file`, and `list_dir` paths are RESOLVED RELATIVE to the `workspace/` directory. So `read_file("foo.py")` reads `workspace/foo.py`. You CANNOT read files outside `workspace/` (e.g. project source like `agent.py` is NOT accessible — if asked about those, say so and use `run_shell` with `cat` if absolutely needed). Pass paths as relative names ("foo.py"), not as `workspace/foo.py` — that would resolve to `workspace/workspace/foo.py`. Use `list_dir(".")` to see what's in the workspace root.
+- **Workspace Sandbox (IMPORTANT)**: ALL file and shell tools operate from the SAME `workspace/` directory. `read_file("foo.py")` reads `workspace/foo.py`; `run_shell("make")` runs `make` from inside `workspace/`. Pass paths as relative names ("foo.py", "blex_os/Makefile") — NEVER prefix with `workspace/` yourself, that double-prefixes to `workspace/workspace/foo.py`. The project source (`agent.py`, `multi_agent.py`, etc.) lives OUTSIDE the sandbox and is not accessible.
 - **Don't pre-validate**: Just call `read_file(path)` — if it errors, then act. Do NOT `list_dir` first to "check if the file exists."
+- **Verify after every change.** If you `write_file` or run any mutating shell command (make, pip install, git commit, mv, rm, etc.), you MUST IN THE SAME TURN re-run the verification command (e.g. `make`, the test suite, `cat` the resulting file) BEFORE declaring success. Editing the file is not the same as fixing it. NEVER write "build succeeded" or "fix applied" based on a successful write_file alone — base success on a successful build/test/cat output.
 - **Verification First**: Before modifying or copying a file, verify its existence and content to avoid redundant work.
 - After each tool result, proceed to the NEXT step. Do NOT repeat a step unless it failed and you have a new approach.
 - Do NOT ask questions. Do NOT say "how can I help". Just execute.
@@ -403,7 +404,8 @@ Before deciding on an action, you must perform a mandatory reflection:
 - If the current agent failed ([FAILURE]), diagnose the cause. Route to `debugger` if needed, or to `executor` with a REFINED strategy.
 
 ## Completion Rules:
-- Set `complete:true` ONLY when the user's FULL original intent is satisfied AND verified.
+- Set `complete:true` ONLY when the user's FULL original intent is satisfied AND VERIFIED by a tool call (a successful build, a passing test, a `cat` of the resulting file, a `git log` showing the commit, etc).
+- **Refuse premature completion.** If the most recent agent turn ended with `write_file` or any mutating shell command (make, pip install, git commit, mv, rm) WITHOUT a subsequent successful verification command, set `complete:false` and route back to the executor with the plan "Verify the previous change by running <appropriate verify command>." An edit is not a fix; an install is not a working build. Demand evidence.
 
 ## Reasoning style (for the `reflection` and `reasoning` fields):
 - One short sentence per field. Direct. No "Let me consider…" filler.

@@ -173,6 +173,11 @@ class ChatUI:
 
         self.welcome_shown = False
 
+        # Architect strategy panels: hidden by default — they dominated the
+        # screen with mostly-redundant information. The compact chip below
+        # still shows the routing decision; F3 toggles the full panels back.
+        self.show_architect = False
+
     def _wrap_tools(self):
         from tools import registry
         original_run_shell = registry.tools.get('run_shell')
@@ -247,6 +252,12 @@ class ChatUI:
             # click-drag selects text the way the terminal natively expects,
             # so the user can copy. Press F2 again to re-enable scroll bindings.
             self._mouse_capture = not self._mouse_capture
+            event.app.invalidate()
+
+        @self.kb.add('f3')
+        def _(event):
+            self.show_architect = not self.show_architect
+            self._update_ui()
             event.app.invalidate()
 
         @self.kb.add('y', filter=Condition(lambda: self.auth_active))
@@ -345,7 +356,8 @@ class ChatUI:
             live = f"  ·  ⚙ {n_tools} tool{'s' if n_tools != 1 else ''}  ·  {elapsed:.1f}s"
 
         copy_badge = "  ·  ✂ COPY MODE" if not self._mouse_capture else ""
-        return f"  {auth_icon}  {mode} {model_info}  ·  {msg_count} msgs{live}{copy_badge}  |  [Ctrl+C] Exit  [F2] Copy  [Arrows] Scroll"
+        arch_badge = "  ·  🧠 STRATEGY" if self.show_architect else ""
+        return f"  {auth_icon}  {mode} {model_info}  ·  {msg_count} msgs{live}{copy_badge}{arch_badge}  |  [Ctrl+C] Exit  [F2] Copy  [F3] Strategy  [Arrows] Scroll"
 
     def _get_current_renderable_ansi(self):
 
@@ -400,37 +412,7 @@ class ChatUI:
              ))
 
         if self.architect_intent:
-            reflection = self.architect_intent.get("reflection", {})
-            if reflection:
-                goal = reflection.get("goal", "N/A")
-                obs = reflection.get("observation", "N/A")
-                ct = reflection.get("critical_thinking", "N/A")
-                
-                parts.append(Panel(
-                    Text.assemble(
-                        ("GOAL: ", f"bold {PRIMARY}"), (f"{goal}\n", ""),
-                        ("OBSERVATION: ", f"bold {WARN}"), (f"{obs}\n", ""),
-                        ("CRITICAL THINKING: ", f"bold {ACCENT}"), (ct, "")
-                    ),
-                    title="[bold blue]Architect Reflection[/bold blue]",
-                    border_style="blue",
-                    padding=(1, 2)
-                ))
-            
-            # Also show plan/reasoning
-            reasoning = self.architect_intent.get("reasoning", "")
-            plan = self.architect_intent.get("plan", "")
-            if reasoning or plan:
-                header = Text.assemble(("Strategy & Plan", "bold blue"))
-                plan_parts = []
-                if reasoning:
-                    plan_parts.append(Text(f"{reasoning}\n", style="italic"))
-                if plan:
-                    # Plan might be a string or list
-                    plan_str = "\n".join(plan) if isinstance(plan, list) else plan
-                    plan_parts.append(Markdown(plan_str))
-                
-                parts.append(Panel(Group(*plan_parts), title=header, border_style="blue"))
+            parts.append(self._render_architect_intent(self.architect_intent))
 
         current_content = "".join(self.current_response_parts)
         if current_content:
@@ -462,6 +444,72 @@ class ChatUI:
         "general":    "#d75fd7", # magenta
         "architect":  "#ffd700", # gold (matches PRIMARY)
     }
+
+    @staticmethod
+    def _clean_field(value):
+        if value is None:
+            return ""
+        if isinstance(value, list):
+            value = "\n".join(str(v) for v in value)
+        s = str(value).strip()
+        if not s or s.lower() in ("n/a", "none", "null"):
+            return ""
+        return s
+
+    def _render_architect_intent(self, intent):
+        agent = intent.get("agent") or "?"
+        reflection = intent.get("reflection") or {}
+        goal = self._clean_field(reflection.get("goal"))
+        obs = self._clean_field(reflection.get("observation"))
+        ct = self._clean_field(reflection.get("critical_thinking"))
+        reasoning = self._clean_field(intent.get("reasoning"))
+        plan = self._clean_field(intent.get("plan"))
+
+        role_color = self._ROLE_COLOR.get(agent, SECONDARY)
+
+        if not self.show_architect:
+            # Compact: dim one-liner — keeps routing context visible without
+            # the screen-eating panels. F3 expands.
+            headline = goal or (plan.splitlines()[0] if plan else reasoning) or "thinking…"
+            if len(headline) > 110:
+                headline = headline[:107] + "…"
+            line = Text()
+            line.append("→ ", style=f"dim {DIM}")
+            line.append(agent, style=f"bold {role_color}")
+            line.append(" · ", style=f"dim {DIM}")
+            line.append(headline, style=f"italic {DIM}")
+            line.append("   [F3] expand", style=f"dim {DIM}")
+            return line
+
+        # Expanded view: only render fields with real content; collapse
+        # reasoning into plan when it's a substring/prefix to avoid the
+        # double-printed prose that bloated the old layout.
+        body = Text()
+        body.append("agent: ", style=f"bold {DIM}")
+        body.append(agent + "\n", style=f"bold {role_color}")
+        if goal:
+            body.append("goal: ", style=f"bold {PRIMARY}")
+            body.append(goal + "\n", "")
+        if obs:
+            body.append("observation: ", style=f"bold {WARN}")
+            body.append(obs + "\n", "")
+        if ct:
+            body.append("critical thinking: ", style=f"bold {ACCENT}")
+            body.append(ct + "\n", "")
+
+        sections = [body]
+        if reasoning and not (plan and reasoning.lower() in plan.lower()):
+            sections.append(Text(reasoning, style="italic"))
+        if plan:
+            sections.append(Markdown(plan))
+
+        return Panel(
+            Group(*sections),
+            title=f"[bold {role_color}]architect[/bold {role_color}]  [dim {DIM}]([F3] collapse)[/dim {DIM}]",
+            border_style=f"dim {role_color}",
+            box=ROUNDED,
+            padding=(0, 1),
+        )
 
     def _get_welcome_panel(self):
         body = Text()
@@ -680,6 +728,7 @@ class ChatUI:
                 "| `/collapse [N|all]` | Re-collapse an expanded tool panel (defaults to all) |\n"
                 "| `/copy [last\\|all\\|N]` | Copy assistant text to clipboard (OSC52) |\n"
                 "| `[F2]` | Toggle copy mode (terminal-native selection) |\n"
+                "| `[F3]` | Toggle architect strategy/reflection panel |\n"
                 "| `exit` / `quit` | Exit EzClaw |\n"
             )
             self.history_ansi.append(render_to_ansi(Panel(Markdown(help_text), title="help", border_style=DIM)))

@@ -21,11 +21,19 @@
 ### Multi-Agent Routing (Super-Architect)
 - The project uses an iterative **Super-Architect** pattern for complex tasks.
 - **Orchestration**: The Architect (`phi4-reasoning:plus`) creates a multi-step plan and delegates sub-tasks sequentially.
-- **Iterative Review**: After an agent completes a task (e.g., Researcher finds information), the Architect reviews the result and decides if the next step (e.g., Executor writing code) is needed.
+- **Loop Detection**: The system uses a `(agent_key, plan)` hashing mechanism to detect and stop redundant loops (e.g., if the Architect keeps sending the same plan to the same agent).
+- **Context Management**: 
+    - The Architect maintains a `task_context` that summarizes older steps while keeping full details for the most recent 3 steps.
+    - Error detection is nuanced: it only triggers the `debugger` for active failures, not for mentions of resolved errors.
+- **Workspace Awareness**: Agents follow a "Path Verification Protocol," checking both root and `workspace/` directories and verifying file content before taking action to avoid redundant copies.
+- **Interactive Shell Handling**: 
+    - For commands requiring user input (e.g., `sudo`, `pacman`, `vim`), agents must use `interactive=True` in `run_shell`.
+    - This triggers a TUI suspension, allowing the user to interact directly with the terminal.
+    - Agents are instructed to inform the user when an interactive session is starting.
+- **Iterative Review**: After an agent completes a task, the Architect reviews the result and decides if the next step is needed.
 - **Workflow**:
     1. Architect analyzes the request and provides a `plan`.
     2. Architect delegates the next step with specific `reasoning`.
     3. Specialized Agent executes and returns output.
     4. Architect reviews output and repeats or finalizes.
-- **Context Management**: The Super-Architect maintains a `task_context` that accumulates results across iterations, ensuring consistency during multi-model handoffs.
 

@@ -85,72 +85,137 @@ def clean_html(html: str) -> str:
     text = re.sub(r'\s+', ' ', text).strip()
     return text
 
+class WorkspacePathError(ValueError):
+    """Raised when a tool path cannot be safely resolved inside the workspace."""
+
 def get_workspace_path(path: str) -> str:
-    """Ensure path is within the workspace directory and prevent escapes."""
-    # Convert to absolute path for the workspace
+    """Resolve a tool-supplied path to an absolute path inside the workspace.
+
+    Failure modes the agent kept hitting:
+      - Passes `/home/lulu/Projects/ezclaw/foo.py` (an absolute project path).
+        The old code did `lstrip('/')` and joined it onto workspace/, producing
+        `workspace/home/lulu/Projects/ezclaw/foo.py`. Now we raise instead, so
+        the agent gets a clear error and corrects itself.
+      - Passes `workspace/foo.py` or even `workspace/workspace/foo.py`.
+        We strip every leading `workspace/` segment, not just one.
+      - Uses `..` to escape. Caught by the final boundary check.
+    """
+    if not isinstance(path, str) or not path.strip():
+        raise WorkspacePathError("Path is empty.")
+
     base_dir = os.path.abspath(WORKSPACE_DIR)
-    
-    # If the model provides a path already containing the workspace dir, strip it
-    # This fixes double-prefixing like workspace/workspace/file.py
+    base_with_sep = base_dir + os.path.sep
     norm_path = os.path.normpath(path)
-    
-    # If it's an absolute path that starts with our base_dir, it's already "safe"
-    # but we should still normalize it.
+
     if os.path.isabs(norm_path):
-        if norm_path.startswith(base_dir):
+        # Absolute is only allowed if it already lives inside the sandbox.
+        # We require a separator boundary so /foo/workspace doesn't masquerade
+        # as a child of /foo/workspace-other.
+        if norm_path == base_dir or norm_path.startswith(base_with_sep):
             return norm_path
-        # If it's an absolute path outside workspace, strip the root to make it relative
-        norm_path = norm_path.lstrip(os.path.sep)
-    
-    # Remove any redundant workspace prefix from the relative path
-    rel_parts = norm_path.split(os.path.sep)
-    if rel_parts and rel_parts[0] == WORKSPACE_DIR:
-        norm_path = os.path.sep.join(rel_parts[1:])
-    
-    # Join and ensure final path is within base_dir
+        raise WorkspacePathError(
+            f"Path '{path}' is outside the workspace sandbox. "
+            f"Pass a relative path (e.g. 'foo.py', 'subdir/bar.py'), "
+            f"not an absolute path. The sandbox root is '{base_dir}'."
+        )
+
+    # Strip every leading `workspace/` segment the agent may have tacked on.
+    rel_parts = [p for p in norm_path.split(os.path.sep) if p not in ("", ".")]
+    while rel_parts and rel_parts[0] == WORKSPACE_DIR:
+        rel_parts = rel_parts[1:]
+    norm_path = os.path.sep.join(rel_parts) if rel_parts else "."
+
     final_path = os.path.abspath(os.path.join(base_dir, norm_path))
-    
-    if not final_path.startswith(base_dir):
-        # Fallback to just the filename if something went wrong or traversal was attempted
-        return os.path.join(base_dir, os.path.basename(norm_path))
-        
+
+    if final_path != base_dir and not final_path.startswith(base_with_sep):
+        raise WorkspacePathError(
+            f"Path '{path}' escapes the workspace sandbox via '..' or similar."
+        )
+
     return final_path
+
+@registry.register
+def get_system_info() -> str:
+    """
+    Get information about the current system (OS, shell, user, package manager).
+    Use this to adapt your commands to the local environment.
+    """
+    try:
+        import platform
+        import getpass
+        info = [
+            f"OS: {platform.system()} {platform.release()}",
+            f"User: {getpass.getuser()}",
+            f"Shell: {os.getenv('SHELL', 'unknown')}",
+            f"Python: {platform.python_version()}",
+        ]
+        
+        # Check for package managers
+        managers = []
+        for pm in ["apt", "dnf", "yum", "pacman", "brew", "pip"]:
+            if subprocess.run(f"which {pm}", shell=True, capture_output=True).returncode == 0:
+                managers.append(pm)
+        if managers:
+            info.append(f"Package Managers: {', '.join(managers)}")
+            
+        return "\n".join(info)
+    except Exception as e:
+        return f"Error getting system info: {str(e)}"
 
 @registry.register(auth_required=True)
 def run_shell(command: str, interactive: bool = False) -> str:
     """
-    Execute a shell command. 
-    Use interactive=True ONLY for commands that require user input (like 'vim', 'ssh', 'python' repl) or are full-screen apps (like 'top').
+    Execute a shell command from the workspace directory.
+
+    All commands run with cwd=workspace/ so that shell paths line up with
+    the paths read_file/write_file/list_dir use. This eliminates the
+    silent split where the agent edited workspace/X but built ./X.
+
+    Use interactive=True for commands that require user input (sudo, vim, ssh, interactive scripts, installers).
     For 'ls', 'grep', 'cat', etc., keep interactive=False for faster, cleaner output.
     """
+    workspace_cwd = os.path.abspath(WORKSPACE_DIR)
+    os.makedirs(workspace_cwd, exist_ok=True)
     try:
         if interactive and os.name != 'nt':
             import pty
             import sys
-            
+
             output_data = []
             def read(fd):
                 data = os.read(fd, 1024)
                 if data:
-                    os.write(sys.stdout.fileno(), data)
-                output_data.append(data)
+                    try:
+                        sys.stdout.buffer.write(data)
+                        sys.stdout.buffer.flush()
+                    except Exception:
+                        pass
+                    output_data.append(data)
                 return data
 
-            # Use pty.spawn to maintain a real terminal for interactive apps
-            pty.spawn(['/bin/sh', '-c', command], read)
-            
+            # pty.spawn doesn't take a cwd kwarg, so we shift to workspace
+            # in the parent before spawning. pty.spawn forks; the child
+            # inherits cwd. We restore the parent's cwd afterward so other
+            # tools (like the embedding client or DB lookups) aren't
+            # affected.
+            prev_cwd = os.getcwd()
+            os.chdir(workspace_cwd)
+            try:
+                pty.spawn(['/bin/sh', '-c', command], read)
+            finally:
+                os.chdir(prev_cwd)
+
             full_output = b"".join(output_data).decode('utf-8', errors='ignore')
-            # Strip common terminal escape sequences
             clean_output = re.sub(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])', '', full_output)
-            return clean_output or "Command completed with no output."
-        
-        # Fallback for non-interactive or Windows
+            return clean_output or "Interactive command completed."
+
         result = subprocess.run(
-            command, 
-            shell=True, 
-            capture_output=True, 
-            text=True, 
-            timeout=120 if interactive else 60
+            command,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            cwd=workspace_cwd,
         )
         output = result.stdout
         if result.stderr:
@@ -249,6 +314,53 @@ def schedule_task(scheduled_time: str, description: str) -> str:
         return f"Task scheduled: {description} at {scheduled_time}"
     except ValueError:
         return "Error: Use 'YYYY-MM-DD HH:MM' format."
+
+@registry.register
+def generate_codebase_map(path: str = ".") -> str:
+    """
+    Generate a structural map of the codebase, identifying classes, functions, and key files.
+    Use this to get a high-level overview of the project architecture.
+    """
+    try:
+        import ast
+        full_path = get_workspace_path(path)
+        if not os.path.exists(full_path):
+            return f"Error: Path '{path}' does not exist."
+
+        ignore_dirs = {'.git', 'venv', '__pycache__', 'node_modules', '.gemini'}
+        map_lines = [f"Codebase Map for: {path}"]
+        
+        for root, dirs, files in os.walk(full_path):
+            dirs[:] = [d for d in dirs if d not in ignore_dirs]
+            rel_path = os.path.relpath(root, full_path)
+            indent = "  " * (0 if rel_path == "." else rel_path.count(os.sep) + 1)
+            
+            if rel_path != ".":
+                map_lines.append(f"{indent}📁 {os.path.basename(root)}/")
+
+            for file in files:
+                if file.endswith('.py'):
+                    file_path = os.path.join(root, file)
+                    map_lines.append(f"{indent}  📄 {file}")
+                    try:
+                        with open(file_path, 'r', encoding='utf-8') as f:
+                            tree = ast.parse(f.read())
+                        for node in tree.body:
+                            if isinstance(node, ast.ClassDef):
+                                map_lines.append(f"{indent}    class {node.name}")
+                                for subnode in node.body:
+                                    if isinstance(subnode, ast.FunctionDef):
+                                        map_lines.append(f"{indent}      def {subnode.name}")
+                            elif isinstance(node, ast.FunctionDef):
+                                map_lines.append(f"{indent}    def {node.name}")
+                    except Exception:
+                        pass
+                elif file.endswith(('.js', '.ts', '.go', '.rs', '.c', '.cpp', '.h')):
+                     map_lines.append(f"{indent}  📄 {file}")
+
+        return "\n".join(map_lines)
+    except Exception as e:
+        return f"Error generating map: {str(e)}"
 
 @registry.register(auth_required=True)
 def learn_skill(name: str, description: str, procedure: str) -> str:
