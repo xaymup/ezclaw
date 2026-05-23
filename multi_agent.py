@@ -8,6 +8,29 @@ from tools import registry, create_memory_tools
 from agent import load_skills, match_skills, format_skills_block
 from embed import embed, cosine_similarity, classify_by_similarity
 from model_client import build_architect_client, build_agent_client, extract_json
+
+
+# Phrases that, when present in recent user messages, indicate the user
+# was correcting or teaching the assistant. Used as a cheap precheck
+# before we spend an architect LLM call on skill drafting.
+_LEARNING_CUES = (
+    "no, ", "no.", "nope", "actually", "instead", "the right way",
+    "you should", "should use", "should be", "use ", "try ",
+    "wrong", "incorrect", "doesn't work", "didn't work",
+    "fix it", "correct way", "not like that", "rather than",
+    "the correct", "what i meant", "i mean", "to be clear",
+    "the proper", "the URL is", "the endpoint is", "the command is",
+)
+
+
+def _has_learning_signal(recent_history: str) -> bool:
+    """Cheap keyword precheck: did the user's recent messages contain
+    corrective/instructive language? Only when this returns True do
+    we pay for the architect call that drafts the skill."""
+    if not recent_history:
+        return False
+    text = recent_history.lower()
+    return any(cue in text for cue in _LEARNING_CUES)
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -865,6 +888,91 @@ class MultiAgentSystem:
             "plan_summary": plan_summary,
         })
 
+    def _propose_skill_from_run(
+        self,
+        user_input: str,
+        final_response: str,
+        step_history: list,
+        recent_history: str,
+    ) -> Optional[dict]:
+        """Ask the architect to distill the just-completed turn into a
+        reusable skill IF the user clearly guided the assistant to
+        success. Returns {name, description, procedure} or None.
+
+        The architect is asked to be conservative — only propose a skill
+        when the work this turn would actually save effort if recalled
+        next time. Generic chats / first-try successes return None."""
+        # Compress step history to keep the prompt cheap.
+        steps_summary = []
+        for s in step_history[:8]:
+            tools = ", ".join(s.get("tools") or [])
+            outcome = s.get("outcome", "?")
+            out = (s.get("output") or "")[:300]
+            steps_summary.append(
+                f"- [{s.get('agent', '?')}|{outcome}] tools=[{tools}] → {out}"
+            )
+
+        prompt = f"""Examine this just-completed turn. The cheap keyword
+detector flagged that the user may have guided/corrected me toward a
+working approach. You decide whether to actually save a skill.
+
+## User's latest request
+{user_input}
+
+## What I ended up answering
+{final_response[:1200]}
+
+## Steps taken
+{chr(10).join(steps_summary) if steps_summary else "(no steps)"}
+
+## Recent conversation (for context — were there corrections?)
+{recent_history[:2000]}
+
+## Decision
+Return a JSON object:
+
+  {{
+    "propose": true | false,
+    "reason": "<one line — why this is or isn't worth saving>",
+    "skill": {{
+      "name": "<3-6 word noun phrase, e.g. 'Weather Forecast Retrieval'>",
+      "description": "<one-line: what this skill does>",
+      "procedure": "<numbered steps, each starting with a verb. Concrete URLs, tool names, and parameter shapes — not abstract guidance.>"
+    }}
+  }}
+
+Propose `true` ONLY when ALL of:
+- The user actually said something corrective/instructive (a URL, a tool, a step, a "don't do X, do Y").
+- The successful approach would actually save effort next time (genuinely reusable).
+- The skill is general enough — strip user-specific details (location names, account IDs).
+
+Propose `false` when:
+- The user just asked a normal question and I got it right first try.
+- The "correction" was about style / formatting / "shorter please".
+- The work was so context-specific no future turn would benefit.
+
+Return ONLY the JSON object."""
+
+        try:
+            content = self.architect._chat(prompt, temperature=0.1)
+            data = extract_json(content)
+        except Exception:
+            return None
+        if not isinstance(data, dict) or not data.get("propose"):
+            return None
+        skill = data.get("skill") or {}
+        name = (skill.get("name") or "").strip()
+        description = (skill.get("description") or "").strip()
+        procedure = (skill.get("procedure") or "").strip()
+        if not (name and procedure):
+            return None
+        return {
+            "name": name[:80],
+            "description": description[:300],
+            "procedure": procedure[:4000],
+            "reason": (data.get("reason") or "")[:200],
+        }
+
     def clear_session_history(self):
         for a in self.agents.values():
             a.messages = [a.messages[0]]
@@ -1169,6 +1277,19 @@ No fluff. No "In this task...". Just facts."""
 
                 # PILLAR 1: Store experience
                 self._summarize_experience(user_input, task_context)
+
+                # PILLAR 2: Offer to save a skill if the turn shows
+                # signs that the user educated us into success. Cheap
+                # keyword precheck guards the (slower) architect call.
+                if _has_learning_signal(recent_history) and step_history:
+                    try:
+                        draft = self._propose_skill_from_run(
+                            user_input, final_text, step_history, recent_history
+                        )
+                    except Exception:
+                        draft = None
+                    if draft:
+                        yield {"type": "skill_offer", "draft": draft}
                 break
 
             agent_key = intent.get("recommended_agent", "executor")

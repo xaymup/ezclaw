@@ -243,6 +243,13 @@ class ChatUI:
         # forwards the user's typed reply.
         self._pending_user_question: str | None = None
         self._user_answer_queue: "queue.Queue[str]" = queue.Queue()
+
+        # Skill-learning offer: after a turn ends with signs that the
+        # user educated us, the architect drafts a skill and yields a
+        # `skill_offer` chunk. The draft sits here until the user
+        # presses Y (save) or N (skip).
+        self._pending_skill_offer: dict | None = None
+
         self._wire_tool_callbacks()
 
     def _wrap_tools(self):
@@ -449,6 +456,54 @@ class ChatUI:
         except Exception as e:
             return f"[critique failed: {type(e).__name__}: {e}]"
 
+    def _accept_skill_offer(self):
+        """Save the parked skill draft via the learn_skill tool. Shows
+        the result in the chat history and reloads the in-memory skill
+        list so the next turn can match against it."""
+        draft = self._pending_skill_offer
+        self._pending_skill_offer = None
+        if not draft:
+            self._update_ui()
+            return
+        try:
+            from tools import registry
+            tool = registry.tools.get("learn_skill")
+            if tool is None:
+                self.history_ansi.append(render_to_ansi(
+                    Text("Error: learn_skill tool not registered.", style=ERR)
+                ))
+                self._update_ui()
+                return
+            result = tool(
+                name=draft.get("name", "unnamed"),
+                description=draft.get("description", ""),
+                procedure=draft.get("procedure", ""),
+            )
+            self.history_ansi.append(render_to_ansi(
+                Text(f"💡 {result}", style=f"bold {ACCENT}")
+            ))
+            # Reload skills so the next turn can match against the new
+            # entry without restarting ezclaw.
+            try:
+                from agent import load_skills
+                if hasattr(self.agent, "skills"):
+                    self.agent.skills = load_skills()
+            except Exception:
+                pass
+        except Exception as e:
+            self.history_ansi.append(render_to_ansi(
+                Text(f"Error saving skill: {e}", style=ERR)
+            ))
+        self._update_ui()
+
+    def _decline_skill_offer(self):
+        """Dismiss the parked skill draft without saving."""
+        self._pending_skill_offer = None
+        self.history_ansi.append(render_to_ansi(
+            Text("Skipped saving the skill candidate.", style=DIM)
+        ))
+        self._update_ui()
+
     def _setup_keybindings(self):
         @self.kb.add('c-c')
         def _(event):
@@ -543,6 +598,20 @@ class ChatUI:
         @self.kb.add('a', filter=Condition(lambda: self.auth_active))
         def _(event):
             self.auth_queue.put("allow_session")
+
+        # Skill-offer Y/N — active only when a draft is parked and no
+        # auth prompt is competing for the same keys.
+        _skill_offer_pending = Condition(
+            lambda: self._pending_skill_offer is not None and not self.auth_active
+        )
+
+        @self.kb.add('y', filter=_skill_offer_pending)
+        def _(event):
+            self._accept_skill_offer()
+
+        @self.kb.add('n', filter=_skill_offer_pending)
+        def _(event):
+            self._decline_skill_offer()
 
         @self.kb.add('enter', filter=Condition(lambda: not self.auth_active))
         def _(event):
@@ -845,6 +914,35 @@ class ChatUI:
                     ("\n\nType your answer below and press Enter.", f"dim {DIM}"),
                 ),
                 title=f"[bold {ACCENT}]Question for you[/bold {ACCENT}]",
+                border_style=ACCENT,
+                box=ROUNDED,
+                padding=(1, 2),
+            ))
+        elif self._pending_skill_offer is not None:
+            draft = self._pending_skill_offer
+            body = Text()
+            body.append("I learned something this turn. Save it as a skill?\n\n", style=f"bold {ACCENT}")
+            body.append("Name: ", style=f"bold {DIM}")
+            body.append(f"{draft.get('name', '?')}\n", style="bold")
+            desc = draft.get("description", "")
+            if desc:
+                body.append("Description: ", style=f"bold {DIM}")
+                body.append(f"{desc}\n", style="")
+            body.append("Procedure:\n", style=f"bold {DIM}")
+            for line in (draft.get("procedure", "") or "").splitlines()[:8]:
+                body.append(f"  {line}\n", style=f"{SECONDARY}")
+            reason = draft.get("reason")
+            if reason:
+                body.append(f"\nWhy: ", style=f"dim {DIM}")
+                body.append(f"{reason}\n", style=f"italic {DIM}")
+            body.append("\nPress ", style="")
+            body.append("[Y]", style="bold")
+            body.append(" to save, ", style="")
+            body.append("[N]", style="bold")
+            body.append(" to skip.", style="")
+            parts.append(Panel(
+                body,
+                title=f"[bold {ACCENT}]💡 New skill candidate[/bold {ACCENT}]",
                 border_style=ACCENT,
                 box=ROUNDED,
                 padding=(1, 2),
@@ -1946,6 +2044,11 @@ class ChatUI:
                 elif chunk["type"] == "context_augmented":
                     for m in chunk["memories"]:
                         self.side_messages.append(f"📎 {m}")
+                elif chunk["type"] == "skill_offer":
+                    # The architect detected the user educated us into
+                    # success and drafted a skill. Park it for the user
+                    # to accept/decline via Y/N keys.
+                    self._pending_skill_offer = chunk.get("draft")
                 elif chunk["type"] == "tool_start":
                     is_int = chunk.get("interactive", False)
                     # Tag the call with the plan step it belongs to so the
