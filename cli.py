@@ -756,17 +756,22 @@ class ChatUI:
             glyph = "·"
             act_color = "#7a7570"
 
-        mascot_color = self._cycle_palette_color(TITLE_GRADIENT, period_sec=1.2)
         divider = (BG + "#5a4a3a", "  ╱  ")
 
         segments = [
             (BG + f"bold {act_color}", f"  {glyph}  "),
-            (BG + f"bold {mascot_color}", MASCOT + " "),
+        ]
+        # While generating, the spinner row already shows its own pulsing
+        # crab — suppress the bar's crab to avoid the doubled mascot.
+        if not self.is_generating:
+            mascot_color = self._cycle_palette_color(TITLE_GRADIENT, period_sec=1.2)
+            segments.append((BG + f"bold {mascot_color}", MASCOT + " "))
+        segments.extend([
             (BG + "#7a7570", f"{auth_icon}  "),
             (BG + "#ffd166", f"{mode_glyph} {model_info}"),
             divider,
             (BG + "#c8c4be", f"{msg_count} msgs"),
-        ]
+        ])
 
         if self.is_generating:
             n_tools = len(self.tool_executions)
