@@ -75,6 +75,25 @@ def _parse_tool_lines(text: str) -> set:
 
 OLLAMA_HOST = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 
+# Model assignment rationale (measured 2026-05-23 via tools_dev/bench_models.py):
+#
+# executor   : qwen3:14b           — correctly emits Ollama tool_calls. The
+#                                    seemingly-better qwen2.5-coder:14b dumps
+#                                    function invocations as plain JSON text
+#                                    (NOT in the tool_calls field), which
+#                                    breaks our tool-execution path. Don't
+#                                    switch to it without re-verifying.
+# architect  : deepseek-r1:14b     — strong reasoning + structured JSON output.
+#                                    phi4-reasoning:plus produces equivalent
+#                                    quality but is ~3x slower (42s vs 15s
+#                                    on the bench prompt).
+# debugger   : deepseek-r1:14b     — root-cause analysis is its strength.
+#                                    phi4-reasoning:plus timed out (>90s) on
+#                                    the bench debugger prompt.
+# researcher : qwen3.5:9b          — fast, on-topic 200-word summaries.
+# general    : qwen3.5:9b          — fast, concise conversational answers.
+#
+# When measuring: spawn `ollama serve`, then run `python tools_dev/bench_models.py`.
 AGENT_DEFS = {
     "executor": {
         "model": os.getenv("OLLAMA_MODEL", "qwen3:14b"),
@@ -317,6 +336,18 @@ class SpecializedAgent:
             except Exception:
                 self._tool_embeddings[name] = None
 
+    # Core workhorse tools — always included regardless of embedding
+    # similarity. Without this guarantee, oddly-phrased queries can
+    # push out the very tools the agent needs (we saw "Create a file
+    # called game.py" rank `learn_skill` ahead of `write_file`).
+    # Keep this list short — the goal is "we'll never accidentally
+    # hide a tool the agent needs on a typical turn", not "we'll
+    # send every tool every time".
+    _CORE_TOOLS = frozenset({
+        "read_file", "write_file", "apply_diff", "list_dir",
+        "run_shell", "grep_codebase", "delegate", "current_datetime",
+    })
+
     def _select_relevant_tools(self, user_input: str, top_n: int = 20) -> List[Dict[str, Any]]:
         if len(self.tools) <= top_n:
             return self.tools
@@ -333,7 +364,28 @@ class SpecializedAgent:
             else:
                 scored.append((0.0, t_def))
         scored.sort(key=lambda x: x[0], reverse=True)
-        return [t for _, t in scored[:top_n]]
+
+        # Take the top-N by similarity, then ensure the core workhorse
+        # tools are present too. Core tools that didn't make the cut
+        # replace the lowest-similarity entries among the top-N so we
+        # never grow the surface beyond top_n.
+        selected = [t for _, t in scored[:top_n]]
+        selected_names = {t["function"]["name"] for t in selected}
+        missing_core: list = []
+        for t in self.tools:
+            name = t["function"]["name"]
+            if name in self._CORE_TOOLS and name not in selected_names:
+                missing_core.append(t)
+        if missing_core:
+            # Replace tail (lowest-similarity non-core) entries with
+            # the missing core tools. Preserve order: high-similarity
+            # at the front, replaced core at the back.
+            kept = [t for t in selected
+                    if t["function"]["name"] in self._CORE_TOOLS
+                    or len(selected) - selected.index(t) > len(missing_core)]
+            kept = kept[: top_n - len(missing_core)]
+            return kept + missing_core
+        return selected
 
     def chat_stream(self, user_input: str) -> Iterator[Dict[str, Any]]:
         # Truncate user input to prevent context overflow
