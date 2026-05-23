@@ -954,9 +954,11 @@ No fluff. No "In this task...". Just facts."""
         max_steps = 40
         last_step_hash = None
         stuck_repeats = 0
-        STUCK_LIMIT = 2
+        STUCK_LIMIT = 3  # bumped from 2 — research/web-fetch chains often
+                          # legitimately re-issue the same plan across steps
+                          # while making progress on different URLs
         pivot_count = 0
-        MAX_PIVOTS = 3  # try up to 3 different approaches before halting
+        MAX_PIVOTS = 3
         agent_has_responded = False
         step_history = []
         final_response = ""

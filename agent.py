@@ -304,10 +304,13 @@ Respond with JSON only:
         last_tool_hash = None
         repeat_count = 0
         # Allow up to this many *consecutive* identical tool batches before
-        # halting. Re-reading a file after a write, or re-running `make` to
-        # verify a fix, are legit repeats — only a third identical call
-        # signals a truly stuck loop.
-        REPEAT_LIMIT = 3
+        # halting. Common legit-repeat patterns:
+        #   - re-reading a file after a write to verify the change
+        #   - re-running `make` after a fix
+        #   - retrying a web_fetch through transient server timeouts
+        # Web-fetch chains in particular can produce 3-4 identical retries
+        # before transient network issues clear, so this needs headroom.
+        REPEAT_LIMIT = 5
 
         # Tool pre-selection: only pass tools relevant to the current query
         selected_tools = self._select_relevant_tools(user_input, top_n=20) if len(self.tools) > 20 else self.tools
@@ -395,6 +398,18 @@ Respond with JSON only:
             current_hash = hash(str([(t.function.name, t.function.arguments) for t in tool_calls]))
             if tool_calls and current_hash == last_tool_hash:
                 repeat_count += 1
+                # Soft warning around the middle of the window — lets the
+                # model see the loop signal and (often) self-correct by
+                # trying a different argument before we hard-halt.
+                if repeat_count == REPEAT_LIMIT - 2:
+                    yield {
+                        "type": "content",
+                        "content": (
+                            f"\n[Note: same tool call repeated {repeat_count + 1}× — "
+                            f"if this is intentional retry, continue; otherwise try a "
+                            f"different approach.]"
+                        ),
+                    }
                 if repeat_count >= REPEAT_LIMIT:
                     yield {
                         "type": "content",
