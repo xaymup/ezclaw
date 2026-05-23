@@ -131,6 +131,12 @@ class ChatAgent:
         set_session_context(self.session_id)
         self.messages = self.db.get_messages(self.session_id)
         self.system_prompt = self._load_system_prompt()
+        self.system_prompt += (
+            "\n\n## Past actions\n"
+            "When the user asks what you did about a past task, file, bug, or "
+            "feature, call `recall_actions(query)` BEFORE answering. It is "
+            "authoritative for this session's mutating actions."
+        )
         self._ensure_system_message()
         self.session_authorized = False
 

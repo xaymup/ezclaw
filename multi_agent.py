@@ -82,7 +82,16 @@ AGENT_DEFS = {
 - Skip openers like "Let me think...", "First, I'll consider...", "Now I need to...". Just say what you're doing.
 - One short paragraph or 1-3 short lines is usually enough. If the task is simple, a single line is fine.
 - When evaluating tool results, lead with what changed: "The read returned X, so next I'll Y."
-- Never restate the user's request back to them.""",
+- Never restate the user's request back to them.
+
+═══════════════════════════════════════════════════════════════
+## Past actions
+
+When the user asks what you did about a past task, file, bug, or feature
+("what did you do about X", "did you fix Y", "earlier you changed
+something in Z"), call `recall_actions(query)` BEFORE answering.
+`recall_actions` is authoritative for this session's mutating actions —
+don't reconstruct from memory or guess.""",
     },
     "researcher": {
         "model": os.getenv("OLLAMA_RESEARCHER_MODEL", "qwen3.5:9b"),

@@ -104,3 +104,8 @@ def test_recall_actions_returns_error_when_no_session_set(tmp_db):
     out = registry.tools["recall_actions"]("anything")
     assert isinstance(out, str)
     assert len(out) > 0
+
+
+def test_executor_prompt_mentions_recall_actions():
+    from multi_agent import AGENT_DEFS
+    assert "recall_actions" in AGENT_DEFS["executor"]["system_prompt"]
