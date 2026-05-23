@@ -1162,6 +1162,69 @@ Return ONLY the JSON object."""
         except Exception:
             return None
 
+    def _synthesize_user_reply(
+        self,
+        user_input: str,
+        step_history: List[Dict[str, Any]],
+        last_step_output: str,
+    ) -> Iterator[Dict[str, Any]]:
+        """Have the architect produce the final user-facing reply from the
+        accumulated orchestration history. Streams content chunks
+        compatible with the existing CLI's chunk handler. Falls back to
+        yielding the last sub-agent's text verbatim on any failure."""
+
+        if step_history:
+            lines = []
+            for i, step in enumerate(step_history, 1):
+                agent = step.get("agent", "?")
+                tools = step.get("tools") or []
+                output = (step.get("output") or "")[:200]
+                tools_str = ", ".join(tools) if tools else "(no tools)"
+                lines.append(f"{i}. {agent} — {tools_str} — {output!r}")
+            history_block = "\n".join(lines)
+        else:
+            history_block = "(no steps recorded)"
+
+        prompt = (
+            "You orchestrated a multi-step plan to answer the user's "
+            "request. Now write the FINAL user-facing reply.\n\n"
+            "Rules:\n"
+            "- Address the user directly. Do not use internal terms like "
+            "\"executor\", \"task ID\", \"architect\", \"step\".\n"
+            "- Do not re-narrate every step — the user has already seen "
+            "the plan panel update in real time. Focus on the OUTCOME.\n"
+            "- If the plan succeeded, confirm what was delivered. Keep it "
+            "short.\n"
+            "- If anything failed, say so plainly and stop. Do not pretend "
+            "work was done that wasn't.\n"
+            "- No JSON, no markdown headers, no code fences unless quoting "
+            "actual code.\n\n"
+            f"User request:\n{user_input}\n\n"
+            f"Steps taken (internal record):\n{history_block}\n\n"
+            f"Last sub-agent output:\n{last_step_output}\n\n"
+            "Your reply to the user:"
+        )
+
+        try:
+            stream = self.architect.client.chat(
+                model=self.architect.model,
+                messages=[{"role": "user", "content": prompt}],
+                options={"temperature": 0.2, "num_ctx": 4096},
+                stream=True,
+            )
+            any_yielded = False
+            for chunk in stream:
+                text = chunk.get("message", {}).get("content", "")
+                if text:
+                    any_yielded = True
+                    yield {"type": "content", "content": text}
+            if not any_yielded and last_step_output.strip():
+                yield {"type": "content", "content": last_step_output}
+        except Exception:
+            if last_step_output.strip():
+                yield {"type": "content", "content": last_step_output}
+            return
+
     def _short_circuit_classify(self, user_input: str) -> Optional[str]:
         # Layer 1: cheap textual heuristic for trivial chat. Anything that
         # looks like a short greeting / acknowledgement / nonsense one-liner
