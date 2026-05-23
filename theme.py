@@ -6,8 +6,8 @@ spinner frame lists, and tool-kind styling. Adding a new role or
 tool kind is a one-file change here.
 """
 
-from dataclasses import dataclass, field
-from typing import Dict, List, Tuple
+from dataclasses import dataclass
+from typing import Dict, Tuple
 
 
 @dataclass(frozen=True)
