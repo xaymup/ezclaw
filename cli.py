@@ -113,14 +113,15 @@ from rich.text import Text
 from rich.syntax import Syntax
 from rich.spinner import Spinner
 from rich.console import Group
+from rich.box import ROUNDED
+
 
 def _make_custom_spinner(frames, color):
     """Build a Spinner with a custom frame list and 10fps cadence."""
     sp = Spinner(name="dots", text="", style=f"bold {color}")
     sp.frames = list(frames)
-    sp.interval = 0.1
+    sp.interval = 100  # milliseconds — rich divides by 1000 internally
     return sp
-from rich.box import ROUNDED
 
 class ChatUI:
     def __init__(self):
@@ -184,6 +185,12 @@ class ChatUI:
         # Track the most recently routed role so the spinner and chip
         # can pick role-specific visuals.
         self.current_role: str | None = None
+
+        # Cache one Spinner per role — rich's Spinner derives its current
+        # frame from (now - start_time) / interval, so re-creating a fresh
+        # spinner each tick would always reset start_time and freeze the
+        # animation on frame 0. Cache key is the role string.
+        self._spinner_cache: dict = {}
 
         # Architect strategy panels: hidden by default — they dominated the
         # screen with mostly-redundant information. The compact chip below
@@ -372,9 +379,19 @@ class ChatUI:
         return f"  {auth_icon}  {mode} {model_info}  ·  {msg_count} msgs{live}{copy_badge}{arch_badge}  |  [Ctrl+C] Exit  [F2] Copy  [F3] Strategy  [Arrows] Scroll"
 
     def _spinner_for(self, role):
-        """Return a Spinner instance using the role's frame list and color."""
-        rs = THEME.role(role or "")
-        return _make_custom_spinner(rs.spinner_frames, rs.color)
+        """Return a cached Spinner instance for the given role.
+
+        Cached so rich's frame counter (now - start_time / interval)
+        actually advances across UI ticks instead of resetting to zero
+        on every render.
+        """
+        key = role or ""
+        spinner = self._spinner_cache.get(key)
+        if spinner is None:
+            rs = THEME.role(key)
+            spinner = _make_custom_spinner(rs.spinner_frames, rs.color)
+            self._spinner_cache[key] = spinner
+        return spinner
 
     def _get_current_renderable_ansi(self):
 
