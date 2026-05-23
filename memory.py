@@ -354,7 +354,7 @@ class Database:
         session_id: int,
         query: str,
         limit: int = 5,
-        threshold: float = 0.0,
+        threshold: float = 0.2,
     ) -> List[Dict[str, Any]]:
         """Semantic search over this session's actions. Returns top `limit`
         rows above `threshold`, ranked by cosine similarity to `query`.

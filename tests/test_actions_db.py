@@ -155,7 +155,39 @@ def test_search_actions_ranks_by_similarity(tmp_db, monkeypatch):
             summary=summary, why=None, outcome="succeeded",
             error_excerpt=None, embedding=pickle.dumps(vecs[key]),
         )
-    rows = tmp_db.search_actions(session_id=sid, query="auth", limit=3)
+    rows = tmp_db.search_actions(session_id=sid, query="auth", limit=3, threshold=0.0)
     summaries = [r["summary"] for r in rows]
     assert summaries[0] == "edited auth.py"
     assert summaries[-1] == "edited unrelated.py"
+
+
+def test_search_actions_default_threshold_filters_unrelated(tmp_db, monkeypatch):
+    """With the default threshold (0.2), zero-similarity rows are filtered out."""
+    import embed as embed_mod
+
+    vecs = {
+        "auth": [1.0, 0.0, 0.0],
+        "unrelated": [0.0, 1.0, 0.0],
+    }
+
+    def fake_embed(text: str):
+        return vecs["auth"] if "auth" in text else vecs["unrelated"]
+
+    monkeypatch.setattr(embed_mod, "embed", fake_embed)
+
+    sid = tmp_db.create_session("test")
+    import pickle
+    tmp_db.add_action(
+        session_id=sid, tool="apply_diff", args_json="{}",
+        summary="edited auth.py", why=None, outcome="succeeded",
+        error_excerpt=None, embedding=pickle.dumps(vecs["auth"]),
+    )
+    tmp_db.add_action(
+        session_id=sid, tool="apply_diff", args_json="{}",
+        summary="edited unrelated.py", why=None, outcome="succeeded",
+        error_excerpt=None, embedding=pickle.dumps(vecs["unrelated"]),
+    )
+    # Default threshold = 0.2 — only the auth row should come back.
+    rows = tmp_db.search_actions(session_id=sid, query="auth")
+    summaries = [r["summary"] for r in rows]
+    assert summaries == ["edited auth.py"]
