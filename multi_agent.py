@@ -1261,6 +1261,15 @@ No fluff. No "In this task...". Just facts."""
         map_block = f"\n## Codebase Map\n{codebase_map[:3000]}\n" if codebase_map else ""
 
         short_circuit_agent = self._short_circuit_classify(user_input)
+        if short_circuit_agent == "executor":
+            kind_count = self._estimate_tool_kinds(user_input)
+            if kind_count is None or kind_count >= PREFLIGHT_KIND_THRESHOLD:
+                kind_label = "?" if kind_count is None else str(kind_count)
+                yield {
+                    "type": "status",
+                    "content": f"[pre-flight: {kind_label} tool kinds — planning]\n",
+                }
+                short_circuit_agent = None
         if short_circuit_agent and short_circuit_agent != "debugger":
             agent_key = short_circuit_agent
             agent = self.agents.get(agent_key)
