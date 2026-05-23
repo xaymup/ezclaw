@@ -80,6 +80,9 @@ AGENT_DEFS = {
         "model": os.getenv("OLLAMA_MODEL", "qwen3:14b"),
         "system_prompt": """You are EzClaw's **Executor** — you receive a numbered plan and execute it step by step using tools.
 
+## Non-coding guard (read this FIRST)
+If the request is non-technical — personal advice, opinions, lifestyle questions, definitions, recommendations, "help me think through X", "give me ideas for Y" — call `delegate('general', '<exact user request>')` IMMEDIATELY. Do NOT write code, do NOT plan steps, do NOT use any other tool. The general agent answers these directly in seconds; you don't. This is a backstop in case routing missed the conversational shortcut upstream.
+
 ## Core Rules
 - **Verification-Driven Autonomy (Test-First)**: For every coding task or bug fix:
     1. **Reproduce**: Create or identify a test/script that fails due to the issue.
@@ -628,6 +631,8 @@ Rules for execution:
 - Set `complete: true` ONLY when every task in the plan is `done` or `skipped` AND the user's full original intent is verifiably satisfied. Premature completion is forbidden.
 - `plan` is the step-by-step instruction the routed agent will execute this turn. Make it concrete and actionable: "Read sse_handler.py, find the handle_disconnect function, add a `connection.cleanup()` call before the return." Not "Work on the leak."
 - `reflection.observation` is one short sentence describing what actually happened in the previous step. Skip if first step.
+- `reflection.critical_thinking` is REQUIRED on every turn. One short sentence on WHY this routing/plan vs. the alternative you discarded. Use it to make the trade-off explicit ("routing to executor because the previous step's file read showed the function is in this module, not elsewhere").
+- **Use the `ask_user` tool when you need user input — never narrate it in `plan`.** If the next step requires clarification or a value only the user knows (location, file path, preference), route to an agent and instruct it to call `ask_user("...")`. NEVER emit `plan` like "Ask the user about their preferences" without a corresponding tool call — that just produces empty agent turns that loop forever waiting for a response that won't come.
 
 ═══════════════════════════════════════════════════════════════
 ## When no plan is active (single-step path)
@@ -860,6 +865,23 @@ Decide the next routing step. Return the EXECUTION JSON object."""
                     intent["task_updates"] = []
                 if not isinstance(intent.get("new_tasks"), list):
                     intent["new_tasks"] = []
+                # Tier 3.1: ensure reflection.critical_thinking is
+                # always populated so the unified Reasoning panel has
+                # substance to show. Re-prompting would cost 12-15s per
+                # architect step, so we synthesize from the other
+                # fields when the model omits it.
+                refl = intent.get("reflection") or {}
+                if not isinstance(refl, dict):
+                    refl = {}
+                if not (refl.get("critical_thinking") or "").strip():
+                    fallback = (
+                        refl.get("observation")
+                        or intent.get("reasoning")
+                        or intent.get("plan")
+                        or "Routing decision based on the current task and the agent's role."
+                    )
+                    refl["critical_thinking"] = str(fallback).splitlines()[0][:200]
+                intent["reflection"] = refl
                 return intent
             except Exception:
                 continue
@@ -1490,6 +1512,10 @@ No fluff. No "In this task...". Just facts."""
         skills_block = format_skills_block(initial_matched_skills)
 
         # Planning pass: produce a structured task list, or None for single-step.
+        yield {
+            "type": "status",
+            "content": f"🦀 architect planning (model: {self.architect.model})",
+        }
         self.current_plan = self.architect.plan(
             user_input,
             memory_block=memory_block,
@@ -1516,12 +1542,18 @@ No fluff. No "In this task...". Just facts."""
             skills_block = format_skills_block(matched_skills)
 
             self._prune_architect()
+            # Tier 2.3: visible handoff status so the user knows the
+            # 12-15s gap is the architect, not a hung tool.
+            yield {
+                "type": "status",
+                "content": f"🦀 architect step {step}/{max_steps} (model: {self.architect.model})",
+            }
             intent = self.architect.execute(
                 self.current_plan, task_context, memory_block, skills_block,
                 routing_block=routing_block, history_block=history_block,
                 map_block=map_block, experiences_block=exp_block,
             )
-            
+
             # Apply plan mutations from the execute intent
             yield from self._apply_intent_to_plan(intent)
 
