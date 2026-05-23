@@ -243,49 +243,6 @@ def _build_sandbox_env() -> dict:
     return env
 
 
-def _bwrap_available() -> bool:
-    """True iff bubblewrap is installed AND the user hasn't opted out.
-    Set EZCLAW_USE_BWRAP=0 to disable (falls back to the process-level
-    sandbox — env scrub + rlimits + new session — without filesystem
-    isolation)."""
-    if os.getenv("EZCLAW_USE_BWRAP", "1") == "0":
-        return False
-    import shutil
-    return shutil.which("bwrap") is not None
-
-
-def _build_shell_argv(command: str, workspace_cwd: str) -> list:
-    """Build the argv that runs `command` under the strongest available
-    sandbox.
-
-    When bubblewrap is available: the entire filesystem is bind-mounted
-    read-only and ONLY `workspace_cwd` is rebound read-write. The agent
-    can read any project source it needs (`cat /home/.../cli.py` works),
-    but `echo > /home/.../cli.py` fails with `Read-only file system`.
-    Network access is preserved (so pip / git remotes still work);
-    /tmp is a tmpfs scoped to the jail; the child dies with the parent.
-
-    When bwrap is not installed (or the user has disabled it): falls back
-    to plain `/bin/sh -c command`. The process-level sandbox (env scrub,
-    rlimits, new session, cwd=workspace) still applies via the Popen
-    kwargs at the call site.
-    """
-    if _bwrap_available():
-        return [
-            "bwrap",
-            "--ro-bind", "/", "/",
-            "--bind", workspace_cwd, workspace_cwd,
-            "--proc", "/proc",
-            "--dev", "/dev",
-            "--tmpfs", "/tmp",
-            "--share-net",
-            "--chdir", workspace_cwd,
-            "--die-with-parent",
-            "/bin/sh", "-c", command,
-        ]
-    return ["/bin/sh", "-c", command]
-
-
 def _apply_sandbox_rlimits() -> None:
     """preexec_fn that caps the child's resource usage. POSIX only.
 
@@ -320,22 +277,29 @@ def _apply_sandbox_rlimits() -> None:
 @registry.register(auth_required=True)
 def run_shell(command: str, interactive: bool = False) -> str:
     """
-    Execute a shell command in a sandboxed child process.
+    Execute a shell command from the workspace directory.
 
-    Sandbox properties:
-      - cwd is `./workspace/` (passed to Popen; the parent process's cwd
-        is never mutated, even for interactive commands).
+    Process-level protections (always on):
+      - cwd is `./workspace/`. The parent process's cwd is never mutated,
+        even for interactive commands — cwd is passed via Popen, not via
+        os.chdir.
       - Environment is scrubbed to a small allowlist (PATH, HOME, USER,
         SHELL, TERM, LANG, LC_*, TMPDIR, TZ). API keys, OLLAMA_* config,
         PYTHONPATH, and VIRTUAL_ENV are dropped. `EZCLAW_SANDBOX=1` is set.
-      - The child runs in its own session/process group (`start_new_session`),
+      - The child runs in its own session/process group (`start_new_session`)
         so signals don't cross the boundary.
-      - POSIX rlimits cap the child: 2 GB virtual memory, 60 s CPU time,
-        100 MB max file size, 256 max processes, no core dumps.
+      - POSIX rlimits: 2 GB virtual memory, 60 s CPU time, 100 MB max file
+        size, no core dumps.
 
-    interactive=True allocates a pty so commands that need a tty (sudo, ssh,
-    vim, installers) work. The parent process's cwd is still untouched —
-    cwd is passed via Popen, not via os.chdir.
+    NOTE: there is NO filesystem jail. The shell can technically write
+    anywhere the user has permission to write. The convention is that
+    the agent confines all writes to `./workspace/`; the file tools
+    (read_file/write_file/list_dir) enforce this via WorkspacePathError,
+    but `run_shell` runs arbitrary shell — it's the agent's responsibility
+    to keep its writes inside the workspace.
+
+    interactive=True allocates a pty so commands that need a tty (sudo,
+    ssh, vim, installers) work correctly.
     """
     workspace_cwd = os.path.abspath(WORKSPACE_DIR)
     os.makedirs(workspace_cwd, exist_ok=True)
@@ -345,13 +309,9 @@ def run_shell(command: str, interactive: bool = False) -> str:
         if interactive and os.name != "nt":
             return _run_shell_interactive(command, workspace_cwd, sandbox_env)
 
-        # Run argv directly (no shell=True) — the shell is the LAST argv
-        # element inside _build_shell_argv, either as `/bin/sh -c command`
-        # or wrapped in `bwrap … /bin/sh -c command`. Passing shell=True
-        # would double-wrap (sh -c "bwrap … sh -c command").
         result = subprocess.run(
-            _build_shell_argv(command, workspace_cwd),
-            shell=False,
+            command,
+            shell=True,
             capture_output=True,
             text=True,
             timeout=60,
@@ -382,7 +342,7 @@ def _run_shell_interactive(command: str, workspace_cwd: str, sandbox_env: dict) 
     proc = None
     try:
         proc = subprocess.Popen(
-            _build_shell_argv(command, workspace_cwd),
+            ["/bin/sh", "-c", command],
             stdin=slave_fd,
             stdout=slave_fd,
             stderr=slave_fd,
