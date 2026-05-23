@@ -68,15 +68,6 @@ WARN = THEME.palette.warn
 ERR = THEME.palette.err
 DIM = THEME.palette.dim
 
-class Theme:
-    primary = PRIMARY
-    secondary = SECONDARY
-    accent = ACCENT
-    warn = WARN
-    err = ERR
-    dim = DIM
-    box = ROUNDED
-
 # Global console for rendering
 console = Console(file=io.StringIO(), force_terminal=True, width=100)
 
@@ -510,8 +501,6 @@ class ChatUI:
         reasoning = self._clean_field(intent.get("reasoning"))
         plan = self._clean_field(intent.get("plan"))
 
-        role_color = THEME.role(agent).color
-
         if not self.show_architect:
             # Compact: dim one-liner — keeps routing context visible without
             # the screen-eating panels. F3 expands.
@@ -532,6 +521,7 @@ class ChatUI:
         # Expanded view: only render fields with real content; collapse
         # reasoning into plan when it's a substring/prefix to avoid the
         # double-printed prose that bloated the old layout.
+        role_color = THEME.role(agent).color
         body = Text()
         body.append("agent: ", style=f"bold {DIM}")
         body.append(agent + "\n", style=f"bold {role_color}")
@@ -675,7 +665,10 @@ class ChatUI:
                     break
         if summary:
             summary_text = Text(f"  ↳ {summary}", style=f"dim {DIM} italic")
-            tool_parts.insert(0, summary_text)
+            # Place summary after the args panel so the call signature shows
+            # first; if no args were added, the summary goes to the top.
+            insert_at = 1 if args else 0
+            tool_parts.insert(insert_at, summary_text)
 
         return Panel(
             Group(*tool_parts),
