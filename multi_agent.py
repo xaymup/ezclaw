@@ -436,6 +436,7 @@ Return:
   "current_task_id": <int>,
   "recommended_agent": "executor|general|researcher|debugger",
   "reasoning": "<one short line on the routing choice>",
+  "plan": "<numbered step-by-step instructions for the routed agent, addressing the current task>",
   "task_updates": [{"id": <int>, "status": "done|failed|skipped"}],
   "new_tasks": [{"after_id": <int>, "description": "<short line>"}],
   "complete": false,
@@ -451,6 +452,7 @@ Rules for execution:
 - `task_updates` is for tasks finishing in the current step. Only mark `done` after a successful verification. Mark `failed` only after retries are exhausted. Mark `skipped` only when the task is genuinely no longer needed.
 - `new_tasks` is for genuinely-new work discovered during execution. Leave empty most of the time. Each entry's `after_id` must reference an existing task.
 - Set `complete: true` ONLY when every task in the plan is `done` or `skipped` AND the user's full original intent is verifiably satisfied. Premature completion is forbidden.
+- `plan` is the step-by-step instruction the routed agent will execute this turn. Make it concrete and actionable: "Read sse_handler.py, find the handle_disconnect function, add a `connection.cleanup()` call before the return." Not "Work on the leak."
 - `reflection.observation` is one short sentence describing what actually happened in the previous step. Skip if first step.
 
 ═══════════════════════════════════════════════════════════════
@@ -640,6 +642,7 @@ Decide the next routing step. Return the EXECUTION JSON object."""
                 intent.setdefault("current_task_id", 0)
                 intent.setdefault("recommended_agent", "executor")
                 intent.setdefault("reasoning", "")
+                intent.setdefault("plan", "")
                 intent.setdefault("task_updates", [])
                 intent.setdefault("new_tasks", [])
                 intent.setdefault("complete", False)
@@ -662,6 +665,7 @@ Decide the next routing step. Return the EXECUTION JSON object."""
             "current_task_id": 0,
             "recommended_agent": "executor",
             "reasoning": "Parse fallback",
+            "plan": "",
             "task_updates": [],
             "new_tasks": [],
             "complete": False,
@@ -958,7 +962,9 @@ No fluff. No "In this task...". Just facts."""
                 "complete": intent.get("complete")
             }
 
-            if intent.get("complete") and agent_has_responded:
+            if intent.get("complete") and agent_has_responded and (
+                self.current_plan is None or self.current_plan.is_complete()
+            ):
                 yield {"type": "status", "content": "Task completed successfully."}
                 final_text = final_response.strip() if final_response else "Task completed."
                 self._conversation_history.append({"user": user_input, "assistant": final_text})
@@ -1040,9 +1046,6 @@ No fluff. No "In this task...". Just facts."""
                 "type": "reasoning",
                 "content": f"[{agent_key}] {plan}\n",
             }
-            if intent.get("pivot_reasoning"):
-                 yield {"type": "reasoning", "content": f"[Pivot] {intent['pivot_reasoning']}\n"}
-
             yield {"type": "status", "content": f"{agent_key.capitalize()}: Working..."}
 
             instruction = intent.get("plan") or intent.get("reasoning", "Execute the next step.")

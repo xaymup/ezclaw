@@ -72,6 +72,7 @@ def test_execute_returns_intent_with_plan(fake_db):
         "current_task_id": 2,
         "recommended_agent": "executor",
         "reasoning": "Apply the cleanup hook found in task 1.",
+        "plan": "1. Open sse_handler.py\n2. Find handle_disconnect\n3. Add connection.cleanup() before return\n4. Run tests",
         "task_updates": [{"id": 1, "status": "done"}],
         "new_tasks": [],
         "complete": False,
@@ -92,6 +93,9 @@ def test_execute_returns_intent_with_plan(fake_db):
     assert intent["recommended_agent"] == "executor"
     assert intent["task_updates"] == [{"id": 1, "status": "done"}]
     assert intent["complete"] is False
+    # plan field must be present and round-trip intact
+    assert "plan" in intent
+    assert "handle_disconnect" in intent["plan"]
 
 
 def test_execute_returns_intent_without_plan(fake_db):
@@ -128,3 +132,4 @@ def test_execute_fallback_on_malformed_json(fake_db):
     assert intent.get("recommended_agent") in ("executor", "general", "researcher", "debugger")
     assert intent.get("task_updates", []) == []
     assert intent.get("new_tasks", []) == []
+    assert "plan" in intent
