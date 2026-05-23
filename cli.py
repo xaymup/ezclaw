@@ -888,7 +888,7 @@ class ChatUI:
             parts.append(Markdown(current_content))
 
         # 4. Architect chip
-        if self.architect_intent:
+        if self.architect_intent and self.current_plan is None:
             parts.append(self._render_architect_intent(self.architect_intent))
 
         # 5. Tool execution panels.
