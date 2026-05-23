@@ -123,6 +123,7 @@ class ChatUI:
         self.reasoning_chunks = []
         self.tool_executions = []
         self.side_messages = []
+        self.halted = False
         self.is_generating = False
         self.auth_queue = queue.Queue()
         self.auth_active = False
@@ -529,6 +530,15 @@ class ChatUI:
             if self.is_generating:
                 self.is_generating = False
                 self.side_messages.append("↯ generation cancelled")
+                self._update_ui()
+                return
+            if self.halted:
+                # User cancelled during halt — finalize the partial panel
+                # so the cancel doesn't leave a phantom open block.
+                final_renderable = self._get_current_renderable_ansi()
+                self.history_ansi.append(final_renderable)
+                self.current_response_parts = []
+                self.halted = False
                 self._update_ui()
                 return
             self.side_messages.append("↯ press is harmless — type 'exit' to leave ezclaw")
@@ -1584,6 +1594,26 @@ class ChatUI:
             self._handle_command(text)
             return
 
+        if self.halted:
+            from continuation import is_continuation
+            if is_continuation(text):
+                # Continuation path: extend the existing panel.
+                self.halted = False
+                self.current_response_parts.append("\n\n*↳ continuing…*\n\n")
+                self._force_scroll_next_update = True
+                self.is_generating = True
+                self._agent_worker(text)
+                return
+            # Non-continuation: finalize the prior halted panel first.
+            final_renderable = self._get_current_renderable_ansi()
+            self.history_ansi.append(final_renderable)
+            self.current_response_parts = []
+            self.reasoning_chunks = []
+            self.tool_executions = []
+            self.side_messages = []
+            self.halted = False
+            # Fall through to the existing fresh-turn path below.
+
         # Regular message — always snap to bottom on new prompt so the user
         # sees their own message and the start of the reply, even if they had
         # scrolled up while reading older history.
@@ -2003,6 +2033,8 @@ class ChatUI:
                             self._task_flash_until[task.id] = now + 0.15
                         self._last_task_states[task.id] = task.status
                     self.current_plan = new_plan
+                elif chunk["type"] == "halt":
+                    self.halted = True
                 elif chunk["type"] == "intent":
                     self.architect_intent = chunk
                     new_role = chunk.get("agent")
@@ -2093,12 +2125,13 @@ class ChatUI:
         
         # Finish generating
         self.is_generating = False
-        final_renderable = self._get_current_renderable_ansi()
-        self.history_ansi.append(final_renderable)
-        self.current_response_parts = []
-        self.reasoning_chunks = []
-        self.tool_executions = []
-        self.side_messages = []
+        if not self.halted:
+            final_renderable = self._get_current_renderable_ansi()
+            self.history_ansi.append(final_renderable)
+            self.current_response_parts = []
+            self.reasoning_chunks = []
+            self.tool_executions = []
+            self.side_messages = []
         self._update_ui()
 
     def _resolve_user_name(self) -> str:
