@@ -460,7 +460,7 @@ Rules for execution:
 ## When no plan is active (single-step path)
 ═══════════════════════════════════════════════════════════════
 
-If the EXECUTION REQUEST says `Plan: (none — single-step request)`, treat each call as a one-shot routing decision. Set `current_task_id` to `0`, leave `task_updates` and `new_tasks` empty, and set `complete: true` as soon as the user's intent is satisfied.
+If the EXECUTION REQUEST says `Plan: (none — single-step request)`, this is a chat reply, a fact lookup, or any other one-shot exchange. Set `current_task_id` to `0`, leave `task_updates` and `new_tasks` empty, and **ALWAYS set `complete: true`** — the routed agent will produce a single reply and the turn is done. Do NOT keep the loop running expecting verification; chat replies don't have verifications. (The orchestrator also auto-completes after the first responsive step in this mode, so `complete: false` here just wastes a turn.)
 
 ═══════════════════════════════════════════════════════════════
 ## General style
@@ -780,6 +780,28 @@ class MultiAgentSystem:
     ]
 
     def _short_circuit_classify(self, user_input: str) -> Optional[str]:
+        # Layer 1: cheap textual heuristic for trivial chat. Anything that
+        # looks like a short greeting / acknowledgement / nonsense one-liner
+        # ("hi", "thanks", "Captain Claw!", "yo") shouldn't burn an embedding
+        # call — and definitely shouldn't reach the architect loop where it
+        # can spin until the stuck-detector trips.
+        stripped = user_input.strip()
+        if 0 < len(stripped) <= 40:
+            # No code/punctuation that suggests an actual request
+            no_code_chars = not any(c in stripped for c in "(){}[];=<>|\\$/`")
+            no_request_verbs = not any(
+                w in stripped.lower().split()
+                for w in {
+                    "make", "build", "create", "write", "fix", "add", "implement",
+                    "refactor", "test", "run", "read", "list", "show", "find",
+                    "search", "look", "edit", "modify", "update", "delete",
+                    "remember", "forget", "install", "commit", "push", "pull",
+                }
+            )
+            if no_code_chars and no_request_verbs:
+                return "general"
+
+        # Layer 2: embedding-similarity routing across the known examples.
         examples = [ex for ex, _ in self.ROUTING_EXAMPLES]
         labels = [lb for _, lb in self.ROUTING_EXAMPLES]
         return classify_by_similarity(user_input, examples, labels, threshold=0.6)
@@ -970,13 +992,26 @@ No fluff. No "In this task...". Just facts."""
                 "complete": intent.get("complete")
             }
 
-            if intent.get("complete") and agent_has_responded and (
-                self.current_plan is None or self.current_plan.is_complete()
-            ):
+            # Two completion paths:
+            #   1. Plan-driven: architect signals complete AND the plan is done.
+            #   2. Single-step (no plan): the architect's job is just routing
+            #      the first turn. As soon as the routed agent produced output,
+            #      we're done — don't ask the architect to second-guess
+            #      a chat reply. Local LLMs habitually keep returning
+            #      complete:false for greetings, which used to drive the
+            #      loop until the stuck-detector tripped.
+            single_step_done = (
+                self.current_plan is None and agent_has_responded and step >= 1
+            )
+            plan_done = (
+                intent.get("complete") and agent_has_responded
+                and self.current_plan is not None and self.current_plan.is_complete()
+            )
+            if single_step_done or plan_done:
                 yield {"type": "status", "content": f"🦀 {pick(COMPLETED)}."}
                 final_text = final_response.strip() if final_response else "Task completed."
                 self._conversation_history.append({"user": user_input, "assistant": final_text})
-                
+
                 # PILLAR 1: Store experience
                 self._summarize_experience(user_input, task_context)
                 break
