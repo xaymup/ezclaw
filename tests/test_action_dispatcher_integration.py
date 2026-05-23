@@ -173,3 +173,26 @@ def test_multi_agent_system_propagates_session_id(monkeypatch, tmp_path):
     assert mas.session_id is not None  # auto-created if None
     for agent in mas.agents.values():
         assert agent.session_id == mas.session_id
+
+
+def test_specialized_agent_dispatcher_gating_records_mutating(tmp_db, monkeypatch):
+    """Replay the multi_agent dispatcher's gating against a mutating tool."""
+    import embed as embed_mod
+    monkeypatch.setattr(embed_mod, "embed", lambda text: [1.0, 0.0])
+
+    from multi_agent import SpecializedAgent
+    agent = SpecializedAgent.__new__(SpecializedAgent)
+    agent.db = tmp_db
+    agent.session_id = tmp_db.create_session("multi")
+
+    tool_name = "apply_diff"
+    args = {"path": "auth.py"}
+    full_response = "I'll edit auth.py to fix the import."
+    full_result = "Patched 1 hunk."
+
+    if tool_name in tools.MUTATING_TOOLS:
+        agent._record_action(
+            tool_name=tool_name, args=args,
+            result=full_result, assistant_text=full_response,
+        )
+    assert _count_actions(tmp_db, agent.session_id) == 1

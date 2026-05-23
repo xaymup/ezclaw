@@ -475,6 +475,13 @@ class SpecializedAgent:
                 self.messages.append({
                     "role": "tool", "content": result_str, "name": tool_call.function.name,
                 })
+                if tool_call.function.name in MUTATING_TOOLS:
+                    self._record_action(
+                        tool_name=tool_call.function.name,
+                        args=tool_call.function.arguments,
+                        result=full_result,
+                        assistant_text=full_response,
+                    )
                 yield {"type": "tool_end", "name": tool_call.function.name, "result": full_result}
 
 
