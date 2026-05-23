@@ -38,6 +38,21 @@ class Database:
 )''')
             cursor.execute('''CREATE INDEX IF NOT EXISTS idx_file_chunks_path_hash
     ON file_chunks(path, content_hash)''')
+            cursor.execute('''CREATE TABLE IF NOT EXISTS actions (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id    INTEGER NOT NULL,
+    tool          TEXT NOT NULL,
+    args_json     TEXT NOT NULL,
+    summary       TEXT NOT NULL,
+    why           TEXT,
+    outcome       TEXT NOT NULL,
+    error_excerpt TEXT,
+    embedding     BLOB,
+    created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (session_id) REFERENCES sessions(id)
+)''')
+            cursor.execute('''CREATE INDEX IF NOT EXISTS idx_actions_session
+    ON actions(session_id, created_at)''')
             conn.commit()
             self._migrate()
 
