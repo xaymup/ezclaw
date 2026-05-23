@@ -11,10 +11,17 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-SKILLS_DIR = "skills"
+# Canonical skills location — import from tools so the loader and the
+# learn_skill / get_skill / list_skills tools all read/write the same dir.
+# Before this import, load_skills() was reading ./skills/ (legacy, empty
+# for users who only ever stored skills via the new tools), so the
+# matcher had no skills to consider for prompt injection.
+from tools import SKILLS_DIR, _migrate_legacy_skills_once
 
 def load_skills() -> List[Dict[str, str]]:
-    """Load all skills from the skills directory."""
+    """Load all skills from the canonical ~/.ezclaw/skills/ directory.
+    Migrates any legacy ./skills/*.md from before the directory move."""
+    _migrate_legacy_skills_once()
     skills = []
     if not os.path.exists(SKILLS_DIR):
         return skills
@@ -30,17 +37,23 @@ def load_skills() -> List[Dict[str, str]]:
             skills.append({'name': name, 'content': content, 'filename': filename})
     return skills
 
-def match_skills(user_input: str, skills: List[Dict[str, str]]) -> List[Dict[str, str]]:
-    """Find relevant skills using embedding similarity, fallback to keyword matching."""
+def match_skills(user_input: str, skills: List[Dict[str, str]], top_n: int = 5) -> List[Dict[str, str]]:
+    """Find relevant skills using embedding similarity, fallback to keyword
+    matching. Returns up to `top_n` skills sorted by relevance.
+
+    The agent prompt block then surfaces these for the architect to apply
+    — see the `Use available skills` section in the system prompt for the
+    contract."""
     if not skills:
         return []
     from embed import rank_by_similarity
     skill_texts = [f"{s['name']}: {s['content'][:500]}" for s in skills]
-    ranked_texts = rank_by_similarity(user_input, skill_texts, top_n=3)
-    matched_names = set()
+    ranked_texts = rank_by_similarity(user_input, skill_texts, top_n=top_n)
+    matched_names = []  # preserve rank order
     for rt in ranked_texts:
         name = rt.split(":")[0]
-        matched_names.add(name)
+        if name not in matched_names:
+            matched_names.append(name)
 
     # Fallback: keyword match if embeddings returned nothing
     if not matched_names:
@@ -49,9 +62,10 @@ def match_skills(user_input: str, skills: List[Dict[str, str]]) -> List[Dict[str
             skill_lower = skill['content'].lower()
             skill_words = set(re.findall(r'\b[a-z]{4,}\b', skill_lower))
             if any(word in user_lower for word in skill_words):
-                matched_names.add(skill['name'])
+                matched_names.append(skill['name'])
 
-    return [s for s in skills if s['name'] in matched_names]
+    by_name = {s['name']: s for s in skills}
+    return [by_name[n] for n in matched_names if n in by_name][:top_n]
 
 def format_skills_block(skills: List[Dict[str, str]]) -> str:
     """Format matched skills into a context block."""

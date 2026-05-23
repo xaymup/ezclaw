@@ -487,6 +487,16 @@ What counts as a "genuine blocker" — set `complete: false` and stop ONLY if:
 Otherwise: **keep going**. The orchestrator gives you up to 40 steps and 3 pivot attempts per run — use them.
 
 ═══════════════════════════════════════════════════════════════
+## Use available skills (this is non-negotiable)
+═══════════════════════════════════════════════════════════════
+
+If the prompt contains an `<available_skills>` block, those are saved procedures the user has explicitly taught ezclaw to handle requests of this shape. They were retrieved by semantic similarity to the current task — they're relevant by construction.
+
+**Before planning from scratch, check the skills.** If any skill matches the user's intent (even partially), your plan should APPLY that skill's procedure rather than re-deriving an approach. In the execution intent, mention the skill name in `reasoning` so the routed agent knows which procedure to follow.
+
+If multiple skills apply, pick the best fit; if none truly match, ignore the block and plan freshly. But don't pretend they're not there — explicitly considering them is the difference between a system that learns and one that re-invents the same workaround every session.
+
+═══════════════════════════════════════════════════════════════
 ## Conversation flow awareness
 ═══════════════════════════════════════════════════════════════
 
@@ -1038,7 +1048,12 @@ No fluff. No "In this task...". Just facts."""
             [f"- Task: {e['task']}\n  Result: {e['trace']}" for e in experiences]
         ) + "\n" if experiences else ""
 
-        skills_block = ""  # populated per-step below; planning pass uses empty initial value
+        # Initial skill match against the raw user input — gives the
+        # planning pass visibility into any learned skill that fits the
+        # request right out of the gate. The per-step loop below replaces
+        # this with a fresh match against the evolving task_context.
+        initial_matched_skills = match_skills(user_input, self.skills)
+        skills_block = format_skills_block(initial_matched_skills)
 
         # Planning pass: produce a structured task list, or None for single-step.
         self.current_plan = self.architect.plan(
@@ -1228,7 +1243,14 @@ No fluff. No "In this task...". Just facts."""
                     prev_step_summary += f"\nTools used: {', '.join(last['tools'][:5])}"
 
             history_block = f"\n## Conversation History\n{recent_history}" if recent_history else ""
-            agent_context = f"{memory_block}{history_block}## Instructions\n{instruction}\n\n## Original Request\n{user_input}{prev_step_summary}"
+            # Sub-agents now ALSO see the matched skills — without this,
+            # the executor / researcher / debugger could not apply a saved
+            # procedure even when the architect's routing reasoning named it.
+            agent_context = (
+                f"{memory_block}{skills_block}{history_block}"
+                f"## Instructions\n{instruction}\n\n"
+                f"## Original Request\n{user_input}{prev_step_summary}"
+            )
 
             step_output_parts = []
             step_tool_results = []
