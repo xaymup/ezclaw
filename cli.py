@@ -732,20 +732,20 @@ class ChatUI:
         expanded = tool.get("expanded", False)
         compact = self.compact_tools
 
-        # Truncation limits flex based on expand state. Expanded uses a generous
-        # cap so we still avoid runaway 10MB dumps, but show effectively all
-        # normal tool output.
-        args_cap = 200 if expanded else 5
-        diff_cap = 2000 if expanded else 20
-        read_cap = 5000 if expanded else 25
-        output_cap = 5000 if expanded else 100
+        # Truncation caps only matter when expanded — the collapsed view
+        # shows just a one-line summary, so the body is never rendered.
+        diff_cap = 2000
+        read_cap = 5000
+        output_cap = 5000
+        args_cap = 200
 
         tool_kind = THEME.tool_kind(tool_name)
         idx_label = f"[{index}] " if index is not None else ""
-        state_label = "  ⇣ expanded" if expanded else ""
+        state_label = "  ▴ expanded" if expanded else "  ▾ collapsed"
 
         # Compact mode inlines args into the title as a function-call signature;
-        # full mode keeps the standalone "args" sub-panel below.
+        # full mode keeps the standalone "args" sub-panel below (only when
+        # expanded — collapsed never shows the args panel either).
         header_parts = [
             (f"{tool_kind.icon} ", f"bold {tool_kind.color}"),
             (idx_label, f"dim {DIM}"),
@@ -756,68 +756,92 @@ class ChatUI:
             header_parts.append(("(", f"dim {DIM}"))
             header_parts.append((sig, f"dim {DIM}"))
             header_parts.append((")", f"dim {DIM}"))
-        header_parts.append((state_label, f"dim {ACCENT}"))
+        header_parts.append((state_label, f"dim {DIM}"))
         header = Text.assemble(*header_parts)
 
         tool_parts = []
+
+        # Tool still running — always show the "running" indicator regardless
+        # of expand state. (No body to hide yet.)
+        if not result:
+            start_time = tool.get("start_time")
+            elapsed = time.time() - start_time if start_time else 0
+            label = f"running... ({elapsed:.1f}s)" if elapsed > 1 else "running..."
+            tool_parts.append(Text(label, style=f"dim {DIM}"))
+            return Panel(
+                Group(*tool_parts),
+                title=header,
+                border_style=f"dim {tool_kind.color}",
+                box=ROUNDED,
+            )
+
+        # We have a result. Compute the one-line summary and whether the
+        # output has more content than the summary captures.
+        renderable_result = str(result)
+        non_empty_lines = [l for l in renderable_result.splitlines() if l.strip()]
+        summary = None
+        if non_empty_lines:
+            first = non_empty_lines[0].strip()
+            summary = first[:80] + ("…" if len(first) > 80 else "")
+        # Output has "more" iff there are 2+ non-empty lines OR the first
+        # line itself exceeded the 80-char cap (and thus got truncated).
+        has_more = len(non_empty_lines) > 1 or (
+            bool(non_empty_lines) and len(non_empty_lines[0]) > 80
+        )
+
+        if not expanded:
+            # Collapsed: summary line, then optionally a hint to expand
+            # if there's content the summary couldn't show.
+            if summary:
+                tool_parts.append(Text(f"  ↳ {summary}", style=f"dim {DIM} italic"))
+            if has_more and index is not None:
+                tool_parts.append(Text(
+                    f"  /expand {index}  to show full output",
+                    style=f"dim {DIM} italic",
+                ))
+            return Panel(
+                Group(*tool_parts),
+                title=header,
+                border_style=f"dim {tool_kind.color}",
+                box=ROUNDED,
+            )
+
+        # ── Expanded: render the full body ─────────────────────────────────
         if not compact and args:
             arg_lines = []
             for k, v in args.items():
                 arg_lines.append(Text.assemble((f"{k}: ", "bold"), (str(v), "")))
             arg_text = Text("\n").join(arg_lines)
-            tool_parts.append(Panel(self._truncate_text(arg_text, max_lines=args_cap), title="args", border_style=f"dim {DIM}"))
+            tool_parts.append(Panel(self._truncate_text(arg_text, max_lines=args_cap),
+                                    title="args", border_style=f"dim {DIM}"))
 
-        if result:
-            renderable_result = str(result)
-            if tool_name == "write_file" and "Diff:" in renderable_result:
-                parts_of_result = renderable_result.split("Diff:\n", 1)
-                if len(parts_of_result) > 1:
-                    tool_parts.append(Text(parts_of_result[0]))
-                    diff_content = self._truncate_text(parts_of_result[1], diff_cap)
-                    if isinstance(diff_content, Text):
-                        diff_content = diff_content.plain
-                    tool_parts.append(Syntax(diff_content, "diff", theme="monokai", background_color="default"))
-                else:
-                    # In compact mode, drop the outer "output" sub-panel and
-                    # render the text directly inside the tool panel.
-                    truncated = self._truncate_text(renderable_result, max_lines=output_cap)
-                    tool_parts.append(truncated if compact else Panel(truncated, title="output", border_style=DIM))
-            elif tool_name == "read_file":
-                path_arg = str(args.get("path", "")) if args else ""
-                lang = self._detect_lang(path_arg)
-                file_content = self._truncate_text(renderable_result, read_cap)
-                if isinstance(file_content, Text):
-                    file_content = file_content.plain
-                tool_parts.append(Syntax(file_content, lang, theme="monokai", background_color="default"))
+        if tool_name == "write_file" and "Diff:" in renderable_result:
+            parts_of_result = renderable_result.split("Diff:\n", 1)
+            if len(parts_of_result) > 1:
+                tool_parts.append(Text(parts_of_result[0]))
+                diff_content = self._truncate_text(parts_of_result[1], diff_cap)
+                if isinstance(diff_content, Text):
+                    diff_content = diff_content.plain
+                tool_parts.append(Syntax(diff_content, "diff", theme="monokai", background_color="default"))
             else:
-                truncated = self._truncate_text(Text(renderable_result), max_lines=output_cap)
+                truncated = self._truncate_text(renderable_result, max_lines=output_cap)
                 tool_parts.append(truncated if compact else Panel(truncated, title="output", border_style=DIM))
-
-            # Hint only when truncation could have hidden something AND not expanded.
-            if not expanded and index is not None:
-                result_lines = renderable_result.count("\n") + 1
-                if result_lines > 20:
-                    tool_parts.append(Text(f"  /expand {index}  to show full output", style=f"dim {DIM} italic"))
+        elif tool_name == "read_file":
+            path_arg = str(args.get("path", "")) if args else ""
+            lang = self._detect_lang(path_arg)
+            file_content = self._truncate_text(renderable_result, read_cap)
+            if isinstance(file_content, Text):
+                file_content = file_content.plain
+            tool_parts.append(Syntax(file_content, lang, theme="monokai", background_color="default"))
         else:
-            start_time = tool.get("start_time")
-            elapsed = time.time() - start_time if start_time else 0
-            label = f"running... ({elapsed:.1f}s)" if elapsed > 1 else "running..."
-            tool_parts.append(Text(label, style=f"dim {DIM}"))
+            truncated = self._truncate_text(Text(renderable_result), max_lines=output_cap)
+            tool_parts.append(truncated if compact else Panel(truncated, title="output", border_style=DIM))
 
-        # Full mode shows the redundant ↳ summary line above the output. Compact
-        # mode drops it — the output is right there and the title already names
-        # the call.
-        if not compact and not expanded and result:
-            summary = None
-            for line in str(result).splitlines():
-                stripped = line.strip()
-                if stripped:
-                    summary = stripped[:80] + ("…" if len(stripped) > 80 else "")
-                    break
-            if summary:
-                summary_text = Text(f"  ↳ {summary}", style=f"dim {DIM} italic")
-                insert_at = 1 if args else 0
-                tool_parts.insert(insert_at, summary_text)
+        if index is not None:
+            tool_parts.append(Text(
+                f"  /collapse {index}  to hide output",
+                style=f"dim {DIM} italic",
+            ))
 
         return Panel(
             Group(*tool_parts),
