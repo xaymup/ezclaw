@@ -629,6 +629,11 @@ Rules for execution:
 - **After a `debugger` step:** the debugger returns a diagnosis plus a numbered "Proposed Fix". This output is INTERNAL — the user never sees it. DO NOT re-narrate that diagnosis or paste its steps into `plan`. Convert each step of the Proposed Fix into a `new_tasks` entry (`after_id` = the debugger task's id, one entry per concrete step), mark the debugger task `done`, route the NEXT turn to the agent that should execute the first new step (usually `executor`). Keep `reflection.observation` to one short sentence.
 - **The user's chat only ever shows what addresses their original prompt.** When you set `complete: true`, the LAST visible step's output is what the user reads as the answer. Route the final step to an agent whose output naturally responds to the user (executor for "did it work?" recaps; researcher/general for explanatory questions). Never let the debugger be the final visible step — its content is suppressed from chat by design.
 - Set `complete: true` ONLY when every task in the plan is `done` or `skipped` AND the user's full original intent is verifiably satisfied. Premature completion is forbidden.
+- **Finalization (when the plan is done) — STOP planning new work.** The moment every plan task is `done`/`skipped` AND the original user request is met, your job is to wrap up cleanly. Set `complete: true` and emit no `new_tasks`. The user's ORIGINAL request is the sole arbiter of "done" — never expand scope by adding tasks they didn't ask for. Specifically forbidden post-completion drift:
+    - Adding "write tests" / "add documentation" / "commit and push" / "create a README" / "refactor for style" when the user didn't ask.
+    - Searching memory or `recall_actions` for "what else might need doing" — those are for retrieving CONTEXT relevant to the current request, not for sourcing new work.
+    - Looking at unrelated workspace files to find "improvements" to make.
+    - One exception: if a genuine blocker was discovered (missing dependency, broken import, the deliverable doesn't actually run), insert ONE corrective task. Otherwise: complete.
 - `plan` is the step-by-step instruction the routed agent will execute this turn. Make it concrete and actionable: "Read sse_handler.py, find the handle_disconnect function, add a `connection.cleanup()` call before the return." Not "Work on the leak."
 - `reflection.observation` is one short sentence describing what actually happened in the previous step. Skip if first step.
 - `reflection.critical_thinking` is REQUIRED on every turn. One short sentence on WHY this routing/plan vs. the alternative you discarded. Use it to make the trade-off explicit ("routing to executor because the previous step's file read showed the function is in this module, not elsewhere").
@@ -652,7 +657,7 @@ For completion:
 
 ## Persistence
 
-Keep iterating until the user's primary goal is achieved. Re-read the original request each step; don't drift to easier sub-goals or declare victory on a partial result. On step failure: diagnose, switch agent or tool path, insert a corrective task — don't halt. Only stop with `complete: false` for genuine blockers: missing credentials, ambiguous requirements, external service unavailable. The orchestrator allows 40 steps and 3 pivots per run.
+Iterate until the user's PRIMARY goal is achieved — then stop. Re-read the original request each step. Two failure modes are equally bad: (a) declaring victory on a partial result before the goal is met, and (b) drifting past completion to add scope the user didn't ask for ("now let me also add tests / docs / refactor"). On step failure: diagnose, switch agent or tool path, insert a corrective task — don't halt. Only stop with `complete: false` for genuine blockers: missing credentials, ambiguous requirements, external service unavailable. The orchestrator allows 40 steps and 3 pivots per run.
 
 ## Use available skills
 
@@ -1233,12 +1238,24 @@ Return ONLY the JSON object."""
             "\"executor\", \"task ID\", \"architect\", \"step\".\n"
             "- Do not re-narrate every step — the user has already seen "
             "the plan panel update in real time. Focus on the OUTCOME.\n"
-            "- If the plan succeeded, confirm what was delivered. Keep it "
-            "short.\n"
+            "- If the plan succeeded, write a short delivery summary in "
+            "this shape:\n"
+            "    1. **One-line outcome.** What you built, in one sentence.\n"
+            "    2. **What's where.** Specific files written or modified "
+            "(e.g. `game.py`, `tests/test_game.py`), one per line if more "
+            "than one.\n"
+            "    3. **How to use it.** One line — the exact command to "
+            "run, open, or import what you built (e.g. `Run `python "
+            "game.py`` or `Import `Game` from `game.py``).\n"
+            "    4. **Next steps (optional, 1–2 max).** Phrased as "
+            "OFFERS the user can decline, NOT auto-applied work. E.g. "
+            "`Want me to add tests? Or wire up two-player mode?`. Skip "
+            "this if there's no natural follow-up.\n"
             "- If anything failed, say so plainly and stop. Do not pretend "
-            "work was done that wasn't.\n"
-            "- No JSON, no markdown headers, no code fences unless quoting "
-            "actual code.\n\n"
+            "work was done that wasn't. Skip the 'how to use' and 'next "
+            "steps' sections on failure.\n"
+            "- No JSON, no markdown headers above level-3, no code fences "
+            "unless quoting actual code.\n\n"
             f"User request:\n{user_input}\n\n"
             f"Steps taken (internal record):\n{history_block}\n\n"
             f"Last sub-agent output:\n{last_step_output}\n\n"
@@ -1281,18 +1298,29 @@ Return ONLY the JSON object."""
         prompt = (
             "You are a strict response-quality gate. Decide if the "
             "candidate response addresses the user's original prompt.\n\n"
+            "IMPORTANT CONTEXT: For coding/build requests, the candidate "
+            "response is a SUMMARY of delivered work — the actual code "
+            "lives in the files that were written by the agent. A "
+            "response like 'Wrote game.py with the Game class. Run "
+            "`python game.py` to play.' is a CORRECT answer — do NOT "
+            "demand the source code inline. Files are the deliverable; "
+            "the response confirms what was delivered.\n\n"
             "Return JSON only:\n"
             '  {"ok": true}\n'
-            "    when the response answers the prompt directly. Don't be "
-            "pedantic — a reasonable, on-topic answer is OK even if not "
-            "exhaustive.\n"
+            "    when the response addresses the prompt directly. "
+            "Coding requests are addressed when the response confirms "
+            "the file(s) were written and (optionally) how to run them. "
+            "Don't be pedantic — a reasonable on-topic answer is OK "
+            "even if not exhaustive.\n"
             '  {"ok": false, "missing": "<one short phrase: what would '
             'turn this into an actual answer>"}\n'
             "    only when the response truly fails to address the "
-            "prompt — generic refusal, off-topic, error message, or "
-            'empty restatement. NEVER respond with missing="more detail" '
-            "or similar vague feedback — the missing field must point "
-            "at a concrete gap.\n\n"
+            "prompt — generic refusal, off-topic, an error message, or "
+            "the work obviously wasn't done (response says 'I cannot' "
+            'or "I don\'t know how"). NEVER respond with missing="more '
+            'detail", "more code", "more tests", or similar vague '
+            "feedback — the missing field must point at a concrete gap "
+            "the user actually asked about.\n\n"
             f"User prompt:\n{user_input[:600]}\n\n"
             f"Candidate response:\n{candidate_response[:2000]}\n\n"
             "Return ONLY the JSON object."
