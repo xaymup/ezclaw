@@ -566,6 +566,108 @@ Return ONLY the JSON object."""
                 continue
         return None
 
+    def execute(
+        self,
+        plan,
+        task_context: str,
+        memory_block: str = "",
+        skills_block: str = "",
+        experiences_block: str = "",
+        routing_block: str = "",
+        history_block: str = "",
+        map_block: str = "",
+        temperature: float = 0.0,
+        pivot_hint: str = "",
+    ) -> "Dict[str, Any]":
+        """Execution-mode call. Returns the structured intent dict. When
+        `plan` is None, the architect operates in single-step mode (no plan
+        active); when present, the plan is rendered into the prompt so the
+        architect knows which task to advance.
+
+        On parse failure, returns a safe fallback intent that does not
+        mutate the plan.
+        """
+        if plan is not None:
+            plan_render_lines = [f"Plan: {plan.title}"]
+            for t in plan.tasks:
+                marker = {
+                    "pending": " ", "in_progress": "▸", "done": "✓",
+                    "failed": "✗", "skipped": "⊘",
+                }.get(t.status, " ")
+                plan_render_lines.append(f"  [{marker}] {t.id}. {t.description}  ({t.status})")
+            plan_block = "\n".join(plan_render_lines)
+        else:
+            plan_block = "Plan: (none — single-step request)"
+
+        pivot_block = ""
+        if pivot_hint:
+            pivot_block = (
+                "## CRITICAL PIVOT REQUIRED\n"
+                f"{pivot_hint}\n"
+                "Do NOT re-issue the previous plan. Choose a fundamentally different "
+                "approach: switch the recommended_agent, decompose differently, "
+                "or use a different tool.\n\n"
+            )
+
+        prompt = f"""## EXECUTION REQUEST
+
+{pivot_block}{plan_block}
+
+## Task Context
+{task_context}
+
+## Conversation History
+{history_block}
+
+## Auxiliary Context
+### Codebase Map
+{map_block}
+### Past Experiences
+{experiences_block}
+{memory_block}{skills_block}{routing_block}
+
+## Decision Required
+Decide the next routing step. Return the EXECUTION JSON object."""
+
+        for attempt in range(2):
+            try:
+                content = self._chat(
+                    prompt if attempt == 0 else prompt + "\n\nCRITICAL: Return ONLY valid JSON.",
+                    temperature=temperature,
+                )
+                intent = extract_json(content)
+                intent.setdefault("kind", "execute")
+                intent.setdefault("current_task_id", 0)
+                intent.setdefault("recommended_agent", "executor")
+                intent.setdefault("reasoning", "")
+                intent.setdefault("task_updates", [])
+                intent.setdefault("new_tasks", [])
+                intent.setdefault("complete", False)
+                intent.setdefault("reflection", {})
+
+                valid_agents = {"executor", "general", "researcher", "debugger"}
+                if intent.get("recommended_agent") not in valid_agents:
+                    intent["recommended_agent"] = "executor"
+                if not isinstance(intent.get("task_updates"), list):
+                    intent["task_updates"] = []
+                if not isinstance(intent.get("new_tasks"), list):
+                    intent["new_tasks"] = []
+                return intent
+            except Exception:
+                continue
+
+        # Safe fallback — keep the loop alive without mutating the plan.
+        return {
+            "kind": "execute",
+            "current_task_id": 0,
+            "recommended_agent": "executor",
+            "reasoning": "Parse fallback",
+            "task_updates": [],
+            "new_tasks": [],
+            "complete": False,
+            "reflection": {"critical_thinking": "Parsing failed; routing to executor as a default."},
+        }
+
     def analyze(self, task_context: str, memory_block: str = "", skills_block: str = "", experiences_block: str = "", routing_block: str = "", history_block: str = "", map_block: str = "", temperature: float = 0.0, pivot_hint: str = "") -> Dict[str, Any]:
         max_prompt_len = 12000
         blocks = [task_context, memory_block, skills_block, experiences_block, routing_block, history_block, map_block]

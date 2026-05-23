@@ -64,3 +64,67 @@ def test_plan_returns_none_on_malformed_json_twice(fake_db):
     plan = arch.plan("anything")
     assert plan is None
     assert mock_client.chat.call_count >= 2
+
+
+def test_execute_returns_intent_with_plan(fake_db):
+    response = json.dumps({
+        "kind": "execute",
+        "current_task_id": 2,
+        "recommended_agent": "executor",
+        "reasoning": "Apply the cleanup hook found in task 1.",
+        "task_updates": [{"id": 1, "status": "done"}],
+        "new_tasks": [],
+        "complete": False,
+        "reflection": {
+            "goal": "Fix SSE leak",
+            "observation": "Read confirmed the leak location.",
+            "critical_thinking": "Move to task 2.",
+        },
+    })
+    arch = _make_architect_with_response(fake_db, response)
+    plan = Plan(
+        title="fix leak",
+        tasks=[Task(id=1, description="read"), Task(id=2, description="fix"), Task(id=3, description="test")],
+    )
+    intent = arch.execute(plan, task_context="Step 1 read complete.")
+    assert intent["kind"] == "execute"
+    assert intent["current_task_id"] == 2
+    assert intent["recommended_agent"] == "executor"
+    assert intent["task_updates"] == [{"id": 1, "status": "done"}]
+    assert intent["complete"] is False
+
+
+def test_execute_returns_intent_without_plan(fake_db):
+    """When plan is None, execute() still works — single-step path."""
+    response = json.dumps({
+        "kind": "execute",
+        "current_task_id": 0,
+        "recommended_agent": "general",
+        "reasoning": "Conversational reply.",
+        "task_updates": [],
+        "new_tasks": [],
+        "complete": True,
+        "reflection": {"goal": "Answer", "observation": "", "critical_thinking": "Done."},
+    })
+    arch = _make_architect_with_response(fake_db, response)
+    intent = arch.execute(None, task_context="User asked: hi")
+    assert intent["kind"] == "execute"
+    assert intent["complete"] is True
+
+
+def test_execute_fallback_on_malformed_json(fake_db):
+    """Two failed parses → return a safe fallback intent (no plan changes)."""
+    from multi_agent import Architect
+
+    with patch("multi_agent.build_architect_client") as build_client:
+        mock_client = MagicMock()
+        mock_client.chat.return_value = {"message": {"content": "not json"}}
+        build_client.return_value = (mock_client, "fake-model")
+        arch = Architect(fake_db)
+
+    intent = arch.execute(None, task_context="anything")
+    # Fallback intent should be safe defaults, not raise
+    assert isinstance(intent, dict)
+    assert intent.get("recommended_agent") in ("executor", "general", "researcher", "debugger")
+    assert intent.get("task_updates", []) == []
+    assert intent.get("new_tasks", []) == []
