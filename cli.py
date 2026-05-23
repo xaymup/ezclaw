@@ -271,6 +271,12 @@ class ChatUI:
                 "input_queue": input_q,
                 "tool": tool_dict,
                 "command": command,
+                # Tracks when the subprocess last emitted output. The tool
+                # panel render uses this to detect "subprocess is waiting
+                # for input" (no output for ~1.5s while still alive) and
+                # promote the panel to a high-attention state.
+                "last_output_at": time.time(),
+                "notified_waiting": False,
             }
 
             def on_output(data: bytes):
@@ -280,6 +286,12 @@ class ChatUI:
                 total = sum(len(c) for c in live_buffer)
                 while total > 64 * 1024 and len(live_buffer) > 1:
                     total -= len(live_buffer.pop(0))
+                # Refresh the "last output" timestamp so the panel knows
+                # the subprocess is still talking — clears any "waiting"
+                # cue from the prior idle window.
+                if self._interactive_session is not None:
+                    self._interactive_session["last_output_at"] = time.time()
+                    self._interactive_session["notified_waiting"] = False
                 try:
                     self._update_ui()
                 except Exception:
@@ -287,9 +299,15 @@ class ChatUI:
 
             def input_provider():
                 try:
-                    return input_q.get_nowait()
+                    val = input_q.get_nowait()
                 except queue.Empty:
                     return None
+                # User just typed — reset the timer so the panel reverts
+                # to "live" while the subprocess processes the input.
+                if self._interactive_session is not None:
+                    self._interactive_session["last_output_at"] = time.time()
+                    self._interactive_session["notified_waiting"] = False
+                return val
 
             try:
                 from tools import (
@@ -948,9 +966,44 @@ class ChatUI:
             # and their keystrokes are forwarded to the subprocess.
             live_buffer = tool.get("_live_buffer")
             if tool.get("interactive") and live_buffer is not None:
+                # Detect "subprocess waiting for input": no output for
+                # ~1.5s while session is still active. Promote the panel
+                # to a high-attention state and (once per waiting event)
+                # ping the user via OS notification + sound.
+                session = self._interactive_session or {}
+                last_out = session.get("last_output_at", time.time())
+                idle = time.time() - last_out
+                waiting = idle > 1.5
+
+                if waiting and not session.get("notified_waiting"):
+                    session["notified_waiting"] = True
+                    try:
+                        from notifications import notify, URGENCY_CRITICAL
+                        notify(
+                            "🦀 ezclaw: subprocess waiting for input",
+                            f"`{tool_name}` is waiting on a prompt — switch to ezclaw to type.",
+                            urgency=URGENCY_CRITICAL,
+                        )
+                    except Exception:
+                        pass
+
                 head = self._one_line_tool_head(tool_kind, tool_name, args, index)
-                head.append(f"   ⏳ live{elapsed_str}", style=f"bold {WARN}")
-                head.append("   (type to send input to subprocess)", style=f"dim {DIM} italic")
+                if waiting:
+                    # Bright attention-grabbing label, animated pulse on
+                    # the ✋ glyph so the eye finds it immediately.
+                    pulse_color = self._cycle_palette_color(
+                        ("#ff8c5c", "#ffd166", "#ff5fd7"), period_sec=0.5
+                    )
+                    head.append(f"   ✋ ", style=f"bold {pulse_color}")
+                    head.append(
+                        f"AWAITING INPUT  ({idle:.0f}s idle) — type below",
+                        style=f"bold {WARN}",
+                    )
+                    border = WARN  # full saturation — not dim
+                else:
+                    head.append(f"   ⏳ live{elapsed_str}", style=f"bold {WARN}")
+                    head.append("   (type to send input to subprocess)", style=f"dim {DIM} italic")
+                    border = f"dim {WARN}"
 
                 # Decode the streaming bytes and strip ANSI; keep the last
                 # ~40 lines so the panel doesn't grow indefinitely on a
@@ -964,7 +1017,7 @@ class ChatUI:
                 body = Text("\n".join(lines), style="")
                 return Panel(
                     Group(head, body),
-                    border_style=f"dim {WARN}",
+                    border_style=border,
                     box=ROUNDED,
                 )
 
