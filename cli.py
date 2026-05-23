@@ -600,12 +600,26 @@ class ChatUI:
             return render_to_ansi(self._get_welcome_panel())
             
         parts = []
-        # Cap to the last 3 side_messages — without this cap, a long
-        # multi-step turn stacked 20+ dim italic lines at the top of the
-        # active area, duplicating what the architect chip already shows.
+        # ── Layout order (top → bottom) ────────────────────────────────────
+        # 1. Side messages (memory / context notes — informational, top)
+        # 2. Reasoning panel (thinking, when SHOW_THINKING)
+        # 3. Assistant response (model output — first thing the user reads)
+        # 4. Architect chip (current routing label)
+        # 5. Tool execution panels (this turn's tool calls)
+        # 6. Plan panel (sticky progress tracker — LAST so it always
+        #    anchors the bottom of the active area, just above the input)
+        # 7. Auth prompt (special — only when active, replaces plan slot)
+        # 8. Spinner (status line, last)
+        #
+        # Rationale: tools sit *under* the current plan step the agent is
+        # working on, and the plan stays pinned to the bottom so the user
+        # always sees overall progress at a glance.
+
+        # 1. Side messages (capped to last 3)
         for msg in self.side_messages[-3:]:
             parts.append(Text(msg, style=f"dim {DIM} italic"))
-            
+
+        # 2. Reasoning / thinking panel
         current_reasoning = "".join(self.reasoning_chunks)
         if SHOW_THINKING and current_reasoning:
             stripped = current_reasoning.strip()
@@ -614,9 +628,6 @@ class ChatUI:
             still_thinking = self.is_generating and not self.current_response_parts
             from phrases import THINKING_BADGE, THOUGHT_BADGE
             badge = f"{THINKING_BADGE}…" if still_thinking else THOUGHT_BADGE
-            # Soft purple-grey for reasoning so it visually recedes vs. the
-            # main response (which renders as markdown). Italic + dim caps
-            # are preserved; border picks up the role hue.
             REASON_COLOR = "#9999cc"
             body_text = Text()
             body_text.append(stripped, style=f"italic {REASON_COLOR}")
@@ -627,36 +638,43 @@ class ChatUI:
                 box=ROUNDED,
                 padding=(0, 1),
             ))
-            
-        for idx, tool in enumerate(self.tool_executions, 1):
-            parts.append(self._build_tool_panel(tool, idx))
-            
-        if self.auth_active and self.current_auth_chunk:
-             parts.append(Panel(
-                 Text.assemble(
-                     ("Authorization Required", f"bold {WARN}"),
-                     ("\n\nTool: ", ""), (self.current_auth_chunk['name'], "bold"),
-                     ("\nArgs: ", ""), (str(self.current_auth_chunk['arguments']), f"dim {DIM}"),
-                     ("\n\nPress ", ""), ("[Y]", "bold"), (" to allow, ", ""),
-                     ("[N]", "bold"), (" to deny, ", ""),
-                     ("[A]", "bold"), (" to allow for session", "")
-                 ),
-                 title="[bold red]Security Check[/bold red]",
-                 border_style="red",
-                 box=ROUNDED,
-                 padding=(1, 2)
-             ))
 
-        plan_panel = self._render_plan_panel()
-        if plan_panel is not None:
-            parts.append(plan_panel)
-
-        if self.architect_intent:
-            parts.append(self._render_architect_intent(self.architect_intent))
-
+        # 3. Assistant response (model output — moved up from bottom)
         current_content = "".join(self.current_response_parts)
         if current_content:
             parts.append(Markdown(current_content))
+
+        # 4. Architect chip
+        if self.architect_intent:
+            parts.append(self._render_architect_intent(self.architect_intent))
+
+        # 5. Tool execution panels (sit between chip and plan — so the
+        #    tools the agent is running are visually grouped under the
+        #    current step they belong to)
+        for idx, tool in enumerate(self.tool_executions, 1):
+            parts.append(self._build_tool_panel(tool, idx))
+
+        # 6 / 7. Auth prompt replaces plan slot when active; otherwise
+        #        the plan panel anchors the bottom of the active area.
+        if self.auth_active and self.current_auth_chunk:
+            parts.append(Panel(
+                Text.assemble(
+                    ("Authorization Required", f"bold {WARN}"),
+                    ("\n\nTool: ", ""), (self.current_auth_chunk['name'], "bold"),
+                    ("\nArgs: ", ""), (str(self.current_auth_chunk['arguments']), f"dim {DIM}"),
+                    ("\n\nPress ", ""), ("[Y]", "bold"), (" to allow, ", ""),
+                    ("[N]", "bold"), (" to deny, ", ""),
+                    ("[A]", "bold"), (" to allow for session", "")
+                ),
+                title="[bold red]Security Check[/bold red]",
+                border_style="red",
+                box=ROUNDED,
+                padding=(1, 2)
+            ))
+        else:
+            plan_panel = self._render_plan_panel()
+            if plan_panel is not None:
+                parts.append(plan_panel)
             
         if self.is_generating:
             elapsed = time.time() - self.generation_start_time
