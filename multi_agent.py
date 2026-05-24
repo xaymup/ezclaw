@@ -763,8 +763,12 @@ class SpecializedAgent:
                         continue
                     elif auth == "allow_session":
                         # Old "session" name kept for back-compat with the
-                        # cli answer queue; semantics: blanket allow.
-                        self.session_authorized = True
+                        # cli answer queue; semantics: blanket allow for
+                        # every auth-required tool until the session ends.
+                        # Must mutate the SHARED auth state — not a local
+                        # attribute on this agent — so sibling agents
+                        # spawned by the architect also see the allow.
+                        self._auth_state.authorized = True
                     elif auth == "allow_tool":
                         # New: this tool gets to run without prompting
                         # again for the rest of the session.
@@ -1876,12 +1880,25 @@ No fluff. No "In this task...". Just facts."""
                 sc_output = ""
                 sc_tool_results = []
                 agent_input = f"{history_block}{memory_hint}{user_input}"
-                for chunk in agent.chat_stream(agent_input):
-                    if chunk["type"] == "content":
-                        sc_output += chunk["content"]
-                    elif chunk["type"] == "tool_end":
-                        sc_tool_results.append(chunk["name"])
-                    yield chunk
+                # Manual send-loop instead of `for chunk in ...` so that
+                # values the outer consumer (cli) sends back via
+                # gen.send(choice) — specifically the auth answer in
+                # response to `auth_required` — propagate through THIS
+                # wrapper to the inner agent generator. A plain `for`
+                # only calls next(), which discards sent values and
+                # makes the inner `auth = yield {...}` always see None.
+                inner = agent.chat_stream(agent_input)
+                sent_back = None
+                try:
+                    while True:
+                        chunk = inner.send(sent_back)
+                        if chunk["type"] == "content":
+                            sc_output += chunk["content"]
+                        elif chunk["type"] == "tool_end":
+                            sc_tool_results.append(chunk["name"])
+                        sent_back = yield chunk
+                except StopIteration:
+                    pass
                 if not sc_output.strip() and sc_tool_results:
                     sc_output = "Done."
                     yield {"type": "content", "content": "Done."}
@@ -2226,18 +2243,30 @@ No fluff. No "In this task...". Just facts."""
             step_output_parts = []
             step_tool_results = []
             step_tool_names = []
-            for chunk in agent.chat_stream(agent_context):
-                if chunk["type"] == "content":
-                    step_output_parts.append(chunk["content"])
-                    if suppress_user_visible:
-                        # Capture-only: architect needs this in its next
-                        # prompt, but the user never sees raw debugger
-                        # analysis as the response to their question.
-                        continue
-                elif chunk["type"] == "tool_end":
-                    step_tool_names.append(chunk["name"])
-                    step_tool_results.append(f"  [{chunk['name']}]: {str(chunk['result'])[:500]}")
-                yield chunk
+            # Manual send-loop (not `for chunk in ...`) so auth answers
+            # the CLI sends via gen.send(choice) propagate down to the
+            # inner agent's `auth = yield {...}`. See the matching
+            # comment in the fast-route path above.
+            inner = agent.chat_stream(agent_context)
+            sent_back = None
+            try:
+                while True:
+                    chunk = inner.send(sent_back)
+                    if chunk["type"] == "content":
+                        step_output_parts.append(chunk["content"])
+                        if suppress_user_visible:
+                            # Capture-only: architect needs this in its
+                            # next prompt, but the user never sees raw
+                            # debugger analysis as the response to their
+                            # question.
+                            sent_back = None
+                            continue
+                    elif chunk["type"] == "tool_end":
+                        step_tool_names.append(chunk["name"])
+                        step_tool_results.append(f"  [{chunk['name']}]: {str(chunk['result'])[:500]}")
+                    sent_back = yield chunk
+            except StopIteration:
+                pass
 
             step_output = "".join(step_output_parts)
 

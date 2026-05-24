@@ -199,7 +199,21 @@ class Database:
             results = [row[0] for row in cursor.fetchall()]
             return list(set(results))[:10]
 
-    def delete_memory(self, query: str) -> List[str]:
+    def delete_memory(self, query: str, max_delete: int = 5) -> List[str]:
+        """Delete memories matching `query`.
+
+        Conditions are joined with **AND**, not OR — every content word must
+        appear in the memory's fact or tags. The previous OR-joined version
+        deleted ANY memory containing ANY one of the query words, which
+        caused `forget("The user's name is Lulu")` to nuke every memory
+        containing "lulu" (garden notes, workspace paths, birthday, etc.).
+
+        Returns a list of fact strings actually deleted, or — if the match
+        set is larger than `max_delete` — returns the matching facts
+        prefixed with `[REFUSED:N]` and deletes NOTHING. The caller (the
+        `forget` tool wrapper) surfaces that to the agent so it can refine
+        the query instead of mass-deleting.
+        """
         stop_words = {'what', 'when', 'is', 'the', 'how', 'many', 'of', 'a', 'an', 'my', 'your', 'forget', 'remove', 'delete'}
         words = [w.strip().lower() for w in query.split() if w.lower() not in stop_words and len(w) > 2]
         if not words: words = [query.lower()]
@@ -209,15 +223,21 @@ class Database:
             conditions = []
             params = []
             for word in words:
-                conditions.append("(fact LIKE ? OR tags LIKE ?)")
+                conditions.append("(LOWER(fact) LIKE ? OR LOWER(tags) LIKE ?)")
                 params.extend([f"%{word}%", f"%{word}%"])
 
-            search_sql = f"SELECT id, fact FROM memories WHERE {' OR '.join(conditions)}"
+            search_sql = f"SELECT id, fact FROM memories WHERE {' AND '.join(conditions)}"
             cursor.execute(search_sql, params)
             to_delete = cursor.fetchall()
 
             if not to_delete:
                 return []
+
+            if len(to_delete) > max_delete:
+                # Refuse — return preview-list with a sentinel so the tool
+                # wrapper can surface "too many matches; narrow the query"
+                # to the agent instead of silently destroying memories.
+                return [f"[REFUSED:{len(to_delete)}]"] + [row[1] for row in to_delete[:max_delete]]
 
             ids = [row[0] for row in to_delete]
             facts = [row[1] for row in to_delete]

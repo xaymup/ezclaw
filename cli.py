@@ -2174,7 +2174,7 @@ class ChatUI:
             status_text.append(f" {rs.icon} ", style=f"bold {rs.color}")
             status_text.append(f"{self.current_status}  [{_fmt_duration(elapsed)}]", style=f"bold {rs.color}")
             if idle_time > 15:
-                status_text.append(f"  ⚠ idle {idle_time:.0f}s", style=f"bold {WARN}")
+                status_text.append(f"  ⚠ idle {_fmt_duration(idle_time)}", style=f"bold {WARN}")
             spinner = self._spinner_for(self.current_role)
             spinner.text = status_text
             parts.append(spinner)
@@ -4065,7 +4065,7 @@ class ChatUI:
             if elapsed >= 30:
                 notify(
                     "🦀 ezclaw finished",
-                    f"Task done in {elapsed:.0f}s. Check the chat for details.",
+                    f"Task done in {_fmt_duration(elapsed)}. Check the chat for details.",
                     urgency=URGENCY_LOW,
                 )
 

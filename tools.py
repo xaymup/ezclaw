@@ -20,6 +20,20 @@ MUTATING_TOOLS = frozenset({
     "inline_save",
 })
 
+
+def _fmt_duration(seconds: float) -> str:
+    """Match cli._fmt_duration so tool-result durations render the same
+    way as everything else in the TUI. Kept local instead of imported
+    from cli.py to avoid a circular import (cli imports tools)."""
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    if seconds < 3600:
+        m, s = divmod(int(seconds), 60)
+        return f"{m}m {s}s"
+    h, rem = divmod(int(seconds), 3600)
+    m = rem // 60
+    return f"{h}h {m}m"
+
 # Set by the agent at session start; read by recall_actions to scope its
 # search. Module-level so it survives across the tool's invocation
 # without threading a parameter through every call site.
@@ -675,7 +689,7 @@ def _run_shell_interactive(
         f"[Interactive shell session — {status}]\n"
         f"Command: {command}\n"
         f"Exit code: {exit_code}\n"
-        f"Duration: {duration:.1f}s\n"
+        f"Duration: {_fmt_duration(duration)}\n"
         f"Captured terminal output ({len(clean_output)} chars):\n"
         f"───\n"
     )
@@ -1257,9 +1271,23 @@ def create_memory_tools(db: Any):
 
     @registry.register
     def forget(query: str) -> str:
-        """Remove facts from long-term memory using keywords."""
+        """Remove facts from long-term memory using keywords. Every content
+        word in the query must appear in the matched memory (AND-joined).
+        If the query matches more than 5 memories, deletion is refused and
+        a preview is returned so the agent can refine the query instead of
+        mass-deleting unrelated facts."""
         deleted = db.delete_memory(query)
         if not deleted: return f"No memories found matching '{query}' to forget."
+        if deleted and deleted[0].startswith("[REFUSED:"):
+            total = deleted[0][len("[REFUSED:"):-1]
+            preview = "\n- ".join(deleted[1:])
+            return (
+                f"Refused to delete: query '{query}' matches {total} memories — "
+                f"too many to safely remove in one call.\n"
+                f"First few that would have been deleted:\n- {preview}\n"
+                f"Narrow the query with more distinctive words, or use a "
+                f"specific tag, then call forget again."
+            )
         return "Deleted memories:\n- " + "\n- ".join(deleted)
 
 
