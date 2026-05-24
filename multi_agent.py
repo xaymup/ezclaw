@@ -49,6 +49,69 @@ _KNOWN_TOOL_NAMES = frozenset({
 })
 
 
+def _format_tool_typeerror(tool_name: str, tool_func, passed_args: dict, exc: TypeError) -> str:
+    """Build a model-actionable error string for a wrong-kwargs tool call.
+
+    The default `TypeError` Python raises ("wrapped_run_shell() got an
+    unexpected keyword argument 'content'") doesn't tell the model what
+    the correct args are, so it loops on the same mistake. This pulls
+    the actual parameter names off the function signature, names the
+    passed-but-unknown / missing args explicitly, and adds a "Did you
+    mean..." nudge for the common write_file/run_shell confusion.
+    """
+    import inspect
+    try:
+        sig = inspect.signature(tool_func)
+        params = list(sig.parameters.values())
+        param_names = [p.name for p in params if p.name != "self"]
+        required = [
+            p.name for p in params
+            if p.name != "self"
+            and p.default is inspect.Parameter.empty
+            and p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                            inspect.Parameter.KEYWORD_ONLY)
+        ]
+    except (TypeError, ValueError):
+        param_names = []
+        required = []
+
+    passed = list((passed_args or {}).keys())
+    unknown = [k for k in passed if k not in param_names] if param_names else []
+    missing = [k for k in required if k not in passed]
+
+    parts = [
+        f"Error: tool `{tool_name}` was called with the wrong arguments.",
+        f"  Underlying: {exc}",
+    ]
+    if param_names:
+        parts.append(f"  Expected args: ({', '.join(param_names)})")
+        parts.append(f"  You passed:    ({', '.join(passed) if passed else 'no args'})")
+    if unknown:
+        parts.append(f"  Unknown args:  {unknown}")
+    if missing:
+        parts.append(f"  Missing args:  {missing}")
+
+    # Heuristic nudges for the most common mix-ups so the model can
+    # self-correct in one retry instead of looping.
+    hint = ""
+    if tool_name == "run_shell" and ("content" in passed or "path" in passed):
+        hint = (
+            "Hint: `run_shell` takes a shell `command` string (e.g. "
+            "command=\"python pyramid.py\"). If you wanted to WRITE a "
+            "file, call write_file(path=..., content=...) instead. "
+            "If you wanted to RUN a file you just wrote, call "
+            "run_shell(command=\"python <path>\")."
+        )
+    elif tool_name == "write_file" and "command" in passed:
+        hint = (
+            "Hint: `write_file` takes `path` and `content`. To EXECUTE a "
+            "shell command use run_shell(command=...)."
+        )
+    if hint:
+        parts.append(f"  {hint}")
+    return "\n".join(parts)
+
+
 def _parse_tool_lines(text: str) -> set:
     """Extract known tool names from a newline-separated LLM response.
 
@@ -109,6 +172,41 @@ When the task is "write/create/save file X", you MUST call `write_file(path, con
   Right: call `write_file(path="snake.py", content="import random\\nn = random.randint(1, 100)\\n...")`
 
 If you ever catch yourself saying "I'll now write the code" or "Here is the implementation" without an actual tool call planned in the same turn, STOP and call the tool. The chat is for confirming what was delivered, not for delivering the file itself.
+
+## CLI tool syntax — probe with `--help` BEFORE you guess
+
+When a task involves invoking a command-line tool (himalaya, kubectl, gh,
+ffmpeg, docker, aws, terraform, …) and you're not 100% sure of the
+subcommand or flag spelling, your FIRST `run_shell` for that tool should
+be `<tool> --help` (or `<tool> <subcommand> --help`). One quick probe
+returns the real syntax in well under a second; guessing burns multiple
+failed turns. Use the help output to pick the correct invocation, THEN
+run the actual command.
+
+Specifically: do NOT chain "guess 1 → fails → guess 2 → fails → ..."
+through three or four `run_shell` calls when you could have read the
+help text once. Once `--help` succeeds, the tool's syntax is in your
+context for the rest of the turn.
+
+Skip the probe ONLY when (a) you have first-hand evidence from earlier
+in this turn that the exact command works, or (b) the tool is so common
+(`ls`, `cat`, `grep`, `python -c`) that the syntax is unambiguous.
+
+═══════════════════════════════════════════════════════════════
+## Skill creation is a TOOL CALL — call `learn_skill`, do not write code
+
+When the plan says to create / save / learn / teach / remember a skill, you MUST call `learn_skill(name, description, procedure)` exactly once. Skills are markdown procedures saved to `~/.ezclaw/skills/` — they are NOT Python files in `workspace/`.
+
+  Wrong: `write_file(path="skills/email_reader.py", content="import himalaya\\nclient = himalaya.EmailClient()...")`
+  Right: `learn_skill(name="read-recent-emails-himalaya", description="List the user's most recent emails using the himalaya CLI", procedure="1. Run himalaya envelope list -p 1 via run_shell\\n2. Parse the table output (columns: ID, FLAGS, SUBJECT, FROM, DATE)\\n3. Reply with a numbered summary of the top 5 entries")`
+
+Rules for the `procedure` argument:
+- It is a numbered checklist of CONCRETE tool/shell invocations a future agent (or you, next turn) will follow verbatim.
+- If the user named an external CLI tool (himalaya, kubectl, gh, ffmpeg, jq, etc.), the procedure says to run it via `run_shell` — NEVER assume it's a Python module. Many CLI tools share a name with no Python package; importing them blindly fails with `ModuleNotFoundError`. If unsure whether something is a CLI or a library, verify with `run_shell("which <name>")` BEFORE saving the skill.
+- Strip user-specific accidents (their inbox count, their password, today's date). Keep the procedure reusable.
+- One skill = one cohesive procedure. Don't pack multiple unrelated workflows into one skill.
+
+After `learn_skill` succeeds, your reply is a single sentence confirming the skill was saved — do NOT then go on to also execute the procedure unless the user asked for that too.
 
 ## Core Rules
 - **Verification-Driven Autonomy (Test-First)**: For every coding task or bug fix:
@@ -247,19 +345,33 @@ Rules:
 
 
 class _SharedAuthState:
-    """One-bit shared state for "user pressed [A] = allow for session".
+    """Shared authorization state across sibling agents.
 
-    Each SpecializedAgent reads/writes session_authorized through this
-    shared object, so when ONE agent's user-prompt session is authorized,
-    ALL sibling agents see it immediately. Previously each agent kept its
-    own bool, so pressing [A] in an executor prompt only authorized the
-    executor; the next architect step to (say) the researcher would
-    re-prompt for auth, defeating the [A] key.
+    Two layers of allow:
+    - `authorized` (bool): blanket — every auth_required tool runs without
+      asking. Set by the `[A] allow all` choice.
+    - `allowed_tools` (set[str]): per-tool. The `[Y] allow this tool` choice
+      adds the tool's name here so subsequent calls to the SAME tool skip
+      the prompt for the rest of the session. Other tools still ask.
+
+    Both layers reset between sessions (per-process). All sibling agents
+    share one instance so authorizing once in any agent context applies
+    everywhere.
     """
-    __slots__ = ("authorized",)
+    __slots__ = ("authorized", "allowed_tools")
 
     def __init__(self):
         self.authorized = False
+        self.allowed_tools: set = set()
+
+    def is_allowed(self, tool_name: str) -> bool:
+        """Return True if the tool can run without a fresh user prompt."""
+        return self.authorized or tool_name in self.allowed_tools
+
+    def allow_tool(self, tool_name: str) -> None:
+        """Mark a single tool as session-allowed."""
+        if tool_name:
+            self.allowed_tools.add(tool_name)
 
 
 class SpecializedAgent:
@@ -561,21 +673,33 @@ class SpecializedAgent:
                 tool_func = registry.tools.get(tool_call.function.name)
                 is_interactive = tool_call.function.arguments.get("interactive", False)
 
-                if tool_func and getattr(tool_func, "auth_required", False) and not self.session_authorized:
+                tool_name = tool_call.function.name
+                if (
+                    tool_func
+                    and getattr(tool_func, "auth_required", False)
+                    and not self._auth_state.is_allowed(tool_name)
+                ):
                     auth = yield {
                         "type": "auth_required",
-                        "name": tool_call.function.name,
+                        "name": tool_name,
                         "arguments": tool_call.function.arguments,
                     }
                     if auth == "deny":
                         self.messages.append({
                             "role": "tool", "content": "Authorization denied.",
-                            "name": tool_call.function.name,
+                            "name": tool_name,
                         })
-                        yield {"type": "tool_end", "name": tool_call.function.name, "result": "Authorization denied."}
+                        yield {"type": "tool_end", "name": tool_name, "result": "Authorization denied."}
                         continue
                     elif auth == "allow_session":
+                        # Old "session" name kept for back-compat with the
+                        # cli answer queue; semantics: blanket allow.
                         self.session_authorized = True
+                    elif auth == "allow_tool":
+                        # New: this tool gets to run without prompting
+                        # again for the rest of the session.
+                        self._auth_state.allow_tool(tool_name)
+                    # "allow" (without suffix) = one-shot — no state change.
 
                 yield {
                     "type": "tool_start",
@@ -585,6 +709,19 @@ class SpecializedAgent:
                 }
                 try:
                     result = tool_func(**tool_call.function.arguments) if tool_func else "Tool not found."
+                except TypeError as e:
+                    # Most TypeErrors here are the model calling a tool with
+                    # the wrong kwargs (e.g. run_shell(content=..., path=...)
+                    # confused with write_file). Python's default message
+                    # mentions the wrapped function name and one specific
+                    # bad arg — not enough for the model to fix itself. Pin
+                    # the actual signature into the error so the next
+                    # attempt can name the right args. Also nudge toward
+                    # the likely-intended tool when the misuse is a known
+                    # shape (write_file/run_shell confusion is the common one).
+                    result = _format_tool_typeerror(
+                        tool_name, tool_func, tool_call.function.arguments, e
+                    )
                 except Exception as e:
                     result = f"Error: {str(e)}"
 
@@ -659,6 +796,8 @@ Return `kind: single` ONLY when the request is purely workspace-independent:
 
 **Anything that names something in the workspace requires inspection** — a project name (blex_os, the API server), a file (cli.py, README), a directory, "the build", "the tests", "this code", "the bug", "how to run X" where X is in `./workspace/` — return `kind: plan`. The executor needs `read_file` / `list_dir` / `run_shell` to actually look at what's there; the model's training data does NOT contain the user's workspace.
 
+**Skill-creation requests are SINGLE-STEP.** When the user asks to create / save / learn / teach / remember a skill ("create a new skill for X", "save this as a skill", "learn this procedure", "remember how to Y", "teach you to Z"), the reduction is one `learn_skill(name, description, procedure)` tool call. Return `kind: single` with `reason: "skill creation"`. Do NOT decompose into "create a file" + "implement functionality" + "integrate" — that misreads the word "skill" as code. Skills in ezclaw are markdown procedures saved to `~/.ezclaw/skills/`, not source files. If the user names an external CLI tool (himalaya, kubectl, gh, ffmpeg, etc.) in the skill request, the procedure MUST invoke that tool via `run_shell` — NOT pretend it's a Python module.
+
 ═══════════════════════════════════════════════════════════════
 ## Mode 2: EXECUTION REQUEST
 ═══════════════════════════════════════════════════════════════
@@ -693,6 +832,8 @@ Rules for execution:
     - Adding "write tests" / "add documentation" / "commit and push" / "create a README" / "refactor for style" when the user didn't ask.
     - Searching memory or `recall_actions` for "what else might need doing" — those are for retrieving CONTEXT relevant to the current request, not for sourcing new work.
     - Looking at unrelated workspace files to find "improvements" to make.
+    - **Re-running `learn_skill` after it already succeeded.** A successful `learn_skill` tool result ("Skill 'X' saved to ~/.ezclaw/skills/X.md") fully satisfies a skill-creation request. Do not "improve the procedure" by saving the same skill again with different wording — set `complete: true` after the first success. Iterating wastes turns and overwrites the file you just wrote.
+    - **Re-doing a script the user can run.** A successful `write_file` followed by no execution request from the user is done. Do not add tasks to "verify" or "polish" the script unless the user asked for verification.
     - One exception: if a genuine blocker was discovered (missing dependency, broken import, the deliverable doesn't actually run), insert ONE corrective task. Otherwise: complete.
 - `plan` is the step-by-step instruction the routed agent will execute this turn. Make it concrete and actionable: "Read sse_handler.py, find the handle_disconnect function, add a `connection.cleanup()` call before the return." Not "Work on the leak."
 - `reflection.observation` is one short sentence describing what actually happened in the previous step. Skip if first step.
@@ -707,7 +848,7 @@ If the EXECUTION REQUEST says `Plan: (none — single-step request)`, the routed
 
 **Routing in single-step mode:**
 - `general` — pure chat ONLY (greetings, definitions of general concepts, arithmetic). The general agent uses no tools by default; route here only when there's nothing in the workspace to look at.
-- `executor` — anything that needs file/shell access. If the user mentions a workspace file, project, or "the code", route here even in single-step.
+- `executor` — anything that needs file/shell access. If the user mentions a workspace file, project, or "the code", route here even in single-step. **ALSO route here for skill-creation requests**: set `plan` to a concrete instruction like `Call learn_skill(name="<short slug>", description="<one line>", procedure="<numbered shell/tool steps>"). The procedure must invoke any named CLI tool via run_shell (e.g. \"himalaya envelope list -p 1\"), NEVER as a Python import.` Do NOT plan a write_file step for skill creation — the procedure goes in the learn_skill call, not in a Python file.
 - `researcher` — web/documentation lookup the executor can't do locally.
 - `debugger` — root-cause analysis of an unexpected error.
 
@@ -725,8 +866,10 @@ When the `⚑ MATCHED SKILLS` block is present, the listed procedure(s) take pre
 
 **Rules for skill-matched requests:**
 - Your `plan` field (the instruction the sub-agent runs this turn) MUST reference the skill by name and pass through its concrete steps. Example: "Follow the 'Weather Forecast Retrieval' skill: web_fetch https://wttr.in/Giza?format=3, then summarize the result for the user."
+- **`recommended_agent` MUST be `executor`** (or `researcher` when the skill's procedure is purely web lookup). NEVER route to `general` when a skill is matched — `general` has no tools and cannot follow a procedure that involves `run_shell`, `web_fetch`, or any other tool. Skills exist precisely because the request needs tool use; routing to `general` discards the skill.
 - Do NOT route to `researcher` or call `web_search` for a request a skill already solves. The skill exists because the freeform approach failed before.
 - If you genuinely believe the skill does NOT fit (wrong location semantics, stale URL, etc.), say so in `reasoning` and proceed with a custom approach. Silence = use the skill.
+- During PLANNING, a non-empty matched-skills block is strong evidence the request needs tool use — return `kind: single` (the executor will follow the skill in one turn), NOT a multi-task plan or a conversational classification.
 
 If the matched-skills block is empty, plan freshly.
 
@@ -1290,6 +1433,51 @@ Return ONLY the JSON object."""
         else:
             history_block = "(no steps recorded)"
 
+        # Detect output-query turns. Spec E suppresses sub-agent content
+        # from the user — but when the user explicitly asks for "the
+        # output" / "what was printed" / "show the result", the
+        # synthesis MUST surface the actual run_shell / python_eval
+        # bytes. Otherwise the architect's reply ends up generic
+        # ("the script ran successfully") with no visible output.
+        import re as _re
+        is_output_query = bool(_re.search(
+            r"\b(?:"
+            r"output|outputs|stdout|"
+            r"what (?:was|did) (?:the |it )?(?:print|output|return)|"
+            r"show (?:me )?(?:the )?(?:output|result|results)|"
+            r"what (?:did|does) (?:it|the script|the command) (?:print|output|say|return)|"
+            r"print(?:ed)?|"
+            r"what was the (?:result|outcome|return)"
+            r")\b",
+            user_input.lower(),
+        ))
+        output_block = ""
+        if is_output_query:
+            # Collect the tail of run_shell / python_eval results from
+            # the most recent steps. Cap at 4 KB so a huge subprocess
+            # dump doesn't overflow num_ctx — the user can ask for the
+            # full thing if needed.
+            collected: list = []
+            for step in reversed(step_history):
+                results = step.get("tool_results") or []
+                tools = step.get("tools") or []
+                for r, t in zip(results, tools):
+                    if t in ("run_shell", "python_eval", "run_tests"):
+                        collected.insert(0, r)
+                if collected:
+                    break
+            joined = "\n".join(collected)
+            if len(joined) > 4000:
+                joined = joined[:4000] + f"\n... ({len(joined)} chars total, truncated)"
+            if joined:
+                output_block = (
+                    "\n\nThe user asked about output / result. "
+                    "Quote the following subprocess output VERBATIM in your "
+                    "reply, in a fenced code block. Do not paraphrase it; "
+                    "the user wants to see exactly what was printed.\n\n"
+                    "```\n" + joined + "\n```\n"
+                )
+
         prompt = (
             "You orchestrated a multi-step plan to answer the user's "
             "request. Now write the FINAL user-facing reply.\n\n"
@@ -1311,6 +1499,11 @@ Return ONLY the JSON object."""
             "OFFERS the user can decline, NOT auto-applied work. E.g. "
             "`Want me to add tests? Or wire up two-player mode?`. Skip "
             "this if there's no natural follow-up.\n"
+            "- If the user asked for the OUTPUT of a script/command (see "
+            "the explicit output block below, if present), your reply "
+            "must START with that output quoted in a fenced code block, "
+            "then one short sentence of context. The user's primary "
+            "want is to SEE the output — don't bury it.\n"
             "- If anything failed, say so plainly and stop. Do not pretend "
             "work was done that wasn't. Skip the 'how to use' and 'next "
             "steps' sections on failure.\n"
@@ -1318,7 +1511,8 @@ Return ONLY the JSON object."""
             "unless quoting actual code.\n\n"
             f"User request:\n{user_input}\n\n"
             f"Steps taken (internal record):\n{history_block}\n\n"
-            f"Last sub-agent output:\n{last_step_output}\n\n"
+            f"Last sub-agent output:\n{last_step_output}"
+            f"{output_block}\n\n"
             "Your reply to the user:"
         )
 
@@ -1414,9 +1608,26 @@ Return ONLY the JSON object."""
                     "refactor", "test", "run", "read", "list", "show", "find",
                     "search", "look", "edit", "modify", "update", "delete",
                     "remember", "forget", "install", "commit", "push", "pull",
+                    "check",
                 }
             )
             if no_code_chars and no_request_verbs:
+                # Before bailing to `general`, check if a saved skill matches
+                # at a *high* threshold. Short, verb-light inputs like
+                # "What's the newest emails" or "any new mail" otherwise
+                # short-circuit to general — which has no tools and ignores
+                # the matched-skills block, so the skill is never used. We
+                # use a stricter threshold (0.55) than the default skill
+                # matcher (0.4): the default is tuned to surface skills as
+                # context inside the architect loop where a soft hit is
+                # cheap, but bypassing the general router needs a confident
+                # hit so we don't drag greetings like "hi"/"thanks" through
+                # the architect just because they share a vector neighborhood
+                # with a saved skill.
+                if self.skills and match_skills(
+                    user_input, self.skills, top_n=1, threshold=0.55
+                ):
+                    return None
                 return "general"
 
         # Layer 2: embedding-similarity routing across the known examples.
@@ -1940,11 +2151,22 @@ No fluff. No "In this task...". Just facts."""
                         # `.1.ext`) rather than clobber — that mirrors
                         # the user-facing path's safe default.
                         choice = "rename" if p.exists else "overwrite"
-                        # Synthetic tool_start for the UI
+                        # Synthetic tool_start for the UI. Include the
+                        # actual file body in `content` so downstream
+                        # consumers (notably cli.py's right-side editor
+                        # pane) can show what's being written. Previously
+                        # this only carried `path` and the editor pane
+                        # rendered empty for every inline-code-save —
+                        # which is the path most agent-written files
+                        # take when the executor emits tagged ```fenced
+                        # blocks instead of calling write_file directly.
                         yield {
                             "type": "tool_start",
                             "name": "write_file",
-                            "arguments": {"path": p.block.path},
+                            "arguments": {
+                                "path": p.block.path,
+                                "content": p.block.body,
+                            },
                         }
                         result = apply_save(p, choice)
                         if result.status in ("succeeded", "renamed"):
@@ -2016,16 +2238,64 @@ No fluff. No "In this task...". Just facts."""
 
             agent_has_responded = bool(step_output.strip() or step_tool_results)
 
-            # Determine if step was a success or failure
-            had_error = any(w in step_output.lower() for w in ["error:", "exception:", "traceback", "failed to"]) or \
-                        any("error" in r.lower() or "not found" in r.lower() for r in step_tool_results)
-            
+            # Determine if step was a success or failure. Loose substring
+            # matching ("error" anywhere) used to mis-tag genuinely-successful
+            # steps as FAILURE — e.g. a grep_codebase hit on the literal word
+            # "error" inside the user's source, or a tool reporting "no
+            # errors found". The auto-advance below would then leave the
+            # active task pending and the architect would re-attempt it next
+            # turn, looking like it's stuck. Tightened signals:
+            #
+            #   - In step_output: anchored prefixes like "Error:", "Traceback"
+            #     (real Python traceback header), or "failed to <verb>".
+            #   - In each tool result: only the LEADING token "error:" or
+            #     "error " (case-insensitive). A success result that mentions
+            #     "no errors" or contains the word inside narrative text is
+            #     no longer counted.
+            #   - "not found" only counts when it's "file not found",
+            #     "command not found", or "module not found" — the bare
+            #     phrase appears too often in legitimate output (e.g. grep
+            #     summaries) to be a reliable failure signal.
+            import re as _re
+            _err_in_output = bool(_re.search(
+                r"(?m)(?:^|\W)(?:Error:|Exception:|Traceback \(most recent call last\)|failed to \w+)",
+                step_output,
+            ))
+            _err_in_tools = False
+            for r in step_tool_results:
+                rl = r.lower()
+                if _re.match(r"\s*(?:\[[^\]]+\]:\s*)?error[:\s]", rl):
+                    _err_in_tools = True
+                    break
+                # Either the explicit phrase "X not found" or the
+                # compound Python exception names FileNotFoundError /
+                # ModuleNotFoundError / ImportError, plus the POSIX
+                # "no such file or directory" string.
+                if _re.search(
+                    r"\b(?:file|command|module)\b[^.\n]{0,30}not found"
+                    r"|filenotfounderror|modulenotfounderror|importerror"
+                    r"|no such file or directory",
+                    rl,
+                ):
+                    _err_in_tools = True
+                    break
+            had_error = _err_in_output or _err_in_tools
+
             outcome = "FAILURE" if had_error else "SUCCESS"
             
             step_record = {
                 "agent": agent_key,
                 "output": step_output[:3000],
                 "tools": step_tool_names,
+                # Verbatim tool result lines ("  [run_shell]: <stdout>", ...)
+                # carried into the synthesis stage so the architect can
+                # quote real subprocess output when the user asks
+                # "what was the output?" — see _synthesize_user_reply.
+                # Previously only the tool NAMES survived to synthesis,
+                # so output-query turns ended with the architect making
+                # up a generic reply about a successful run instead of
+                # actually showing the bytes the subprocess printed.
+                "tool_results": list(step_tool_results),
                 "outcome": outcome,
                 "task_id": intent.get("current_task_id"),
             }
@@ -2053,6 +2323,35 @@ No fluff. No "In this task...". Just facts."""
                     if task is not None and task.status == "in_progress":
                         self.current_plan.advance(tid, "done")
                         yield {"type": "plan_update", "plan": self.current_plan}
+
+            # Hard guard: if `learn_skill` just ran successfully, the
+            # skill-creation request is fully satisfied — force
+            # completion so the architect doesn't iterate on
+            # "improve the procedure" tasks (a real failure mode
+            # observed in the himalaya turn where the same skill got
+            # written 5 times in a row). One successful learn_skill =
+            # done, regardless of what intent.complete said.
+            if (
+                outcome == "SUCCESS"
+                and "learn_skill" in step_tool_names
+                and any(
+                    isinstance(r, str)
+                    and r.lower().startswith("  [learn_skill]:")
+                    and "saved" in r.lower()
+                    for r in step_tool_results
+                )
+            ):
+                intent["complete"] = True
+                if self.current_plan is not None:
+                    # Mark every remaining open task as skipped so
+                    # is_complete() returns True and the orchestrator
+                    # exits via the plan_done path. The user only asked
+                    # to create the skill — leftover "verify" / "integrate"
+                    # tasks the architect dreamed up don't need to run.
+                    for t in self.current_plan.tasks:
+                        if t.status in ("pending", "in_progress"):
+                            self.current_plan.advance(t.id, "skipped")
+                    yield {"type": "plan_update", "plan": self.current_plan}
 
             step_ctx = step_output[:3000]
             if step_tool_results:

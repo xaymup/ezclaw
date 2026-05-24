@@ -26,7 +26,7 @@ from rich.syntax import Syntax
 from rich.spinner import Spinner
 
 from prompt_toolkit.application import Application
-from prompt_toolkit.layout.containers import HSplit, Window
+from prompt_toolkit.layout.containers import HSplit, VSplit, Window, ConditionalContainer
 from prompt_toolkit.layout.controls import FormattedTextControl, BufferControl
 from prompt_toolkit.layout.layout import Layout
 from prompt_toolkit.key_binding import KeyBindings
@@ -59,7 +59,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ── Theme (opencode-inspired) ───────────────────────────────────
-from theme import THEME, TITLE_GRADIENT, ACTIVITY_FRAMES, MASCOT
+from theme import THEME, TITLE_GRADIENT, ACTIVITY_FRAMES, MASCOT, model_emoji
 
 PRIMARY = THEME.palette.primary
 SECONDARY = THEME.palette.secondary
@@ -137,6 +137,40 @@ class ChatUI:
         # Generation timing & health tracking
         self.generation_start_time = 0.0
         self.last_chunk_time = 0.0
+
+        # Session-wide accounting (Feature 2 — status bar tokens + energy).
+        # Tokens are a char/4 estimate, not exact counts from Ollama — the
+        # status bar surfaces them with a `~` prefix so the imprecision is
+        # honest. Energy is wall-clock generation seconds × GPU TDP, an
+        # over-counting Fermi estimate good enough for "this turn was
+        # expensive" intuition but not for billing.
+        self.session_tokens_in = 0
+        self.session_tokens_out = 0
+        self.session_energy_wh = 0.0
+        # Default to RTX 4080 (320W) — matches README's hardware section.
+        try:
+            self.gpu_tdp_watts = float(os.environ.get("EZCLAW_GPU_TDP_W", "320"))
+        except (TypeError, ValueError):
+            self.gpu_tdp_watts = 320.0
+        # Most recently completed turn's cook time (seconds). Used for the
+        # "· 12.3s" annotation under the assistant bubble (Feature 1) when
+        # the streamed turn has settled into history.
+        self.last_cook_time = 0.0
+
+        # ── Reflection line (Feature: ambient wisdom) ─────────────────
+        # A short, dim italic one-liner shown between the status bar and
+        # the input field. Refreshed every REFLECTION_REFRESH_SEC from
+        # the architect LLM with a "give me one short aphorism / fun
+        # fact / insight" prompt, optionally grounded in user-memory
+        # facts. The user can force a refresh with `/wisdom`.
+        self.reflection: str = ""
+        self.reflection_at: float = 0.0
+        self.reflection_refresh_sec: float = float(
+            os.environ.get("EZCLAW_REFLECTION_REFRESH_SEC", "900")
+        )
+        # Set to True while a background thread is mid-fetch so we don't
+        # launch a second one on top of it.
+        self._reflection_inflight: bool = False
 
         self.history_file = os.path.expanduser("~/.ezclaw_history")
         self.prompt_history = FileHistory(self.history_file)
@@ -217,6 +251,27 @@ class ChatUI:
         # no summary line) by default. F4 toggles to the full layout that
         # shows args in their own panel and the redundant ↳ summary line.
         self.compact_tools = True
+
+        # Feature 3 — right-side editor pane with tabs.
+        #
+        # `_open_files` maps {path -> {content, opened_at, revealed_chars}}.
+        # Every write_file or apply_diff that touches a path opens (or
+        # updates) the corresponding entry. The pane shows the active
+        # file's content with a tab row at the top listing every open
+        # file; F6/F7 cycles, F5 toggles the whole pane.
+        #
+        # Reveal animation: on first appearance, `revealed_chars` starts
+        # at 0 and the animation tick walks it up to len(content) over
+        # ~1.5s so the file appears to be typed in by the agent. Once
+        # fully revealed, subsequent updates (apply_diff growing the
+        # file) snap to the new content — the typing illusion only fires
+        # the first time you see the file.
+        self._show_editor: bool = True
+        self._open_files: dict = {}
+        self._active_editor_path: str | None = None
+        # Legacy alias — some callers still reference this; we expose a
+        # property below so existing code paths keep working until they
+        # migrate.
 
         # When True, the next _update_ui will auto-scroll to bottom even if
         # the user has scrolled up. Set on new-prompt submit and on End-key
@@ -614,7 +669,42 @@ class ChatUI:
             self._update_ui()
             event.app.invalidate()
 
+        # Feature 3: F5 toggles the right-side editor panel (which
+        # auto-shows whenever the agent calls write_file while toggled on).
+        @self.kb.add('f5')
+        def _(event):
+            self._show_editor = not self._show_editor
+            self._update_ui()
+            event.app.invalidate()
+
+        # F6 / F7 cycle through open file tabs in the editor pane.
+        @self.kb.add('f6')
+        def _(event):
+            self._cycle_editor_tab(-1)
+            self._update_ui()
+            event.app.invalidate()
+
+        @self.kb.add('f7')
+        def _(event):
+            self._cycle_editor_tab(+1)
+            self._update_ui()
+            event.app.invalidate()
+
+        # Authorization keys (active only while an auth_required panel
+        # is up — see self.auth_active). Semantics:
+        #   Y  remember THIS tool for the rest of the session (most common
+        #      user intent — previously this was one-shot, which surprised
+        #      users who pressed Y and were immediately re-prompted for
+        #      the same tool the next turn).
+        #   O  allow ONCE (true one-shot — useful when you want to inspect
+        #      one call but stay strict on the rest).
+        #   A  allow ALL tools session-wide.
+        #   N  deny this call (no state change).
         @self.kb.add('y', filter=Condition(lambda: self.auth_active))
+        def _(event):
+            self.auth_queue.put("allow_tool")
+
+        @self.kb.add('o', filter=Condition(lambda: self.auth_active))
         def _(event):
             self.auth_queue.put("allow")
 
@@ -721,14 +811,309 @@ class ChatUI:
             history=self.prompt_history,
         )
 
+        # Feature 3: right-side editor panel. Lazy ANSI render driven by
+        # `_get_editor_text`. Only visible when `_show_editor` AND at
+        # least one file is open — keeps the chat full-width when the
+        # agent isn't writing code.
+        self.editor_control = FormattedTextControl(self._get_editor_text)
+        editor_window = Window(
+            content=self.editor_control,
+            wrap_lines=False,
+            width=64,
+        )
+        editor_frame = Frame(editor_window, title="Editor")
+        editor_container = ConditionalContainer(
+            content=editor_frame,
+            filter=Condition(lambda: self._show_editor and bool(self._open_files)),
+        )
+
+        chat_frame = Frame(self.history_window, title="EzClaw Chat")
+        chat_plus_editor = VSplit([chat_frame, editor_container])
+
+        # Dedicated interactive-shell pane. Renders the subprocess's live
+        # stdout outside the chat so the user can see what's happening at
+        # full width without scrolling through the tool log. The pane is
+        # shown ONLY while `_interactive_session` is active — when the
+        # subprocess exits, the ConditionalContainer collapses and the
+        # chat returns to full height. Keystrokes already route to the
+        # subprocess via existing chat_mode handling (Esc toggles); the
+        # status bar's KEYS→SUBPROC badge tells the user where keys go.
+        self.shell_pane_control = FormattedTextControl(self._get_shell_pane_text)
+        shell_pane_window = Window(
+            content=self.shell_pane_control,
+            wrap_lines=False,
+            height=12,
+        )
+        shell_pane_frame = Frame(shell_pane_window, title="Interactive Shell")
+        shell_pane_container = ConditionalContainer(
+            content=shell_pane_frame,
+            filter=Condition(lambda: self._interactive_session is not None),
+        )
+
         return Layout(
             HSplit([
-                Frame(self.history_window, title="EzClaw Chat"),
+                chat_plus_editor,
+                shell_pane_container,
                 self.status_window,
                 Frame(self.input_field, height=5)
             ]),
             focused_element=self.input_field
         )
+
+    def _maybe_refresh_reflection(self, force: bool = False) -> None:
+        """Kick off a background reflection fetch if it's due.
+
+        `force=True` (from `/wisdom`) bypasses the time gate. We launch
+        in a daemon thread so the UI never blocks on the LLM call.
+        Re-entry is guarded by `_reflection_inflight` so a fast user
+        spamming /wisdom doesn't pile up requests.
+        """
+        if self._reflection_inflight:
+            return
+        if not force and (time.time() - self.reflection_at < self.reflection_refresh_sec):
+            return
+        self._reflection_inflight = True
+        threading.Thread(target=self._fetch_reflection, daemon=True).start()
+
+    def _fetch_reflection(self) -> None:
+        """Call the architect LLM for one short reflection.
+
+        Best-effort: any exception, timeout, or unparseable response is
+        swallowed and the previous reflection stays on screen. Pulls a
+        few recent memory facts (if any) so the model can ground the
+        line in something the user has shared.
+        """
+        try:
+            arch = getattr(self.agent, "architect", None)
+            client = getattr(arch, "client", None) or getattr(self.agent, "client", None)
+            model = getattr(arch, "model", None) or getattr(self.agent, "model", None)
+            if client is None or not model:
+                return
+
+            # Pull up to 5 short memory facts for grounding. Best-effort.
+            memory_facts: list = []
+            try:
+                facts = self.agent.db.search_memories_hybrid("recent personal facts", alpha=0.6)
+                if isinstance(facts, list):
+                    memory_facts = [str(f)[:200] for f in facts[:5]]
+            except Exception:
+                memory_facts = []
+
+            user_label = self.user_name or "the user"
+            # Randomize the prompt's "kind" so consecutive refreshes feel
+            # varied rather than producing the same Hallmark-card register
+            # every time. The previous prompt drifted toward sappy
+            # aphorisms ("Wisdom is X, courage is Y") — explicitly steer
+            # AWAY from that here.
+            import random as _r
+            kinds = [
+                "a movie quote (short, recognizable, attribute briefly if you want)",
+                "an obscure fun fact you'd actually tell someone at a bar",
+                "a single-sentence weird piece of trivia",
+                "a witty programmer / hacker observation",
+                "a one-line dry joke",
+                "a memorable line from a song",
+                "a tiny piece of dev folklore",
+                "a brief odd observation about computers, terminals, or code",
+                "a vivid one-line image (not a metaphor about life)",
+            ]
+            kind = _r.choice(kinds)
+            prompt = (
+                "Write ONE short single-line caption for a developer's terminal "
+                f"status bar. Make it: {kind}.\n\n"
+                "Hard constraints:\n"
+                "- Under 60 characters total. Brevity matters more than depth.\n"
+                "- No greeting, no name, no preface like 'here is' / 'reflection:'.\n"
+                "- No surrounding quotes around the whole line.\n"
+                "- NEVER produce sappy aphorisms like 'wisdom is X, courage is Y',\n"
+                "  'success is when...', 'life is a journey', or any Hallmark-card\n"
+                "  pattern. If you find yourself writing 'is the X of Y', stop and\n"
+                "  pick a different angle.\n"
+                "- Tone: dry, playful, specific, like something you'd see scrawled\n"
+                "  in a coworker's terminal — not on an inspirational poster.\n\n"
+                "Return ONLY the line, nothing else."
+            )
+            if memory_facts:
+                prompt += "\n\nOptional context (use only if it sparks something concrete):\n"
+                for f in memory_facts[:3]:
+                    prompt += f"- {f}\n"
+
+            resp = client.chat(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                options={"temperature": 1.05, "num_ctx": 4096},
+            )
+            text = (resp.get("message") or {}).get("content", "").strip()
+            # Strip leading/trailing quotes (model adds them sometimes
+            # despite being told not to) and any meta-prefix like
+            # "Reflection: ..." or "Here's a thought: ...".
+            import re as _re
+            text = _re.sub(r"^(?:reflection|here'?s? .{0,40}?[:\-])\s*", "", text, flags=_re.IGNORECASE)
+            text = text.strip().strip("'\"")
+            # Drop any <think>…</think> a thinking model emits.
+            text = _re.sub(r"<think>.*?</think>", "", text, flags=_re.DOTALL).strip()
+            # Reasonable length floor — drop if model returned trash.
+            if 5 < len(text) <= 200:
+                self.reflection = text.splitlines()[0].strip()
+                self.reflection_at = time.time()
+                try:
+                    self._update_ui()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        finally:
+            self._reflection_inflight = False
+
+    def _get_shell_pane_text(self):
+        """ANSI for the dedicated interactive-shell pane.
+
+        Pulls from the active session's `live_buffer` (a list of bytes
+        chunks captured by on_output) and shows the tail. Caps at the
+        last ~80 lines so a chatty subprocess doesn't blow out the panel.
+        """
+        session = self._interactive_session
+        if session is None:
+            return ANSI("")
+        tool = session.get("tool") or {}
+        live_buffer = tool.get("_live_buffer") or []
+        # Bytes → text, tolerating partial UTF-8.
+        try:
+            text = b"".join(live_buffer).decode("utf-8", errors="replace")
+        except Exception:
+            text = ""
+        lines = text.splitlines()
+        if len(lines) > 80:
+            lines = lines[-80:]
+        body = "\n".join(lines) if lines else "(no output yet)"
+
+        chat_mode = session.get("chat_mode", False)
+        cmd = session.get("command", "")
+        header = Text()
+        header.append(" ⌘ ", style=f"bold {ACCENT}")
+        header.append(f"{cmd[:90]}", style=f"bold {SECONDARY}")
+        header.append("   ", style="")
+        if chat_mode:
+            header.append(" KEYS → CHAT  (Esc: switch to subprocess) ",
+                          style=f"bold reverse {ACCENT}")
+        else:
+            header.append(" KEYS → SUBPROCESS  (Esc: switch to chat) ",
+                          style=f"bold reverse {WARN}")
+        return ANSI(self._render_to_ansi(Group(header, Text(""), Text(body))))
+
+    def _open_or_update_file(self, path: str, content: str, fresh: bool) -> None:
+        """Open / update a tab in the editor pane.
+
+        `fresh=True` means this is a brand-new write that should
+        animate (reveal_chars reset to 0). `fresh=False` is for updates
+        that should snap (e.g. apply_diff growing an already-open file).
+        """
+        existing = self._open_files.get(path)
+        if existing is None:
+            self._open_files[path] = {
+                "content": content or "",
+                "opened_at": time.time(),
+                "revealed_chars": 0 if fresh else len(content or ""),
+            }
+        else:
+            existing["content"] = content or ""
+            if fresh:
+                existing["revealed_chars"] = 0
+            else:
+                existing["revealed_chars"] = len(content or "")
+
+    def _cycle_editor_tab(self, direction: int) -> None:
+        """Advance the active editor tab by `direction` (±1)."""
+        paths = list(self._open_files.keys())
+        if not paths:
+            return
+        try:
+            idx = paths.index(self._active_editor_path) if self._active_editor_path in paths else 0
+        except ValueError:
+            idx = 0
+        new_idx = (idx + direction) % len(paths)
+        self._active_editor_path = paths[new_idx]
+
+    def _get_editor_text(self):
+        """Return ANSI for the right-side editor panel (Feature 3).
+
+        Shows the most recent write_file's path + content using rich.Syntax
+        so the user can see what the agent is writing without scrolling the
+        tool log. Content is the *intended* final file — write_file is
+        atomic in this codebase, not streamed. The panel updates once per
+        tool call.
+        """
+        # Helpers for the editor pane defined just above the renderer.
+        # (Body continues below.)
+        if not self._open_files or self._active_editor_path is None:
+            return ANSI("")
+        # Bring the reveal animation forward by a tick. Walking up to ~6
+        # chars per UI tick (40-60 per second at the 10fps anim cadence)
+        # makes a 1.5s "typing" feel for short files, and longer files
+        # finish revealing within a few seconds — fast enough not to
+        # block the user, slow enough to register as motion.
+        REVEAL_STEP = 64
+        for f in self._open_files.values():
+            target = len(f.get("content") or "")
+            if f.get("revealed_chars", 0) < target:
+                f["revealed_chars"] = min(target, f.get("revealed_chars", 0) + REVEAL_STEP)
+
+        path = self._active_editor_path
+        f = self._open_files.get(path) or {}
+        full_content = f.get("content", "") or ""
+        revealed = full_content[: f.get("revealed_chars", len(full_content))]
+
+        # Tab row at the top — one chip per open file, the active one in
+        # bright primary, others in dim. Truncated paths so the tab row
+        # fits in the panel width.
+        tabs = Text()
+        for p in self._open_files.keys():
+            label = os.path.basename(p) or p
+            if len(label) > 16:
+                label = label[:13] + "…"
+            if p == path:
+                tabs.append(f" {label} ", style=f"bold reverse {PRIMARY}")
+            else:
+                tabs.append(f" {label} ", style=f"dim {DIM}")
+            tabs.append(" ", style="")
+        if len(self._open_files) > 1:
+            tabs.append("  [F6/F7]", style=f"dim {DIM}")
+
+        # Header line (active file's full path + reveal progress).
+        target = len(full_content)
+        revealed_n = f.get("revealed_chars", target)
+        header = Text()
+        header.append(path, style=f"bold {PRIMARY}")
+        if revealed_n < target:
+            header.append(f"  {revealed_n}/{target}", style=f"italic {DIM}")
+
+        # Syntax-highlight what's been revealed so far. Cap at 200 lines.
+        ext = os.path.splitext(path)[1].lower().lstrip(".")
+        lang_map = {
+            "py": "python", "js": "javascript", "ts": "typescript",
+            "tsx": "tsx", "jsx": "jsx", "sh": "bash", "bash": "bash",
+            "md": "markdown", "rs": "rust", "go": "go", "java": "java",
+            "c": "c", "cpp": "cpp", "h": "c", "hpp": "cpp",
+            "json": "json", "yaml": "yaml", "yml": "yaml", "toml": "toml",
+            "html": "html", "css": "css",
+        }
+        lang = lang_map.get(ext, "text")
+        max_lines = 200
+        lines = revealed.splitlines()
+        truncated = False
+        if len(lines) > max_lines:
+            lines = lines[-max_lines:]
+            truncated = True
+        body = "\n".join(lines)
+        renderables = [tabs, header]
+        if truncated:
+            renderables.append(Text(
+                f"… (showing last {max_lines} of {len(revealed.splitlines())} lines)",
+                style=DIM,
+            ))
+        if body:
+            renderables.append(Syntax(body, lang, theme="monokai", line_numbers=True, word_wrap=False))
+        return ANSI(self._render_to_ansi(Group(*renderables)))
 
     def _update_ui(self):
         # Serialize across threads — the worker thread and the asyncio
@@ -768,76 +1153,129 @@ class ChatUI:
         last_visible = info.vertical_scroll + info.window_height
         return last_visible >= total_lines - 2
     def _get_status_text(self):
-        """Return the status bar as a list of (inline-style, text) tuples.
+        """Status bar as a list of (inline-style, text) tuples.
 
-        We use inline styles (`bg:#xxx fg`) instead of class-based styles
-        so each segment can carry its own color while still inheriting
-        the bar-wide warm-dark background defined in self.style. The
-        activity glyph and 🦀 mascot both color-cycle per tick — visible
-        because the animation loop re-renders the status bar at 4-10fps.
+        Streamlined into four left-to-right groups with `│` between them:
+          1. State  — single glyph indicating idle vs generating
+          2. Identity — auth · model emoji(s) · primary model · msg count
+          3. Cost   — session tokens · energy estimate · (gen) elapsed · (gen) tools
+          4. Mode   — only non-default toggles surface (COPY, EDITOR,
+                      shell-routing). Default state shows nothing here so
+                      the bar reads as clean.
+
+        F-key hints used to live in this bar but were removed — they
+        consumed most of the horizontal real estate and the same info is
+        available via /help and F1. Keep the bar information-dense, not
+        instruction-dense.
         """
         BG = "bg:#1f160e "
-        auth_icon = "◉" if self.agent.session_authorized else "○"
-        mode_glyph = "⚡" if ENABLE_MULTI_AGENT else "●"
-        model_info = self.agent.model.split(",")[0][:45] if "," in self.agent.model else self.agent.model[:45]
-        msg_count = len(self.agent.messages) if hasattr(self.agent, 'messages') and self.agent.messages else 0
+        SEP = (BG + "#5a4a3a", "  │  ")
+        DOT = (BG + "#5a4a3a", "  ·  ")
 
+        # ── Group 1: state glyph ──────────────────────────────────────
         if self.is_generating:
-            frame_idx = int(time.time() * 4) % len(ACTIVITY_FRAMES)
+            # 1Hz cycle — slow enough to read as a steady heartbeat
+            # rather than the previous 4Hz flicker.
+            frame_idx = int(time.time()) % len(ACTIVITY_FRAMES)
             glyph = ACTIVITY_FRAMES[frame_idx]
-            act_color = self._cycle_palette_color(TITLE_GRADIENT)
+            glyph_color = PRIMARY
         else:
             glyph = "·"
-            act_color = "#7a7570"
+            glyph_color = "#7a7570"
 
-        divider = (BG + "#5a4a3a", "  ╱  ")
-
-        segments = [
-            (BG + f"bold {act_color}", f"  {glyph}  "),
+        segments: list = [
+            (BG + f"bold {glyph_color}", f"  {glyph}  "),
+            SEP,
         ]
-        # While generating, the spinner row already shows its own pulsing
-        # crab — suppress the bar's crab to avoid the doubled mascot.
-        if not self.is_generating:
-            mascot_color = self._cycle_palette_color(TITLE_GRADIENT, period_sec=1.2)
-            segments.append((BG + f"bold {mascot_color}", MASCOT + " "))
+
+        # ── Group 2: identity ─────────────────────────────────────────
+        auth_icon = "◉" if self.agent.session_authorized else "○"
+
+        def _bare_name(token: str) -> str:
+            return token.split(": ", 1)[1].strip() if ": " in token else token.strip()
+
+        raw_tokens = [m.strip() for m in self.agent.model.split(",") if m.strip()]
+        raw_models = [_bare_name(t) for t in raw_tokens]
+        arch_model = getattr(getattr(self.agent, "architect", None), "model", None)
+        if arch_model and arch_model not in raw_models:
+            raw_models.append(arch_model)
+        primary_model = raw_models[0] if raw_models else self.agent.model
+        seen_glyphs: list = []
+        for m in raw_models:
+            g = model_emoji(m)
+            if g not in seen_glyphs:
+                seen_glyphs.append(g)
+        model_glyphs = "".join(seen_glyphs) or model_emoji(primary_model)
+
+        msg_count = len(self.agent.messages) if hasattr(self.agent, "messages") and self.agent.messages else 0
+
         segments.extend([
-            (BG + "#7a7570", f"{auth_icon}  "),
-            (BG + "#ffd166", f"{mode_glyph} {model_info}"),
-            divider,
-            (BG + "#c8c4be", f"{msg_count} msgs"),
+            (BG + "#7a7570", f"{auth_icon} "),
+            (BG + "#ffd166", f"{model_glyphs} "),
+            (BG + "#ffd166", f"{primary_model[:35]}"),
+            DOT,
+            (BG + "#c8c4be", f"{msg_count} msg"),
+            SEP,
         ])
 
+        # ── Group 3: cost ─────────────────────────────────────────────
+        total_tokens = self.session_tokens_in + self.session_tokens_out
+        if total_tokens >= 1000:
+            tok_label = f"~{total_tokens / 1000:.1f}k tok"
+        else:
+            tok_label = f"~{total_tokens} tok"
+        segments.extend([
+            (BG + "#c8c4be", tok_label),
+            DOT,
+            (BG + "#c8c4be", f"{self.session_energy_wh:.2f} Wh"),
+        ])
         if self.is_generating:
             n_tools = len(self.tool_executions)
             elapsed = time.time() - self.generation_start_time if self.generation_start_time else 0
-            segments.append(divider)
-            segments.append((BG + "#7fd070", f"⚙ {n_tools} tool{'s' if n_tools != 1 else ''}"))
-            segments.append(divider)
-            segments.append((BG + "#ff8c5c", f"{elapsed:.1f}s"))
+            segments.extend([
+                DOT,
+                (BG + "#7fd070", f"⚙{n_tools}"),
+                DOT,
+                (BG + "#ff8c5c", f"{elapsed:.1f}s"),
+            ])
 
+        # ── Group 4: reflection (subtle, one segment, dim) ────────────
+        # Sits between Cost and Mode badges so it's visible by default
+        # but doesn't push status-critical info off the right edge of
+        # narrow terminals. Dim grey, no italic, no prefix glyph — the
+        # idea is that the line BELONGS in the bar, not screams from it.
+        # When the LLM hasn't produced one yet, this segment is omitted.
+        if self.reflection:
+            text = self.reflection
+            # Hard-cap so the prompt-toolkit single-row status bar never
+            # has to handle wrapped content. 60 chars is a tight ceiling
+            # the LLM prompt aims for — this is a defensive truncation
+            # in case it goes long.
+            if len(text) > 60:
+                text = text[:57] + "…"
+            segments.append(SEP)
+            segments.append((BG + "#7a7570", text))
+
+        # ── Group 5: active toggles (only when non-default) ───────────
+        badges: list = []
         if not self._mouse_capture:
-            segments.append(divider)
-            segments.append((BG + "bold #ff8c5c", "✂ COPY"))
-        if self.show_architect:
-            segments.append(divider)
-            segments.append((BG + "bold #ff5fd7", "🧠 STRATEGY"))
-        if not self.compact_tools:
-            segments.append(divider)
-            segments.append((BG + "bold #7fd070", "⊞ FULL TOOLS"))
-
-        # Interactive shell routing indicator — tells the user where
-        # their keystrokes are going. Critical to see at a glance during
-        # an interactive session.
+            badges.append((BG + "bold #ff8c5c", "✂ COPY"))
+        if self._show_editor and self._open_files:
+            n = len(self._open_files)
+            badges.append((BG + "bold #7fd070", f"⊟ EDITOR ({n})" if n > 1 else "⊟ EDITOR"))
         if self._interactive_session is not None:
             chat_mode = self._interactive_session.get("chat_mode", False)
-            segments.append(divider)
-            if chat_mode:
-                segments.append((BG + "bold #7fd070", "↳ KEYS→CHAT (Esc:subproc)"))
-            else:
-                segments.append((BG + "bold #ffd166", "↳ KEYS→SUBPROC (Esc:chat)"))
+            badges.append(
+                (BG + "bold #7fd070", "↳ KEYS→CHAT") if chat_mode
+                else (BG + "bold #ffd166", "↳ KEYS→SUBPROC")
+            )
+        if badges:
+            segments.append(SEP)
+            for i, b in enumerate(badges):
+                if i > 0:
+                    segments.append(DOT)
+                segments.append(b)
 
-        segments.append((BG + "#5a4a3a", "  │  "))
-        segments.append((BG + "#a89884", "[F1] help  [F2] copy  [F3] strategy  [F4] tools  [^C] cancel"))
         return segments
 
     def _spinner_for(self, role):
@@ -868,68 +1306,42 @@ class ChatUI:
             
         parts = []
         # ── Layout order (top → bottom) ────────────────────────────────────
-        # 1. Side messages (memory / context notes — informational, top)
-        # 2. Reasoning panel (thinking, when SHOW_THINKING)
-        # 3. Assistant response (model output — first thing the user reads)
-        # 4. Architect chip (current routing label)
-        # 5. Tool execution panels (this turn's tool calls)
-        # 6. Plan panel (sticky progress tracker — LAST so it always
-        #    anchors the bottom of the active area, just above the input)
-        # 7. Auth prompt (special — only when active, replaces plan slot)
-        # 8. Spinner (status line, last)
+        # 1. Side messages         — context notes (memory stored, etc).
+        # 2. Assistant response    — the model output, first thing read.
+        # 3. Unattached tools      — tool calls not nested under a plan task.
+        # 4. Bottom slot (one of):
+        #      - Auth prompt       (when waiting on Y/O/N/A)
+        #      - ask_user question (when the agent asked for input)
+        #      - Skill offer       (when a draft skill is parked for Y/N)
+        #      - Unified panel     (plan tree + reasoning timeline)
+        # 5. Spinner               — role-aware status line, last.
         #
-        # Rationale: tools sit *under* the current plan step the agent is
-        # working on, and the plan stays pinned to the bottom so the user
-        # always sees overall progress at a glance.
+        # Tools attached to a plan step nest inside the unified panel under
+        # their task row; flat tool panels above are the fallback for
+        # single-step / pre-plan tools.
 
         # 1. Side messages (capped to last 3)
         for msg in self.side_messages[-3:]:
             parts.append(Text(msg, style=f"dim {DIM} italic"))
 
-        # 2. Unified reasoning panel (Tier 2.1)
-        # Collapses what used to be three separate UI elements:
-        #   - the "thinking" panel (sub-agent <think> blocks)
-        #   - the architect chip (current intent one-liner)
-        #   - the F3-expanded architect panel (per-step reflections)
-        # into one chronological log gated on `self.show_reasoning`.
-        reasoning_panel = self._render_reasoning_panel()
-        if reasoning_panel is not None:
-            parts.append(reasoning_panel)
-
-        # 3. Assistant response (model output — moved up from bottom)
+        # 2. Assistant response.
         current_content = "".join(self.current_response_parts)
         if current_content:
             parts.append(Markdown(current_content))
 
-        # 5. Tool execution panels.
-        #    Tools that ran inside a plan step are nested INSIDE the plan
-        #    panel (see _render_plan_panel) so they sit visually under
-        #    their step. Tools that ran outside any plan (no current
-        #    plan, or the architect hadn't picked a step yet) fall back
-        #    to the flat layout here so they're still visible.
+        # 3. Unattached tool panels — tools that ran outside any plan
+        # task. Plan-attached tools render inside the unified panel
+        # via _render_nested_tool_row.
         for idx, tool in enumerate(self.tool_executions, 1):
             if self.current_plan is not None and tool.get("task_id") is not None:
                 continue
             parts.append(self._build_tool_panel(tool, idx))
 
-        # 6 / 7. Auth prompt or ask_user question replaces the plan slot
-        #        when active; otherwise the plan panel anchors the bottom
-        #        of the active area.
+        # 4. Bottom slot: exactly one of {auth, question, skill offer,
+        # unified panel} renders here. Auth and ask_user are blocking on
+        # user input so they take precedence over the plan/reasoning.
         if self.auth_active and self.current_auth_chunk:
-            parts.append(Panel(
-                Text.assemble(
-                    ("Authorization Required", f"bold {WARN}"),
-                    ("\n\nTool: ", ""), (self.current_auth_chunk['name'], "bold"),
-                    ("\nArgs: ", ""), (str(self.current_auth_chunk['arguments']), f"dim {DIM}"),
-                    ("\n\nPress ", ""), ("[Y]", "bold"), (" to allow, ", ""),
-                    ("[N]", "bold"), (" to deny, ", ""),
-                    ("[A]", "bold"), (" to allow for session", "")
-                ),
-                title="[bold red]Security Check[/bold red]",
-                border_style="red",
-                box=ROUNDED,
-                padding=(1, 2)
-            ))
+            parts.append(self._build_auth_panel(self.current_auth_chunk))
         elif self._pending_user_question is not None:
             parts.append(Panel(
                 Text.assemble(
@@ -973,10 +1385,11 @@ class ChatUI:
                 padding=(1, 2),
             ))
         else:
-            plan_panel = self._render_plan_panel()
-            if plan_panel is not None:
-                parts.append(plan_panel)
-            
+            unified_panel = self._render_unified_panel()
+            if unified_panel is not None:
+                parts.append(unified_panel)
+
+
         if self.is_generating:
             elapsed = time.time() - self.generation_start_time
             idle_time = time.time() - self.last_chunk_time
@@ -1071,212 +1484,229 @@ class ChatUI:
                     step["status"] = "in_progress"
         return steps
 
-    def _render_reasoning_panel(self):
-        """Unified Reasoning panel rendered as a TODO list.
+    def _render_unified_panel(self):
+        """Merged Plan + Reasoning panel.
 
-        Each step (one architect decision + the sub-agent activity that
-        followed) is a numbered row with a status icon:
-            ● 1. architect → executor — Add foo() to bar.py
-            ● 2. architect → executor — Run the tests
-            ▸ 3. architect → executor — Apply the fix      ← current
-                ✦ executor: think: need to handle the empty-input edge
-                ⚐ self-check: ok
+        Replaces the previously-separate `_render_plan_panel` and
+        `_render_reasoning_panel` so the user has ONE place to look for
+        "what's happening." Layout inside the panel:
 
-        Pending future steps aren't shown because they aren't known
-        ahead of time — the architect picks the next step adaptively.
-        The title shows the running step counter so progress is obvious.
+            (plan tree)                ← when self.current_plan is set
+            ── Reasoning ──            ← divider, only if both sections exist
+            (reasoning timeline)       ← when reasoning_log has entries
 
-        Returns None when the user has collapsed the panel and the log
-        is empty; returns a one-line chip when collapsed but the log
-        has entries.
+        Cases handled:
+        - Both plan and reasoning present → both sections, divider between.
+        - Plan only (no reasoning yet) → plan section, no divider.
+        - Reasoning only (single-step request, no plan) → reasoning section
+          alone; title falls back to "🧠 Reasoning · step N".
+        - Neither → returns None (callers omit the panel entirely).
+        - `show_reasoning` False → reasoning section collapses to a chip
+          line ("🧠 reasoning · step N · …  [Ctrl+R] expand"). Plan stays
+          fully rendered because it's load-bearing for in-flight work.
         """
+        from theme import TASK_STATE_STYLE, TASK_STATE_FLASH
         REASON_COLOR = "#9999cc"
 
-        if not self.show_reasoning:
-            # Collapsed: a one-line chip so the user knows reasoning IS
-            # happening. Shows the latest step's headline.
-            if not self.reasoning_log:
-                return None
-            steps = self._group_reasoning_into_steps()
-            n = len(steps)
-            head = steps[-1]["head"] if steps else {"body": "", "label": ""}
-            preview = head["body"].split("·")[0].strip()
-            if len(preview) > 80:
-                preview = preview[:77] + "…"
-            line = Text()
-            line.append(f"🧠 reasoning · step {n} · ", style=f"dim {REASON_COLOR}")
-            line.append(preview, style=f"italic dim {REASON_COLOR}")
-            line.append("   [Ctrl+R] expand", style=f"dim {DIM}")
-            return line
-
-        if not self.reasoning_log:
+        has_plan = self.current_plan is not None and self.current_plan.tasks
+        has_reasoning = bool(self.reasoning_log)
+        if not has_plan and not has_reasoning:
             return None
 
-        steps = self._group_reasoning_into_steps()
+        body_renderables: list = []
+
+        # ── Plan section ───────────────────────────────────────────────
+        plan_done = plan_total = 0
+        plan_title_text = ""
+        if has_plan:
+            plan = self.current_plan
+            plan_done, plan_total = plan.progress()
+            plan_title_text = f"Plan: {plan.title}  ·  {plan_done}/{plan_total}"
+            now = time.time()
+
+            tools_by_task: dict = {}
+            for idx, tool in enumerate(self.tool_executions, 1):
+                tid = tool.get("task_id")
+                if tid is None:
+                    continue
+                tools_by_task.setdefault(tid, []).append((idx, tool))
+
+            plan_lines: list = []
+
+            def render_subtree(task, depth: int) -> None:
+                icon, color = TASK_STATE_STYLE.get(task.status, ("•", DIM))
+                flashing = now < self._task_flash_until.get(task.id, 0.0)
+                line_color = TASK_STATE_FLASH.get(task.status, color) if flashing else color
+                display_icon = icon
+                if flashing and task.status == "done":
+                    display_icon = "✨"
+                    line_color = self._cycle_palette_color(TITLE_GRADIENT, period_sec=0.15)
+                weight = "bold " if task.status == "in_progress" else ""
+                indent = "  " + ("    " * depth)
+                connector = "↳ " if depth > 0 else ""
+                line_text = Text()
+                line_text.append(f"{indent}", style="")
+                if connector:
+                    line_text.append(connector, style=f"dim {DIM}")
+                line_text.append(f"{display_icon} ", style=f"{weight}{line_color}")
+                line_text.append(f"{task.id}. ", style=f"dim {DIM}")
+                line_text.append(task.description, style=f"{weight}{line_color}")
+                plan_lines.append(line_text)
+                if task.status == "in_progress" and self.architect_intent:
+                    plan_lines.extend(self._render_intent_lines(self.architect_intent))
+                for tidx, tool in tools_by_task.get(task.id, []):
+                    plan_lines.append(self._render_nested_tool_row(tidx, tool))
+                for child in plan.children_of(task.id):
+                    render_subtree(child, depth + 1)
+
+            roots = plan.roots() if hasattr(plan, "roots") else plan.tasks
+            for root in roots:
+                render_subtree(root, 0)
+            body_renderables.extend(plan_lines)
+
+        # ── Divider + reasoning section ────────────────────────────────
+        steps = self._group_reasoning_into_steps() if has_reasoning else []
         n_steps = len(steps)
 
-        # Status icons mirror the plan panel's vocabulary so the user
-        # learns ONE visual language for "step state" across the UI.
-        status_glyphs = {
-            "done":        ("●", "#5fd75f"),    # green
-            "in_progress": ("▸", "#5fafff"),    # executor-blue
-            "failed":      ("✗", "#e85a5a"),
-        }
-        sub_glyphs = {
-            "agent":      "✦",
-            "skill":      "⚑",
-            "self_check": "⚐",
-        }
+        if has_reasoning:
+            if has_plan:
+                # Slim divider separating the two sections inside one panel.
+                divider = Text()
+                divider.append("  ── Reasoning ", style=f"dim {REASON_COLOR}")
+                divider.append("─" * 40, style=f"dim {DIM}")
+                body_renderables.append(divider)
 
-        # Cap to the last 12 steps so a runaway architect doesn't blow
-        # out the panel. Earlier steps roll off the top of the panel —
-        # the conversation history already has the full record.
-        visible_steps = steps[-12:]
-        truncated = len(steps) - len(visible_steps)
+            if not self.show_reasoning:
+                # Collapsed: one-line chip pointing at the latest step.
+                head = steps[-1]["head"] if steps else {"body": "", "label": ""}
+                preview = head["body"].split("·")[0].strip()
+                if len(preview) > 80:
+                    preview = preview[:77] + "…"
+                chip = Text()
+                chip.append(f"  🧠 reasoning · step {n_steps} · ",
+                            style=f"dim {REASON_COLOR}")
+                chip.append(preview, style=f"italic dim {REASON_COLOR}")
+                chip.append("   [Ctrl+R] expand", style=f"dim {DIM}")
+                body_renderables.append(chip)
+            else:
+                status_glyphs = {
+                    "done":        ("●", "#5fd75f"),
+                    "in_progress": ("▸", "#5fafff"),
+                    "failed":      ("✗", "#e85a5a"),
+                }
+                sub_glyphs = {
+                    "agent": "✦",
+                    "skill": "⚑",
+                    "self_check": "⚐",
+                }
+                visible_steps = steps[-12:]
+                truncated = len(steps) - len(visible_steps)
+                reasoning_text = Text()
+                if truncated > 0:
+                    reasoning_text.append(
+                        f"  … ({truncated} earlier step{'s' if truncated != 1 else ''} hidden)\n",
+                        style=f"dim {DIM}",
+                    )
+                # When a plan is active, the reasoning timeline often
+                # repeats each task description verbatim (the architect's
+                # `goal:` field == the active plan task). Build a set of
+                # normalized plan-task descriptions so we can suppress
+                # those duplicate rows — the user already sees them in
+                # the plan section just above.
+                plan_descs_norm: set = set()
+                if has_plan:
+                    from plan import _norm_desc as _nd
+                    plan_descs_norm = {_nd(t.description) for t in self.current_plan.tasks if t.description}
+                start_n = truncated + 1
+                for offset, step in enumerate(visible_steps):
+                    step_n = start_n + offset
+                    head = step["head"]
+                    status = step["status"]
+                    glyph, gcolor = status_glyphs.get(status, ("○", DIM))
+                    weight = "bold " if status == "in_progress" else ""
+                    headline = head["body"]
+                    if "goal:" in headline:
+                        goal_part = headline.split("·")[0].strip()
+                        if goal_part.startswith("goal:"):
+                            goal_part = goal_part[len("goal:"):].strip()
+                        headline = goal_part
+                    # Skip this row if its headline matches an existing
+                    # plan task — the plan section already covers it.
+                    # Substeps under that step (skill matches, self-checks,
+                    # agent <think>) are still worth showing, but the
+                    # redundant architect row would just clutter.
+                    if has_plan and headline:
+                        from plan import _norm_desc as _nd
+                        if _nd(headline) in plan_descs_norm:
+                            # Render only the substeps if any are
+                            # non-redundant (skill / self_check), else skip
+                            # the row entirely.
+                            interesting = [s for s in step["subs"] if s["kind"] in ("skill", "self_check")]
+                            if not interesting:
+                                continue
+                            for sub in interesting:
+                                sub_glyph = sub_glyphs.get(sub["kind"], "·")
+                                sub_text = sub["body"]
+                                if len(sub_text) > 140:
+                                    sub_text = sub_text[:137] + "…"
+                                reasoning_text.append("       ", style="")
+                                reasoning_text.append(f"{sub_glyph} ", style=f"{REASON_COLOR}")
+                                reasoning_text.append(f"{sub['label']}: ", style=f"dim {REASON_COLOR}")
+                                reasoning_text.append(sub_text, style=f"italic dim {REASON_COLOR}")
+                                reasoning_text.append("\n")
+                            continue
+                    if len(headline) > 110:
+                        headline = headline[:107] + "…"
+                    reasoning_text.append(f"  {glyph} ", style=f"{weight}{gcolor}")
+                    reasoning_text.append(f"{step_n}. ", style=f"dim {DIM}")
+                    reasoning_text.append(f"{head['label']} ", style=f"{weight}dim {REASON_COLOR}")
+                    reasoning_text.append("— ", style=f"dim {DIM}")
+                    reasoning_text.append(headline, style=f"{weight}italic {REASON_COLOR}")
+                    reasoning_text.append("\n")
+                    for sub in step["subs"]:
+                        if status == "done" and sub["kind"] == "agent":
+                            continue
+                        sub_glyph = sub_glyphs.get(sub["kind"], "·")
+                        sub_text = sub["body"]
+                        if len(sub_text) > 140:
+                            sub_text = sub_text[:137] + "…"
+                        reasoning_text.append("       ", style="")
+                        reasoning_text.append(f"{sub_glyph} ", style=f"{REASON_COLOR}")
+                        reasoning_text.append(f"{sub['label']}: ", style=f"dim {REASON_COLOR}")
+                        reasoning_text.append(sub_text, style=f"italic dim {REASON_COLOR}")
+                        reasoning_text.append("\n")
+                body_renderables.append(reasoning_text)
 
-        body = Text()
-        if truncated > 0:
-            body.append(f"  … ({truncated} earlier step{'s' if truncated != 1 else ''} hidden)\n",
-                        style=f"dim {DIM}")
+        # ── Wrap in one outer Panel ────────────────────────────────────
+        # Title blends both sections so the user sees plan progress AND
+        # current reasoning step without scrolling.
+        #
+        # Animation policy: the plan panel sits on screen the whole turn
+        # and shouldn't visually pulse — it was fighting for attention
+        # with the agent's actual output. The title color drifts slowly
+        # (period 8s) and the border no longer breathes between bright
+        # and dim — it stays a steady dim warm to read as "ambient" rather
+        # than "live".
+        PANEL_TITLE_PERIOD_SEC = 8.0
+        if has_plan and has_reasoning:
+            title_color = self._cycle_palette_color(TITLE_GRADIENT, period_sec=PANEL_TITLE_PERIOD_SEC)
+            title = f"{plan_title_text}  ·  🧠 step {n_steps}"
+            border_style = f"dim {title_color}"
+            title_markup = f"[bold {title_color}]{title}[/bold {title_color}]  [dim {DIM}](Ctrl+R / /reasoning)[/dim {DIM}]"
+        elif has_plan:
+            title_color = self._cycle_palette_color(TITLE_GRADIENT, period_sec=PANEL_TITLE_PERIOD_SEC)
+            border_style = f"dim {title_color}"
+            title_markup = f"[bold {title_color}]{plan_title_text}[/bold {title_color}]"
+        else:
+            # Reasoning-only — single-step or pre-plan window.
+            title = f"🧠 Reasoning  ·  step {n_steps}  ·  {n_steps} total"
+            border_style = f"dim {REASON_COLOR}"
+            title_markup = f"[bold {REASON_COLOR}]{title}[/bold {REASON_COLOR}]  [dim {DIM}](Ctrl+R / /reasoning)[/dim {DIM}]"
 
-        # Step numbering starts at the original (un-trimmed) index so
-        # the user still sees "step 7", "step 8" even after rolling.
-        start_n = truncated + 1
-        for offset, step in enumerate(visible_steps):
-            step_n = start_n + offset
-            head = step["head"]
-            status = step["status"]
-            glyph, gcolor = status_glyphs.get(status, ("○", DIM))
-            weight = "bold " if status == "in_progress" else ""
-
-            # Compact headline from the architect entry: prefer just
-            # the goal field if we can isolate it, else the full body
-            # truncated.
-            headline = head["body"]
-            # The architect-entry format is "goal: X · observation: Y · critical_thinking: Z"
-            # — yank just "goal: X" when present so the row stays scannable.
-            if "goal:" in headline:
-                # Take the goal segment, drop the leading "goal: " prefix
-                goal_part = headline.split("·")[0].strip()
-                if goal_part.startswith("goal:"):
-                    goal_part = goal_part[len("goal:"):].strip()
-                headline = goal_part
-            if len(headline) > 110:
-                headline = headline[:107] + "…"
-
-            body.append(f"  {glyph} ", style=f"{weight}{gcolor}")
-            body.append(f"{step_n}. ", style=f"dim {DIM}")
-            body.append(f"{head['label']} ", style=f"{weight}dim {REASON_COLOR}")
-            body.append("— ", style=f"dim {DIM}")
-            body.append(headline, style=f"{weight}italic {REASON_COLOR}")
-            body.append("\n")
-
-            # Substeps: shown for the CURRENT step always, and for
-            # earlier steps only when they carry meaningful detail
-            # (skill matches and self-check verdicts — agent <think>
-            # blocks roll off to keep the panel compact).
-            for sub in step["subs"]:
-                if status == "done" and sub["kind"] == "agent":
-                    continue  # roll off old <think> blocks
-                sub_glyph = sub_glyphs.get(sub["kind"], "·")
-                sub_text = sub["body"]
-                if len(sub_text) > 140:
-                    sub_text = sub_text[:137] + "…"
-                body.append("       ", style="")  # 7-space indent for substep
-                body.append(f"{sub_glyph} ", style=f"{REASON_COLOR}")
-                body.append(f"{sub['label']}: ", style=f"dim {REASON_COLOR}")
-                body.append(sub_text, style=f"italic dim {REASON_COLOR}")
-                body.append("\n")
-
-        # Title: count + current step indicator
-        title = f"🧠 Reasoning  ·  step {n_steps}  ·  {len(steps)} total"
         return Panel(
-            body,
-            title=f"[bold {REASON_COLOR}]{title}[/bold {REASON_COLOR}]  [dim {DIM}](Ctrl+R / /reasoning)[/dim {DIM}]",
-            border_style=f"dim {REASON_COLOR}",
-            box=ROUNDED,
-            padding=(0, 1),
-        )
-
-    def _render_plan_panel(self):
-        """Render the active plan as a sticky panel. Returns None when no plan."""
-        if self.current_plan is None or not self.current_plan.tasks:
-            return None
-        from theme import TASK_STATE_STYLE, TASK_STATE_FLASH
-
-        plan = self.current_plan
-        done, total = plan.progress()
-        now = time.time()
-
-        # Group tool executions by the plan task they ran under so each
-        # task row is followed by a nested list of the tools it spawned.
-        tools_by_task: dict = {}
-        for idx, tool in enumerate(self.tool_executions, 1):
-            tid = tool.get("task_id")
-            if tid is None:
-                continue
-            tools_by_task.setdefault(tid, []).append((idx, tool))
-
-        body_lines = []
-
-        # Tier 2.2: walk the plan as a tree so sub-tasks (Task.parent_id
-        # is set) render INDENTED under their parent instead of as flat
-        # siblings. Sub-tasks indent by 4 spaces per depth level and get
-        # a ↳ connector to make the hierarchy obvious. The renderer for
-        # a single task row stays the same shape; depth only changes
-        # the indent prefix and the connector glyph.
-        def render_subtree(task, depth: int) -> None:
-            icon, color = TASK_STATE_STYLE.get(task.status, ("•", DIM))
-            flashing = now < self._task_flash_until.get(task.id, 0.0)
-            line_color = TASK_STATE_FLASH.get(task.status, color) if flashing else color
-
-            display_icon = icon
-            if flashing and task.status == "done":
-                display_icon = "✨"
-                line_color = self._cycle_palette_color(TITLE_GRADIENT, period_sec=0.15)
-
-            weight = "bold " if task.status == "in_progress" else ""
-
-            indent = "  " + ("    " * depth)
-            connector = "↳ " if depth > 0 else ""
-
-            line_text = Text()
-            line_text.append(f"{indent}", style="")
-            if connector:
-                line_text.append(connector, style=f"dim {DIM}")
-            line_text.append(f"{display_icon} ", style=f"{weight}{line_color}")
-            line_text.append(f"{task.id}. ", style=f"dim {DIM}")
-            line_text.append(task.description, style=f"{weight}{line_color}")
-            body_lines.append(line_text)
-
-            # Architect intent nests under the in_progress task (Spec D).
-            if task.status == "in_progress" and self.architect_intent:
-                body_lines.extend(self._render_intent_lines(self.architect_intent))
-
-            # Tool rows under this task.
-            for tidx, tool in tools_by_task.get(task.id, []):
-                body_lines.append(self._render_nested_tool_row(tidx, tool))
-
-            # Recurse into child sub-tasks.
-            for child in plan.children_of(task.id):
-                render_subtree(child, depth + 1)
-
-        # Roots only — descendants are pulled in by render_subtree.
-        roots = plan.roots() if hasattr(plan, "roots") else plan.tasks
-        for root in roots:
-            render_subtree(root, 0)
-
-        # Title color shifts through the sunset palette every ~1.5s so the
-        # plan panel reads as actively alive. Border breathes between dim
-        # and full saturation at ~0.6Hz — slow enough to feel meditative.
-        title_color = self._cycle_palette_color(TITLE_GRADIENT, period_sec=1.5)
-        border_breath = (time.time() * 1.2) % 2.0
-        border_prefix = "" if border_breath < 1.0 else "dim "
-        title = f"Plan: {plan.title}  ·  {done}/{total}"
-        return Panel(
-            Group(*body_lines),
-            title=f"[bold {title_color}]{title}[/bold {title_color}]",
-            border_style=f"{border_prefix}{title_color}",
+            Group(*body_renderables),
+            title=title_markup,
+            border_style=border_style,
             box=ROUNDED,
             padding=(0, 1),
         )
@@ -1433,27 +1863,20 @@ class ChatUI:
     def _get_welcome_panel(self):
         body = Text()
 
-        # Mascot prefix + animated gradient title.
-        # The gradient offset shifts ~2.5Hz so colors flow across the letters.
-        # A SHIMMER position (one letter at a time, sweeping left-to-right
-        # at ~2Hz) gets rendered bright white on top of the gradient — a
-        # clearly-visible "light moving across the title" effect.
-        body.append(f"{MASCOT} ", style=f"bold {self._cycle_palette_color(TITLE_GRADIENT)}")
-        offset = self._gradient_offset()
+        # Static gradient title — colors are positional (each letter gets
+        # its index's slot in TITLE_GRADIENT) so the banner reads as a
+        # single composed piece, not a marquee. The previous shimmer
+        # sweep + 2.5Hz offset shift looked like a screensaver in the
+        # corner of the screen during idle; the streamline pass removed
+        # both. The welcome panel only paints when there's no history,
+        # so the user sees it once per fresh session — animation isn't
+        # earning its visual cost.
+        body.append(f"{MASCOT} ", style=f"bold {PRIMARY}")
         title = "EzClaw"
-        # Shimmer cell: sweeps 0..len(title)-1 then pauses for a beat
-        # before restarting. The pause makes the next sweep feel intentional
-        # rather than a continuous strobe.
-        shimmer_period = len(title) + 2
-        shimmer_pos = int(time.time() * 2) % shimmer_period
         for i, ch in enumerate(title):
-            base_color = TITLE_GRADIENT[(i + offset) % len(TITLE_GRADIENT)]
-            if i == shimmer_pos:
-                body.append(ch, style=f"bold reverse {base_color}")
-            else:
-                body.append(ch, style=f"bold {base_color}")
+            body.append(ch, style=f"bold {TITLE_GRADIENT[i % len(TITLE_GRADIENT)]}")
         body.append(" ", "")
-        body.append("v2.2 (Full TUI)\n", style=f"dim {DIM}")
+        body.append("v2.3 (Full TUI)\n", style=f"dim {DIM}")
         body.append("─" * 40 + "\n", style=f"dim {DIM}")
 
         if ENABLE_MULTI_AGENT and hasattr(self.agent, "agents"):
@@ -1550,6 +1973,69 @@ class ChatUI:
         if len(sig) > max_len:
             sig = sig[: max_len - 1] + "…"
         return sig
+
+    def _build_auth_panel(self, chunk: dict):
+        """Render the security-check panel shown while waiting on a user
+        decision about an auth_required tool.
+
+        Layout goal: the four choices read as a row of equal-weight chips
+        with their key and consequence side by side, so the user can pick
+        without re-reading the help text every time. The most-common
+        intent (Y = remember this tool) is highlighted; the rare one (A =
+        blanket session allow) is dimmed.
+        """
+        tool_name = chunk.get("name", "?")
+        args = chunk.get("arguments", {}) or {}
+        # Pick the most identifying arg to render inline so the user can
+        # see WHAT this call is about, not just which tool. Mirrors the
+        # nested-tool-row logic.
+        arg_summary = ""
+        if isinstance(args, dict) and args:
+            for key in ("command", "path", "file_path", "url", "query"):
+                if key in args and args[key]:
+                    arg_summary = str(args[key]).splitlines()[0].strip()
+                    break
+            if not arg_summary:
+                k0 = next(iter(args))
+                v0 = args.get(k0)
+                if v0 is not None:
+                    arg_summary = f"{k0}={str(v0).splitlines()[0]}"
+        if len(arg_summary) > 90:
+            arg_summary = arg_summary[:87] + "…"
+
+        # Header block — tool + identifying arg.
+        header = Text()
+        header.append(" Authorization required", style=f"bold {WARN}")
+        header.append("  · ", style=f"dim {DIM}")
+        header.append(tool_name, style="bold")
+        if arg_summary:
+            header.append(f"  {arg_summary}", style=f"italic {SECONDARY}")
+        header.append("\n")
+
+        # Choice rows. Each row is: [key]  name — what it actually does.
+        # Order is meaningful — Y first because it's the recommended
+        # default; A last because it's the broadest grant.
+        choices = [
+            ("Y", ACCENT,  "Allow this tool",  "won't ask for the same tool again this session"),
+            ("O", PRIMARY, "Allow once",       "this single call only — ask again next time"),
+            ("N", ERR,     "Deny",             "skip this call; agent continues without the result"),
+            ("A", DIM,     "Allow all tools",  "blanket auth for the rest of the session"),
+        ]
+        rows = Text()
+        for key, color, name, desc in choices:
+            rows.append(" ", style="")
+            rows.append(f" {key} ", style=f"bold reverse {color}")
+            rows.append("  ", style="")
+            rows.append(f"{name:<17}", style=f"bold {color}")
+            rows.append(f"  {desc}\n", style=f"dim {DIM}")
+
+        return Panel(
+            Group(header, Text(""), rows),
+            title=f"[bold {WARN}] 🛡  Security check[/bold {WARN}]",
+            border_style=f"bold {WARN}",
+            box=ROUNDED,
+            padding=(1, 2),
+        )
 
     def _build_tool_panel(self, tool, index=None):
         tool_name = tool["name"]
@@ -1885,7 +2371,9 @@ class ChatUI:
         self.current_status = f"{_pick(_CN)}…"
         self.generation_start_time = time.time()
         self.last_chunk_time = time.time()
-        
+        # Feature 2: tally the prompt as input tokens.
+        self.session_tokens_in += max(1, len(text) // 4)
+
         self._update_ui()
         # Start redraw loop for animations
         self._start_animation_loop()
@@ -1974,6 +2462,15 @@ class ChatUI:
             self._show_scheduled_queue()
         elif cmd == "/skills":
             self._show_skills()
+        elif cmd.startswith("/phrases"):
+            self._handle_phrases_command(cmd)
+        elif cmd.startswith("/wisdom"):
+            # Force a fresh reflection line. The fetch runs in the
+            # background; the row updates as soon as the model replies.
+            self._maybe_refresh_reflection(force=True)
+            self.history_ansi.append(render_to_ansi(
+                Text("Asking for a fresh reflection…", style=f"italic {DIM}")
+            ))
         elif cmd.startswith("/memory"):
             query = cmd[len("/memory"):].strip()
             self._show_memory(query)
@@ -1984,6 +2481,13 @@ class ChatUI:
         elif cmd == "/clear":
             self.agent.clear_session_history()
             self.history_ansi = []
+            # Feature 2: /clear resets session accounting too.
+            self.session_tokens_in = 0
+            self.session_tokens_out = 0
+            self.session_energy_wh = 0.0
+            self.last_cook_time = 0.0
+            self._open_files = {}
+            self._active_editor_path = None
         elif cmd.startswith("/expand") or cmd.startswith("/collapse"):
             self._toggle_tool_expansion(cmd)
         elif cmd.startswith("/copy"):
@@ -1992,6 +2496,45 @@ class ChatUI:
             self.history_ansi.append(render_to_ansi(Text(f"Unknown command: {cmd}", style=ERR)))
 
         self._update_ui()
+
+    def _build_agents_models_rows(self, history_size: int) -> list:
+        """Per-role model rows for the settings panel.
+
+        In multi-agent mode, expand each specialized agent's model on its
+        own row prefixed with the model-family emoji (theme.model_emoji)
+        so the user can see at a glance who runs what. In single-agent
+        mode, show just the primary model.
+        """
+        rows: list = [
+            ("Mode", "multi-agent" if ENABLE_MULTI_AGENT else "single-agent", "ENABLE_MULTI_AGENT env"),
+        ]
+        if ENABLE_MULTI_AGENT and hasattr(self.agent, "agents"):
+            # Surface every role's model with its emoji. `self.agent.agents`
+            # is the {name: SpecializedAgent} dict on MultiAgentSystem.
+            for role_name, role_agent in self.agent.agents.items():
+                model_name = getattr(role_agent, "model", "?")
+                rows.append((
+                    role_name,
+                    f"{model_emoji(model_name)} {model_name}",
+                    f"OLLAMA_{role_name.upper()}_MODEL env",
+                ))
+            # Architect runs through a separate client; pull its model too.
+            arch_model = getattr(getattr(self.agent, "architect", None), "model", None)
+            if arch_model:
+                rows.append((
+                    "architect",
+                    f"{model_emoji(arch_model)} {arch_model}",
+                    "OLLAMA_ARCHITECT_MODEL env",
+                ))
+        else:
+            primary = getattr(self.agent, "model", "?")
+            rows.append((
+                "Primary model",
+                f"{model_emoji(primary)} {primary}",
+                "OLLAMA_MODEL env",
+            ))
+        rows.append(("History", f"{history_size} messages", "/clear to reset"))
+        return rows
 
     def _show_settings(self) -> None:
         """Reorganized settings view — grouped by concern, each row shows
@@ -2015,11 +2558,7 @@ class ChatUI:
                 ("Session auth",       "always allow" if self.agent.session_authorized else "ask per tool", "/authorize"),
                 ("User name",          self.user_name, "EZCLAW_USER env"),
             ]),
-            ("Agents & models", [
-                ("Mode",               "multi-agent" if ENABLE_MULTI_AGENT else "single-agent", "ENABLE_MULTI_AGENT env"),
-                ("Primary model",      self.agent.model, "OLLAMA_MODEL env"),
-                ("History",            f"{history_size} messages", "/clear to reset"),
-            ]),
+            ("Agents & models", self._build_agents_models_rows(history_size)),
             ("Notifications", [
                 ("Desktop alerts",     "on" if notify_on else "off", "/notify"),
                 ("Sound",              "on" if (notify_on and sound_on) else "off", "EZCLAW_NOTIFY_SOUND env"),
@@ -2067,6 +2606,87 @@ class ChatUI:
         self.history_ansi.append(render_to_ansi(Panel(
             t, title=f"[bold]{len(tasks)} scheduled task{'s' if len(tasks) != 1 else ''}[/bold]",
             border_style=f"dim {PRIMARY}", box=ROUNDED,
+        )))
+
+    def _handle_phrases_command(self, cmd: str) -> None:
+        """`/phrases`             — show how many variants live in each category.
+        `/phrases refresh`     — ask the running LLM for fresh phrases,
+                                 merged into the pool + persisted to
+                                 ~/.ezclaw/phrase_pool.json so subsequent
+                                 sessions inherit them.
+        `/phrases reset`       — delete the cache file (in-memory state
+                                 settles on next restart)."""
+        import phrases as _ph
+        rest = cmd[len("/phrases"):].strip().lower()
+        from rich.table import Table
+
+        if rest in ("", "show", "list"):
+            t = Table.grid(padding=(0, 2))
+            t.add_column(style=f"bold {PRIMARY}")
+            t.add_column(style="")
+            for name, n in _ph.counts().items():
+                t.add_row(name, str(n))
+            self.history_ansi.append(render_to_ansi(Panel(
+                t,
+                title=f"[bold]Phrase pool[/bold]  [dim {DIM}](/phrases refresh to add more)[/dim {DIM}]",
+                border_style=f"dim {PRIMARY}",
+                box=ROUNDED,
+            )))
+            return
+
+        if rest == "refresh":
+            # Use the architect's client and a quick model — the call is
+            # one-shot and creative, not load-bearing. Architect client
+            # works for both ollama and deepseek backends.
+            client = getattr(getattr(self.agent, "architect", None), "client", None)
+            model = getattr(getattr(self.agent, "architect", None), "model", None)
+            if client is None or model is None:
+                # Fall back to a per-agent client (single-agent mode).
+                client = getattr(self.agent, "client", None)
+                model = getattr(self.agent, "model", None)
+            if client is None or model is None:
+                self.history_ansi.append(render_to_ansi(
+                    Text("No LLM client available to refresh phrases.", style=ERR)
+                ))
+                return
+
+            self.history_ansi.append(render_to_ansi(
+                Text(f"Asking {model} for fresh phrases…", style=f"italic {DIM}")
+            ))
+            self._update_ui()
+            added = _ph.augment_with_llm(client, model)
+            if not added:
+                self.history_ansi.append(render_to_ansi(
+                    Text("No new phrases added (model returned nothing usable).",
+                         style=f"dim {WARN}")
+                ))
+                return
+
+            t = Table.grid(padding=(0, 2))
+            t.add_column(style=f"bold {ACCENT}")
+            t.add_column(style="")
+            total = 0
+            for name, plist in added.items():
+                t.add_row(f"+{len(plist)} {name}", ", ".join(plist[:6]))
+                total += len(plist)
+            self.history_ansi.append(render_to_ansi(Panel(
+                t,
+                title=f"[bold {ACCENT}]Added {total} new phrase{'s' if total != 1 else ''}[/bold {ACCENT}]",
+                border_style=f"dim {ACCENT}",
+                box=ROUNDED,
+            )))
+            return
+
+        if rest == "reset":
+            _ph.reset_cache()
+            self.history_ansi.append(render_to_ansi(Text(
+                "Phrase cache deleted. Restart the session to drop the in-memory additions.",
+                style=f"dim {DIM}",
+            )))
+            return
+
+        self.history_ansi.append(render_to_ansi(Text(
+            "Usage: /phrases [refresh | reset]", style=ERR,
         )))
 
     def _show_skills(self) -> None:
@@ -2342,6 +2962,8 @@ class ChatUI:
                         })
                 elif chunk["type"] == "content":
                     self.current_response_parts.append(chunk["content"])
+                    # Feature 2: tally output tokens (char/4 heuristic).
+                    self.session_tokens_out += max(1, len(chunk["content"]) // 4)
                 elif chunk["type"] == "status":
                     self.current_status = chunk["content"].strip()
                     # Pipe self-check verdicts into the reasoning log so
@@ -2391,6 +3013,30 @@ class ChatUI:
                     # to accept/decline via Y/N keys.
                     self._pending_skill_offer = chunk.get("draft")
                 elif chunk["type"] == "tool_start":
+                    # Feature 3: light the right-side editor pane when a
+                    # file is touched. write_file carries full content
+                    # in its `content` arg; apply_diff carries a `diff`
+                    # we can render as-is in a separate "diff" pseudo
+                    # entry so the user can see the patch take effect.
+                    name = chunk.get("name")
+                    args = chunk.get("arguments") or {}
+                    if name == "write_file":
+                        ed_path = args.get("path") or args.get("file_path") or ""
+                        ed_content = args.get("content", "")
+                        if ed_path:
+                            self._open_or_update_file(ed_path, ed_content, fresh=True)
+                            self._active_editor_path = ed_path
+                    elif name == "apply_diff":
+                        ed_path = args.get("path") or args.get("file_path") or ""
+                        diff_text = args.get("diff", "")
+                        if ed_path:
+                            # Show the diff itself in the editor pane until
+                            # we have the post-image (which we don't from
+                            # the args alone). Tagged with a `.diff`
+                            # suffix so the lexer treats it as a diff.
+                            tab_path = f"{ed_path}  (patch)"
+                            self._open_or_update_file(tab_path, diff_text, fresh=True)
+                            self._active_editor_path = tab_path
                     is_int = chunk.get("interactive", False)
                     # Tag the call with the plan step it belongs to so the
                     # plan panel can render tools nested under their task.
@@ -2429,6 +3075,13 @@ class ChatUI:
         
         # Finish generating
         self.is_generating = False
+        # Features 1+2: freeze cook time and account for energy spent on this
+        # turn. The energy figure is wall-clock × TDP and is therefore an
+        # overestimate (GPU isn't pinned the whole time); see spec.
+        cook = (time.time() - self.generation_start_time) if self.generation_start_time else 0.0
+        self.last_cook_time = cook
+        if not self.halted and cook > 0:
+            self.session_energy_wh += cook * self.gpu_tdp_watts / 3600.0
         # Inline-save pass: parse tagged code blocks, save them, rewrite
         # the joined content with badges. Skipped if halted (the turn will
         # resume; saves wait until the user truly ends the turn).
@@ -2436,12 +3089,27 @@ class ChatUI:
             self._process_inline_saves()
         if not self.halted:
             final_renderable = self._get_current_renderable_ansi()
+            # Feature 1: append a dim cook-time annotation under the bubble
+            # so the user can scan "how long did each response take" while
+            # scrolling history.
+            if cook > 0:
+                final_renderable += render_to_ansi(
+                    Text(f"  · {cook:.1f}s", style=f"italic {DIM}")
+                )
             self.history_ansi.append(final_renderable)
             self.current_response_parts = []
             self.reasoning_chunks = []
             self.reasoning_log = []
             self.tool_executions = []
             self.side_messages = []
+            # Feature 3: editor pane closes at the end of a turn. The
+            # ConditionalContainer auto-hides on the next render once
+            # _open_files is empty.
+            self._open_files = {}
+            self._active_editor_path = None
+        # End-of-turn: refresh the reflection line in the background if
+        # the gate (15 min by default) has elapsed. Free if not due.
+        self._maybe_refresh_reflection()
         self._update_ui()
 
     def _resolve_user_name(self) -> str:
@@ -2694,6 +3362,10 @@ class ChatUI:
         # pulse visible from the moment the app starts, not just during
         # generation.
         self._start_animation_loop()
+        # Fetch an initial reflection in the background so the line below
+        # the status bar gets populated within a few seconds of startup —
+        # the welcome banner has time to be visible before this lands.
+        self._maybe_refresh_reflection(force=True)
         self.app.run()
 
     def _heartbeat_monitor(self):

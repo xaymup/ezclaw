@@ -77,6 +77,44 @@ def test_insert_after_unknown_id_appends_to_end():
     assert p.tasks[-1] is new_task
 
 
+def test_insert_dedupes_open_sibling_with_same_description():
+    """Regression: architect sometimes emits identical new_tasks on
+    consecutive turns. Plan.insert should silently no-op rather than
+    growing the plan with visible duplicates."""
+    from plan import Plan, Task
+    p = Plan(title="t", tasks=[Task(id=1, description="Read input")])
+    first = p.insert(after_id=1, description="Write output")
+    second = p.insert(after_id=1, description="Write output")
+    third = p.insert(after_id=1, description="write  output.")  # whitespace/case/punct
+    assert first is second is third  # same Task instance returned each time
+    assert len(p.tasks) == 2
+
+
+def test_insert_does_not_dedupe_against_done_tasks():
+    """If a task with the same description already finished, a new one
+    of the same name IS legitimate (rerun, second pass) — the dedupe
+    guard only applies to OPEN (pending / in_progress) siblings."""
+    from plan import Plan, Task
+    p = Plan(title="t", tasks=[Task(id=1, description="Run tests", status="done")])
+    second = p.insert(after_id=1, description="Run tests")
+    assert second is not p.tasks[0]
+    assert len(p.tasks) == 2
+
+
+def test_insert_does_not_dedupe_across_different_parents():
+    """Same description under a different parent is a separate task in
+    the hierarchy and should be allowed."""
+    from plan import Plan, Task
+    p = Plan(title="t", tasks=[
+        Task(id=1, description="root A"),
+        Task(id=2, description="root B"),
+    ])
+    sub1 = p.insert(after_id=1, description="cleanup", parent_id=1)
+    sub2 = p.insert(after_id=2, description="cleanup", parent_id=2)
+    assert sub1 is not sub2
+    assert len(p.tasks) == 4
+
+
 def test_is_complete_false_when_any_pending():
     p = make_plan(3)
     p.advance(1, "done")

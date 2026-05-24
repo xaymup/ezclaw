@@ -1050,8 +1050,23 @@ def _skill_filename(name: str) -> str:
 
 @registry.register(auth_required=True)
 def learn_skill(name: str, description: str, procedure: str) -> str:
-    """
-    Save a reusable step-by-step procedure to ~/.ezclaw/skills/.
+    """Save a reusable step-by-step procedure to ~/.ezclaw/skills/ as a markdown file.
+
+    This is the ONLY way to create a skill. If the user asks you to "create a
+    skill", "save a skill", "learn this", or "remember how to X", call THIS
+    tool — do NOT use write_file to drop Python in workspace/. Skills are
+    procedures (markdown), not source files.
+
+    The `procedure` argument is a numbered checklist of CONCRETE tool calls or
+    shell commands a future turn will follow verbatim. If the user named an
+    external CLI tool (himalaya, kubectl, gh, ffmpeg, …), the procedure must
+    invoke it via run_shell, NOT assume it's a Python module — many CLI tools
+    have no Python package by the same name.
+
+    Args:
+        name: Short slug, e.g. "read-recent-emails-himalaya".
+        description: One sentence on what this skill does and when to use it.
+        procedure: Numbered markdown checklist of shell commands / tool calls.
     """
     try:
         _migrate_legacy_skills_once()
@@ -1087,6 +1102,34 @@ def list_skills() -> str:
         return "No skills learned yet."
     skills = [f.replace(".md", "") for f in os.listdir(SKILLS_DIR) if f.endswith(".md")]
     return "\n".join(skills) if skills else "No skills learned yet."
+
+
+@registry.register
+def delete_skill(name: str) -> str:
+    """Permanently delete a learned skill by name."""
+    try:
+        _migrate_legacy_skills_once()
+        filename = _skill_filename(name)
+        path = os.path.join(SKILLS_DIR, filename)
+        
+        # Also check legacy directory just in case
+        legacy_path = os.path.join(_LEGACY_SKILLS_DIR, filename)
+        
+        deleted = False
+        if os.path.exists(path):
+            os.remove(path)
+            deleted = True
+        
+        if os.path.exists(legacy_path):
+            os.remove(legacy_path)
+            deleted = True
+            
+        if deleted:
+            return f"Skill '{name}' deleted successfully."
+        else:
+            return f"Skill '{name}' not found."
+    except Exception as e:
+        return f"Error deleting skill: {str(e)}"
 
 def create_memory_tools(db: Any):
     """Integrates Database-backed memory tools."""
@@ -1415,13 +1458,46 @@ def apply_diff(path: str, diff: str) -> str:
     new_content, applied, rejections = _apply_unified_diff(original, diff)
     if rejections:
         return _format_rejections(rejections, path)
+
+    # Guard the "looked like a diff but had no @@ hunks" case: previously
+    # this silently wrote the file unchanged and returned "Applied 0
+    # hunk(s)", which the UI then rendered with a green ✓. Now it's an
+    # explicit error so the model can self-correct.
+    if applied == 0:
+        if "@@" not in diff:
+            return (
+                f"Error: no diff hunks found in input. A unified diff "
+                f"needs at least one '@@ -N,n +M,m @@' header followed "
+                f"by context/+/- lines. Got {len(diff)} chars; first 80: "
+                f"{diff[:80]!r}"
+            )
+        return (
+            f"Error: parsed 0 applicable hunks from the diff for {path}. "
+            f"This usually means every hunk was empty (no `+` or `-` lines) "
+            f"or only contained the `@@` header. Re-emit the diff with at "
+            f"least one change line per hunk."
+        )
+
+    # Count actual content changes so the success line is informative.
+    # Walk the raw diff lines so this stays independent of the applier's
+    # internal hunk parser. `+++` / `---` are header lines, not content.
+    plus = minus = 0
+    for ln in diff.splitlines():
+        if ln.startswith("+") and not ln.startswith("+++"):
+            plus += 1
+        elif ln.startswith("-") and not ln.startswith("---"):
+            minus += 1
+
     try:
         with open(full_path, "w", encoding="utf-8") as f:
             f.write("".join(new_content))
     except Exception as e:
         return f"Error writing {path}: {e}"
 
-    return f"Applied {applied} hunk(s) to {path}."
+    return (
+        f"Applied {applied} hunk(s) to {path}  "
+        f"(+{plus} / -{minus} lines)."
+    )
 
 
 def _apply_unified_diff(original_lines, diff_text):

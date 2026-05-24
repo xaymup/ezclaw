@@ -244,16 +244,19 @@ def test_panel_uses_status_glyphs_for_todo_style():
 
 
 def test_render_reasoning_panel_method_exists():
-    """Smoke check that the renderer is wired into the cli module."""
+    """Smoke check that the reasoning renderer is wired into the cli module.
+
+    The reasoning panel was merged into a unified Plan+Reasoning panel
+    rendered by `_render_unified_panel`. The standalone
+    `_render_reasoning_panel` has been removed during the streamline
+    pass — this test now pins the merged renderer instead.
+    """
     import cli
-    assert hasattr(cli.ChatUI, "_render_reasoning_panel")
+    assert hasattr(cli.ChatUI, "_render_unified_panel")
     src = open(cli.__file__).read()
-    assert "def _render_reasoning_panel" in src
-    # And the old fragmented elements are no longer rendered alongside
-    # the new panel (the architect chip / SHOW_THINKING panel were
-    # explicitly replaced, not duplicated).
-    assert "# 2. Unified reasoning panel" in src
-    assert "self._render_reasoning_panel()" in src
+    assert "def _render_unified_panel" in src
+    # The unified panel is what the chat loop calls.
+    assert "self._render_unified_panel()" in src
 
 
 def test_ctrl_r_keybinding_present():

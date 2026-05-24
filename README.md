@@ -16,9 +16,16 @@ EzClaw is a focused local agent that aims for "just works" without the configura
 - **Plan-first orchestration** — the architect produces a structured task list (2-7 tasks) for multi-step requests, then executes against it. The TUI shows the plan with live `pending → in_progress → done` transitions.
 - **Persistent chat history** — every conversation is saved in SQLite (`ezclaw.db`).
 - **Long-term memory** — explicit `remember` / `recall` / `forget` tools, plus a hybrid full-text + cosine-similarity retrieval layer.
-- **Tools** — `read_file`, `write_file` (with unified diff), `list_dir`, `run_shell` (interactive- and background-safe), `web_fetch`, `learn_skill`, plus memory tools. All file operations sandboxed to `./workspace/`.
-- **TUI** — full-screen prompt-toolkit + rich layout with role-aware spinners, compact tool panels (F4 toggles full), strategy panel (F3 toggles), and copy mode (F2).
+- **Tools** — `read_file`, `write_file`, `apply_diff` (unified-diff applier with fuzzy line-number recovery, explicit hunk-count + add/remove counts on success), `list_dir`, `run_shell` (interactive- and background-safe), `web_fetch`, `learn_skill`, plus memory tools. All file operations sandboxed to `./workspace/`.
+- **TUI** — full-screen prompt-toolkit + rich layout with role-aware spinners, compact tool panels (F4 toggles full), strategy panel (F3 toggles), copy mode (F2), and per-response cook-time annotation under every assistant bubble.
+- **Unified Plan + Reasoning panel** — one bordered panel renders both the task tree (with tool calls nested under their step) AND a chronological reasoning timeline. Reasoning rows that mirror plan task descriptions are auto-hidden so the same item doesn't appear twice.
+- **Right-side editor pane with tabs** (F5 toggle, F6/F7 cycle) — every `write_file` and `apply_diff` the agent makes opens a tab; content reveals character-by-character as the agent "types." Multiple files can be open at once; the active tab is bright, others dim.
+- **Interactive shell pane** — when a tool launches a subprocess that wants stdin (`pacman`, `vim`, etc.), a dedicated pane appears outside the chat box showing the live stdout. Keystrokes route to the subprocess (Esc toggles back to chat).
+- **Status bar** — single line with state glyph, model emoji per family (🐳 deepseek, 🧧 qwen, 💎 gemma, 🦙 llama, 🌬 mistral, 🔬 phi, 🛠 coder variants, 🧮 embedders, 🤖 default), msg count, ~tokens, energy estimate (Wh based on GPU TDP), active-toggle badges, and a subtle one-line reflection from the agent (`/wisdom` refreshes; cached 15 min).
+- **Per-tool authorization** — the security-check panel offers `[Y] allow this tool` (session-wide for that tool), `[O] allow once`, `[N] deny`, `[A] allow all tools` — pressing Y no longer re-prompts on the next call to the same tool.
+- **Skill mechanism** — `learn_skill(name, description, procedure)` saves a markdown procedure to `~/.ezclaw/skills/`. Embedding-based matching surfaces relevant skills automatically on subsequent turns. Architect routes skill-creation requests to a single `learn_skill` call; a hard guard prevents re-iterating "improve the procedure" loops after a successful save.
 - **Loop detection + auto-pivot** — when the architect gets stuck (same plan + same agent + no progress), it auto-retries once at a higher temperature instead of giving up.
+- **Whimsical status vocabulary** — 150+ built-in playful crab/coastal status phrases across 11 categories ("scuttling over", "shellgazing", "claw-tapping the diagram"). Pool can be expanded with `/phrases refresh`, which asks the running LLM to brainstorm fresh additions and persists them to `~/.ezclaw/phrase_pool.json` so subsequent sessions inherit them.
 
 ## Recommended Multi-Agent Setup
 

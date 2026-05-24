@@ -162,6 +162,78 @@ THEME = Theme(
 )
 
 
+# Per-model emoji used in the status bar and the settings panel. Lookup is
+# by prefix on the model family — e.g. "qwen3:14b" and "qwen3.5:9b-q4_K_M"
+# both resolve to the qwen entry. Order in this list matters: the FIRST
+# matching prefix wins, so put longer / more specific keys before shorter
+# ones. Unknown models get the default 🤖 glyph.
+#
+# Each emoji is chosen to evoke the model family without leaning on the
+# vendor's logo character (which doesn't render in most terminals):
+#   🐳 deepseek — whale, their open-source brand
+#   🧧 qwen     — Alibaba's red envelope (qwen-coder gets 🛠 to distinguish)
+#   💎 gemma    — gem
+#   🦙 llama    — the obvious one
+#   🌬 mistral  — wind, matches the name
+#   🤖 gpt-oss  — generic OSS GPT
+#   🔬 phi      — Microsoft research line
+#   🧮 embed    — embeddings are computation, not chat
+#   🐍 codellama / coder-variants → 💾  → coder gets a tool icon
+_MODEL_EMOJI_PREFIXES: Tuple[Tuple[str, str], ...] = (
+    ("mxbai-embed", "🧮"),
+    ("nomic-embed", "🧮"),
+    ("all-minilm",  "🧮"),
+    ("qwen2.5-coder", "🛠"),
+    ("qwen3-coder",   "🛠"),
+    ("codellama",     "💾"),
+    ("starcoder",     "💾"),
+    ("deepseek-coder","💾"),
+    ("deepseek-r1",   "🐳"),
+    ("deepseek",      "🐳"),
+    ("phi4",          "🔬"),
+    ("phi3",          "🔬"),
+    ("phi",           "🔬"),
+    ("qwen3.5",       "🧧"),
+    ("qwen3",         "🧧"),
+    ("qwen2.5",       "🧧"),
+    ("qwen2",         "🧧"),
+    ("qwen",          "🧧"),
+    ("gemma4",        "💎"),
+    ("gemma3",        "💎"),
+    ("gemma2",        "💎"),
+    ("gemma",         "💎"),
+    ("llama4",        "🦙"),
+    ("llama3",        "🦙"),
+    ("llama2",        "🦙"),
+    ("llama",         "🦙"),
+    ("mistral",       "🌬"),
+    ("mixtral",       "🌬"),
+    ("gpt-oss",       "🤖"),
+    ("gpt-",          "🤖"),
+    ("claude",        "🪶"),
+)
+
+_DEFAULT_MODEL_EMOJI = "🤖"
+
+
+def model_emoji(name: str) -> str:
+    """Return a single emoji for the given model name.
+
+    Lookup is prefix-based on the model family — "qwen3:14b" returns 🧧,
+    "deepseek-r1:14b" returns 🐳, etc. Unknown models return the default
+    🤖. Comparison is case-insensitive; tag and quantization suffixes
+    (`:14b`, `-q4_K_M`, `:latest`) are ignored because matching happens
+    on a prefix of the bare name.
+    """
+    if not name:
+        return _DEFAULT_MODEL_EMOJI
+    n = name.lower().strip()
+    for prefix, glyph in _MODEL_EMOJI_PREFIXES:
+        if n.startswith(prefix):
+            return glyph
+    return _DEFAULT_MODEL_EMOJI
+
+
 # Task-state styling for the plan panel. The state key matches Plan task
 # statuses (plan.TASK_STATUSES). Each entry is (icon_glyph, color_hex).
 TASK_STATE_STYLE: dict = {
