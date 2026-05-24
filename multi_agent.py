@@ -49,6 +49,64 @@ _KNOWN_TOOL_NAMES = frozenset({
 })
 
 
+# ── Direct-command shortcuts ───────────────────────────────────────────────
+# Map of normalized exact-match user prompts → (tool_name, kwargs). When
+# the user types one of these phrases verbatim, the orchestrator runs the
+# tool with NO LLM call — no architect, no executor, no synthesis. The
+# user gets the tool's output as the answer in essentially one syscall.
+#
+# Only deterministic, idempotent, no-argument queries belong here. The
+# moment a phrase needs interpretation ("list tasks scheduled for this
+# week", "show daily-recurring ones") it goes through the architect like
+# any other request — the shortcut deliberately does NOT try to be smart.
+#
+# Keys are normalized via `_norm_command`: lowercased, whitespace
+# collapsed, trailing punctuation stripped. Multiple synonymous phrasings
+# can map to the same tool (e.g. "list tasks" and "show scheduled tasks").
+_COMMAND_SHORTCUTS: dict = {
+    # Scheduled tasks
+    "list tasks":                    ("list_scheduled_tasks", {}),
+    "show tasks":                    ("list_scheduled_tasks", {}),
+    "tasks":                         ("list_scheduled_tasks", {}),
+    "list scheduled tasks":          ("list_scheduled_tasks", {}),
+    "show scheduled tasks":          ("list_scheduled_tasks", {}),
+    "scheduled tasks":               ("list_scheduled_tasks", {}),
+    "what's scheduled":              ("list_scheduled_tasks", {}),
+    "what is scheduled":             ("list_scheduled_tasks", {}),
+    "what's queued":                 ("list_scheduled_tasks", {}),
+    # Skills
+    "list skills":                   ("list_skills", {}),
+    "show skills":                   ("list_skills", {}),
+    "skills":                        ("list_skills", {}),
+    # System info
+    "system info":                   ("get_system_info", {}),
+    "show system info":              ("get_system_info", {}),
+    "what time is it":               ("current_datetime", {}),
+    "current time":                  ("current_datetime", {}),
+    "what's the date":               ("current_datetime", {}),
+    "what is the date":              ("current_datetime", {}),
+}
+
+
+def _norm_command(s: str) -> str:
+    """Normalize for shortcut lookup: lowercase, collapse whitespace,
+    drop trailing punctuation. Matches what a human casually types."""
+    if not s:
+        return ""
+    out = " ".join(s.lower().split())
+    while out and out[-1] in ".!?,:;":
+        out = out[:-1]
+    return out.strip()
+
+
+def _resolve_command_shortcut(user_input: str):
+    """Return (tool_name, kwargs) when `user_input` exactly matches a
+    shortcut, else None. The match is strict — paraphrasing
+    ("could you list the tasks for me?") falls through to the architect
+    so the LLM can disambiguate."""
+    return _COMMAND_SHORTCUTS.get(_norm_command(user_input))
+
+
 def _format_tool_typeerror(tool_name: str, tool_func, passed_args: dict, exc: TypeError) -> str:
     """Build a model-actionable error string for a wrong-kwargs tool call.
 
@@ -223,7 +281,7 @@ After `learn_skill` succeeds, your reply is a single sentence confirming the ski
 - **Don't pre-validate**: Just call `read_file(path)` — if it errors, then act. Do NOT `list_dir` first to "check if the file exists."
 - **Use the efficient tools when they fit** — they save context budget and avoid common mistakes:
     - `code_outline(file)` BEFORE `read_file` on large source files. The outline tells you which symbols exist; only `read_file` after you know which part you want.
-    - `apply_diff(file, diff)` INSTEAD of `write_file` for small edits. It sends just the hunks, not the whole file.
+    - `apply_diff(file, diff)` INSTEAD of `write_file` for small edits. It sends just the hunks, not the whole file. **HARD RULE**: only call `apply_diff` on a file you've actually `read_file`'d (or written via `write_file`) in THIS turn. Diffs against an un-read file rely on your model's guess of the surrounding context lines, which is wrong roughly half the time — the diff gets rejected and you waste a turn retrying. When in doubt, `read_file` first to confirm the context, OR use `write_file` with the full final content.
     - `grep_codebase(pattern)` INSTEAD of `run_shell("grep -rn …")`. Structured output, skips binary/cache dirs automatically.
     - `run_tests([target])` INSTEAD of guessing pytest/jest/cargo invocations.
     - `python_eval(expr)` INSTEAD of mental math, datetime arithmetic, or JSON manipulation. Use it whenever the answer is computable.
@@ -674,16 +732,28 @@ class SpecializedAgent:
                 is_interactive = tool_call.function.arguments.get("interactive", False)
 
                 tool_name = tool_call.function.name
-                if (
+                needs_auth = (
                     tool_func
                     and getattr(tool_func, "auth_required", False)
-                    and not self._auth_state.is_allowed(tool_name)
-                ):
+                )
+                if needs_auth and not self._auth_state.is_allowed(tool_name):
                     auth = yield {
                         "type": "auth_required",
                         "name": tool_name,
                         "arguments": tool_call.function.arguments,
                     }
+                    # Diagnostic: log every auth answer so we can see what
+                    # the user pressed and what state changed. Always on
+                    # (one line per auth resolution — negligible).
+                    try:
+                        with open("/tmp/ezclaw_auth.log", "a") as _f:
+                            import time as _t
+                            _f.write(
+                                f"{_t.strftime('%H:%M:%S')}  tool={tool_name!r}  "
+                                f"answer={auth!r}  authorized_before={self._auth_state.authorized}\n"
+                            )
+                    except Exception:
+                        pass
                     if auth == "deny":
                         self.messages.append({
                             "role": "tool", "content": "Authorization denied.",
@@ -700,6 +770,29 @@ class SpecializedAgent:
                         # again for the rest of the session.
                         self._auth_state.allow_tool(tool_name)
                     # "allow" (without suffix) = one-shot — no state change.
+                    try:
+                        with open("/tmp/ezclaw_auth.log", "a") as _f:
+                            import time as _t
+                            _f.write(
+                                f"{_t.strftime('%H:%M:%S')}  → authorized_after={self._auth_state.authorized}  "
+                                f"allowed_tools={sorted(self._auth_state.allowed_tools)}\n"
+                            )
+                    except Exception:
+                        pass
+                elif needs_auth:
+                    # Auth was granted earlier in this session — emit a
+                    # quiet status so the user can see WHY no panel showed
+                    # up. Tells them which mechanism is keeping it auto-
+                    # approved (per-tool [Y] vs session-wide [A]).
+                    reason = (
+                        "session-wide allow ([A])"
+                        if self._auth_state.authorized
+                        else f"previous [Y] on {tool_name}"
+                    )
+                    yield {
+                        "type": "status",
+                        "content": f"🔓 {tool_name} auto-allowed ({reason})",
+                    }
 
                 yield {
                     "type": "tool_start",
@@ -834,6 +927,8 @@ Rules for execution:
     - Looking at unrelated workspace files to find "improvements" to make.
     - **Re-running `learn_skill` after it already succeeded.** A successful `learn_skill` tool result ("Skill 'X' saved to ~/.ezclaw/skills/X.md") fully satisfies a skill-creation request. Do not "improve the procedure" by saving the same skill again with different wording — set `complete: true` after the first success. Iterating wastes turns and overwrites the file you just wrote.
     - **Re-doing a script the user can run.** A successful `write_file` followed by no execution request from the user is done. Do not add tasks to "verify" or "polish" the script unless the user asked for verification.
+    - **"Would you like to clean up / remove / fix..." follow-ups on a query.** When the user asked to LIST / SHOW / READ something ("list tasks", "show skills", "what's in foo.py"), the tool's output IS the answer. Do NOT bolt on "Next Steps: 1. Remove duplicates 2. Adjust dates" suggestions — those are a separate request. Set `complete: true` immediately after the query tool returns. If you notice something the user might want to know (e.g. duplicates), mention it ONCE in your reply as a single observation, not as a numbered menu of actions for them to choose from.
+    - **Routing to `general` to "clarify user preferences" without an `ask_user` call.** The `general` agent can't actually ask the user anything — it just produces conversational filler. If you genuinely need a decision from the user before proceeding, route an agent to call `ask_user("specific question")` exactly once. Otherwise pick the most-likely interpretation and proceed.
     - One exception: if a genuine blocker was discovered (missing dependency, broken import, the deliverable doesn't actually run), insert ONE corrective task. Otherwise: complete.
 - `plan` is the step-by-step instruction the routed agent will execute this turn. Make it concrete and actionable: "Read sse_handler.py, find the handle_disconnect function, add a `connection.cleanup()` call before the return." Not "Work on the leak."
 - `reflection.observation` is one short sentence describing what actually happened in the previous step. Skip if first step.
@@ -1733,6 +1828,32 @@ No fluff. No "In this task...". Just facts."""
         except: pass
         map_block = f"\n## Codebase Map\n{codebase_map[:3000]}\n" if codebase_map else ""
 
+        # Layer 0: direct-command shortcut. A handful of fixed phrases like
+        # "list tasks" / "show skills" map deterministically to a single
+        # tool call. Run the tool ourselves and skip every LLM step —
+        # architect, executor, synthesis. This is what makes "list tasks"
+        # respond in <1s instead of going through 16 architect iterations
+        # while the executor and general agents debate the user's intent.
+        shortcut = _resolve_command_shortcut(user_input)
+        if shortcut is not None:
+            tool_name, kwargs = shortcut
+            tool_func = registry.tools.get(tool_name)
+            if tool_func is not None:
+                yield {"type": "tool_start", "name": tool_name, "arguments": kwargs}
+                try:
+                    result = tool_func(**kwargs)
+                except Exception as e:
+                    result = f"Error: {e}"
+                result_str = str(result)
+                yield {"type": "tool_end", "name": tool_name, "result": result_str}
+                yield {"type": "content", "content": result_str}
+                self._append_conversation_turn(
+                    user_input,
+                    result_str,
+                    step_history=[{"agent": "executor", "tools": [tool_name]}],
+                )
+                return
+
         short_circuit_agent = self._short_circuit_classify(user_input)
         if short_circuit_agent == "executor":
             kind_count = self._estimate_tool_kinds(user_input)
@@ -2301,6 +2422,31 @@ No fluff. No "In this task...". Just facts."""
             }
             step_history.append(step_record)
 
+            # Halt the "general-agent clarification loop". Observed
+            # failure mode: the architect, after running one good tool
+            # call, kept routing to `general` (which has no tools) to
+            # "clarify user preferences" — the general agent emits
+            # generic chat that doesn't actually ask the user anything,
+            # the architect reads that as ambiguous and routes to
+            # `general` AGAIN. 11 consecutive `general` steps in the
+            # transcript that prompted this fix. After 3 consecutive
+            # `general` routes, force completion so the user sees what's
+            # already on screen and can correct course.
+            recent_general = sum(
+                1 for s in step_history[-3:] if s.get("agent") == "general"
+            )
+            if recent_general >= 3:
+                yield {
+                    "type": "status",
+                    "content": "🦀 caught in a clarification loop — stopping here\n",
+                }
+                intent["complete"] = True
+                if self.current_plan is not None:
+                    for t in self.current_plan.tasks:
+                        if t.status in ("pending", "in_progress"):
+                            self.current_plan.advance(t.id, "skipped")
+                    yield {"type": "plan_update", "plan": self.current_plan}
+
             # Auto-advance the just-finished task if the architect didn't
             # explicitly close it via task_updates. Without this, plans get
             # stuck on `pending` forever because deepseek-r1 often omits
@@ -2348,6 +2494,32 @@ No fluff. No "In this task...". Just facts."""
                     # exits via the plan_done path. The user only asked
                     # to create the skill — leftover "verify" / "integrate"
                     # tasks the architect dreamed up don't need to run.
+                    for t in self.current_plan.tasks:
+                        if t.status in ("pending", "in_progress"):
+                            self.current_plan.advance(t.id, "skipped")
+                    yield {"type": "plan_update", "plan": self.current_plan}
+
+            # Hard guard: pure-query tools (`list_*`, `recall`, etc.) are
+            # one-shot from the user's POV — their output IS the answer.
+            # After one of these succeeds, force completion to stop the
+            # architect from drifting into "Next Steps: would you like to
+            # clean up these duplicates?" follow-ups. Observed failure
+            # mode: a 447s / 16-step "list tasks" turn where the
+            # architect ran list_scheduled_tasks on step 1 then spent 15
+            # more steps asking the general agent for "user preference on
+            # task handling" before the user got the actual list.
+            _QUERY_TOOLS = {
+                "list_scheduled_tasks", "list_skills", "list_dir",
+                "recall", "get_skill", "git_log", "git_blame",
+                "current_datetime", "get_system_info",
+                "code_outline", "grep_codebase", "recall_actions",
+            }
+            if (
+                outcome == "SUCCESS"
+                and any(tn in _QUERY_TOOLS for tn in step_tool_names)
+            ):
+                intent["complete"] = True
+                if self.current_plan is not None:
                     for t in self.current_plan.tasks:
                         if t.status in ("pending", "in_progress"):
                             self.current_plan.advance(t.id, "skipped")

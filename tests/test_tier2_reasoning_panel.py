@@ -231,16 +231,15 @@ def test_grouping_method_exposed_on_chatui():
 
 
 def test_panel_uses_status_glyphs_for_todo_style():
-    """The renderer must use ●/▸/✗ status glyphs (matching the plan
-    panel's vocabulary) and numbered rows ("1.", "2.") so the panel
-    reads as a TODO list."""
-    import cli
-    src = open(cli.__file__).read()
-    # The status glyph table is present
-    assert '"done":' in src and '"in_progress":' in src
-    assert "▸" in src and "●" in src
-    # Step numbering: 'f"{step_n}.'
-    assert "step_n}" in src or "step_n}." in src
+    """The unified panel must render TODO-style status glyphs (●/▸/✗)
+    for each plan task. After dropping the standalone Reasoning section,
+    these come from theme.TASK_STATE_STYLE rather than an inline dict in
+    cli.py — pin the same vocabulary at the theme module."""
+    from theme import TASK_STATE_STYLE
+    glyphs = {style[0] for style in TASK_STATE_STYLE.values()}
+    assert "●" in glyphs   # done
+    assert "▸" in glyphs   # in_progress
+    assert "✗" in glyphs   # failed
 
 
 def test_render_reasoning_panel_method_exists():

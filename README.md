@@ -18,13 +18,16 @@ EzClaw is a focused local agent that aims for "just works" without the configura
 - **Long-term memory** — explicit `remember` / `recall` / `forget` tools, plus a hybrid full-text + cosine-similarity retrieval layer.
 - **Tools** — `read_file`, `write_file`, `apply_diff` (unified-diff applier with fuzzy line-number recovery, explicit hunk-count + add/remove counts on success), `list_dir`, `run_shell` (interactive- and background-safe), `web_fetch`, `learn_skill`, plus memory tools. All file operations sandboxed to `./workspace/`.
 - **TUI** — full-screen prompt-toolkit + rich layout with role-aware spinners, compact tool panels (F4 toggles full), strategy panel (F3 toggles), copy mode (F2), and per-response cook-time annotation under every assistant bubble.
-- **Unified Plan + Reasoning panel** — one bordered panel renders both the task tree (with tool calls nested under their step) AND a chronological reasoning timeline. Reasoning rows that mirror plan task descriptions are auto-hidden so the same item doesn't appear twice.
+- **Unified Plan panel** — one bordered panel renders the active task tree with tool calls nested under their step. The architect's `goal / observation / critical_thinking` for the current task appears inline under the in-progress row — no separate Reasoning timeline duplicating the task descriptions.
 - **Right-side editor pane with tabs** (F5 toggle, F6/F7 cycle) — every `write_file` and `apply_diff` the agent makes opens a tab; content reveals character-by-character as the agent "types." Multiple files can be open at once; the active tab is bright, others dim.
 - **Interactive shell pane** — when a tool launches a subprocess that wants stdin (`pacman`, `vim`, etc.), a dedicated pane appears outside the chat box showing the live stdout. Keystrokes route to the subprocess (Esc toggles back to chat).
+- **Multiline input + paste-as-block** — the prompt is a real multiline editor. Newline keys: `Shift+Enter` (kitty / iTerm2 / WezTerm / modern xterm via CSI u or modifyOtherKeys), `Ctrl+J` (universal), `Alt+Enter`, or `\` + Enter (terminal-independent escape). Large pastes (≥3 lines or ≥200 chars) collapse to a single-line placeholder `[pasted #N: L lines, C chars]`; the real content is expanded back at submit. Keeps the input compact even when you paste 200 lines.
 - **Status bar** — single line with state glyph, model emoji per family (🐳 deepseek, 🧧 qwen, 💎 gemma, 🦙 llama, 🌬 mistral, 🔬 phi, 🛠 coder variants, 🧮 embedders, 🤖 default), msg count, ~tokens, energy estimate (Wh based on GPU TDP), active-toggle badges, and a subtle one-line reflection from the agent (`/wisdom` refreshes; cached 15 min).
 - **Per-tool authorization** — the security-check panel offers `[Y] allow this tool` (session-wide for that tool), `[O] allow once`, `[N] deny`, `[A] allow all tools` — pressing Y no longer re-prompts on the next call to the same tool.
 - **Skill mechanism** — `learn_skill(name, description, procedure)` saves a markdown procedure to `~/.ezclaw/skills/`. Embedding-based matching surfaces relevant skills automatically on subsequent turns. Architect routes skill-creation requests to a single `learn_skill` call; a hard guard prevents re-iterating "improve the procedure" loops after a successful save.
-- **Loop detection + auto-pivot** — when the architect gets stuck (same plan + same agent + no progress), it auto-retries once at a higher temperature instead of giving up.
+- **Scheduled tasks (with recurrence)** — `schedule_task(time, description, recurrence=...)` queues a task in `heartbeat.md`. Recurrence accepts `every Nm/Nh/Nd`, `hourly`, `daily`, `weekly`, or `weekdays`. On firing the agent auto-executes the description as if you'd typed it. Recurring tasks re-arm to the next occurrence after each successful run.
+- **Direct command shortcuts** — `list tasks`, `show skills`, `system info`, `what time is it`, etc., resolve to a single tool call with zero LLM involvement. Typed verbatim → answer in ~50ms instead of routing through the architect.
+- **Loop detection + auto-pivot** — when the architect gets stuck (same plan + same agent + no progress), it auto-retries once at a higher temperature instead of giving up. Also halts and surfaces a notice when the architect routes to `general` three times in a row (clarification-loop guard).
 - **Whimsical status vocabulary** — 150+ built-in playful crab/coastal status phrases across 11 categories ("scuttling over", "shellgazing", "claw-tapping the diagram"). Pool can be expanded with `/phrases refresh`, which asks the running LLM to brainstorm fresh additions and persists them to `~/.ezclaw/phrase_pool.json` so subsequent sessions inherit them.
 
 ## Recommended Multi-Agent Setup
@@ -131,11 +134,20 @@ For factual comparisons against other local-agent projects (opencode, Hermes-bas
 
 ## Usage
 
+Sample prompts:
 - "Add a Python script that lists every function in tools.py with its docstring summary." → multi-step, triggers the plan panel.
 - "What's the modified date of cli.py?" → single-step, no plan panel.
 - "Remember that my name is Alice and I like coffee." → memory write.
 - "Who am I?" → memory recall in a new session.
-- F2 toggles copy mode (mouse selection in the terminal), F3 toggles the strategy panel, F4 toggles compact vs. full tool panels.
+- `list tasks` / `show skills` / `system info` / `what time is it` → direct shortcuts (no LLM call, instant).
+- "Water the plants every weekday at 10am." → recurring scheduled task; `unschedule_task(<id>)` to stop.
+
+Keyboard:
+- **Enter** submits, **Ctrl+J** (or **Alt+Enter** / **Shift+Enter** / `\` + Enter) inserts a newline.
+- **F1** help · **F2** copy mode · **F3** strategy panels · **F4** full vs compact tool panels · **F5** editor pane · **F6 / F7** cycle editor tabs · **Ctrl+R** reasoning visibility · **Ctrl+C** interrupt.
+- Pasting ≥3 lines or ≥200 chars collapses to `[pasted #N: L lines, C chars]`; expanded back at submit.
+
+Slash commands: `/help` `/settings` `/queue` `/skills` `/memory` `/phrases [refresh|reset]` `/wisdom` `/diagnose` `/clear` `/copy [last|all|N]` `/expand [N|all]` `/collapse [N|all]` `/authorize`.
 
 ## Project Structure
 

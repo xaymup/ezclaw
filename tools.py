@@ -152,6 +152,41 @@ def clean_html(html: str) -> str:
 class WorkspacePathError(ValueError):
     """Raised when a tool path cannot be safely resolved inside the workspace."""
 
+def _missing_workspace_file_error(rel_path: str, full_path: str) -> str:
+    """Build an error message that distinguishes 'file truly missing'
+    from 'file exists outside the workspace sandbox'. Without this hint,
+    the agent saw a generic 'does not exist' and either retried with
+    the same path or fabricated content. With it, the agent can choose
+    to copy the file into ./workspace/ first or use an in-workspace
+    target instead."""
+    import os as _os
+    base_dir = _os.path.abspath(WORKSPACE_DIR)
+    # Check whether the file exists OUTSIDE the workspace (project root,
+    # parent dirs, common dev locations).
+    candidates = [
+        _os.path.join(_os.path.dirname(base_dir), rel_path),  # project root
+        _os.path.abspath(rel_path),                           # cwd
+        _os.path.join(_os.path.expanduser("~"), rel_path),    # home
+    ]
+    for cand in candidates:
+        if cand == full_path:
+            continue
+        if _os.path.exists(cand):
+            return (
+                f"Error: File '{rel_path}' does not exist INSIDE the workspace "
+                f"sandbox ('{base_dir}/'). It does exist at '{cand}' but file "
+                f"tools (read_file / write_file / code_outline / apply_diff) "
+                f"only operate on paths under './workspace/'. If you need to "
+                f"work with it, either copy it in via `cp` (run_shell) or use "
+                f"an in-workspace path."
+            )
+    return (
+        f"Error: File '{rel_path}' does not exist in workspace "
+        f"('{base_dir}/{rel_path}'). The sandbox root is './workspace/' — "
+        f"create it there first via write_file, or check the path."
+    )
+
+
 def get_workspace_path(path: str) -> str:
     """Resolve a tool-supplied path to an absolute path inside the workspace.
 
@@ -263,6 +298,30 @@ _ENV_ALLOWLIST = frozenset({
     "LC_MESSAGES",
     "TMPDIR",
     "TZ",
+    # ── GUI app support ────────────────────────────────────────────────
+    # Without these, child processes that try to open windows fail with
+    # "cannot open display" / "no session bus" / etc. Pass-through is
+    # safe because they're DISPLAY-style identifiers, not credentials —
+    # the actual auth lives in XAUTHORITY (a file path; the cookie
+    # inside is what authenticates, and the user's session already
+    # owns it).
+    "DISPLAY",                  # X11 display
+    "WAYLAND_DISPLAY",          # Wayland display
+    "XAUTHORITY",               # X11 magic-cookie file path
+    "DBUS_SESSION_BUS_ADDRESS", # session DBus (most GUI apps use it)
+    "DBUS_SYSTEM_BUS_ADDRESS",  # system DBus (rare, for portals/etc.)
+    "XDG_RUNTIME_DIR",          # Wayland sockets, pulseaudio, etc.
+    "XDG_SESSION_TYPE",         # "wayland" or "x11" — apps branch on it
+    "XDG_CURRENT_DESKTOP",      # "GNOME"/"KDE"/etc. for theme hints
+    "XDG_DATA_DIRS",            # icon/theme/mime lookup
+    "XDG_CONFIG_DIRS",          # config lookup
+    "GDK_BACKEND",              # GTK backend override
+    "QT_QPA_PLATFORM",          # Qt backend override
+    "GTK_IM_MODULE", "QT_IM_MODULE", "XMODIFIERS",  # IME
+    "PULSE_SERVER",             # PulseAudio (for apps that play sound)
+    "SDL_VIDEODRIVER",          # SDL apps
+    "SSH_AUTH_SOCK",            # ssh-agent (only meaningful if the user
+                                #   explicitly invokes ssh; otherwise inert)
 })
 
 # Hard resource ceilings for shell children (POSIX only). These cap a runaway
@@ -387,6 +446,32 @@ def run_shell(command: str, interactive: bool = False) -> str:
     try:
         if interactive and os.name != "nt":
             return _run_shell_interactive(command, workspace_cwd, sandbox_env)
+
+        # Background launch: a command ending in `&` (or `&` followed
+        # by whitespace) is the user/agent's signal to fire-and-forget.
+        # Use Popen with no wait → no 60s wall timeout, and skip the
+        # CPU rlimit so a long-running GUI app isn't killed. Crucially,
+        # the GUI env vars are already in sandbox_env (allowlist
+        # update), so DISPLAY / WAYLAND_DISPLAY / XAUTHORITY etc. are
+        # available to the child.
+        stripped = command.rstrip()
+        if stripped.endswith("&") and not stripped.endswith("&&"):
+            launch_cmd = stripped[:-1].rstrip()
+            try:
+                proc = subprocess.Popen(
+                    launch_cmd,
+                    shell=True,
+                    cwd=workspace_cwd,
+                    env=sandbox_env,
+                    start_new_session=True,  # detach from our process group
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    stdin=subprocess.DEVNULL,
+                    # No preexec_fn — rlimits would kill long-running apps.
+                )
+                return f"Launched in background: pid={proc.pid}  cmd={launch_cmd!r}"
+            except Exception as e:
+                return f"Error launching background command: {e}"
 
         result = subprocess.run(
             command,
@@ -609,7 +694,7 @@ def read_file(path: str) -> str:
     try:
         full_path = get_workspace_path(path)
         if not os.path.exists(full_path):
-            return f"Error: File '{path}' does not exist."
+            return _missing_workspace_file_error(path, full_path)
         with open(full_path, 'r', encoding='utf-8') as f:
             return f.read()
     except Exception as e:
@@ -931,7 +1016,7 @@ def web_search(query: str, limit: int = 5) -> str:
     return "\n".join(lines).rstrip()
 
 @registry.register
-def schedule_task(scheduled_time: str, description: str) -> str:
+def schedule_task(scheduled_time: str, description: str, recurrence: str = "") -> str:
     """
     Schedule a task to run at a future time (YYYY-MM-DD HH:MM).
 
@@ -939,13 +1024,36 @@ def schedule_task(scheduled_time: str, description: str) -> str:
     the description as if the user had typed it — the agent plans and
     runs it autonomously. Returns the new task's stable ID, which can be
     passed to unschedule_task() to cancel before it fires.
+
+    Args:
+        scheduled_time: First firing time, formatted 'YYYY-MM-DD HH:MM'.
+        description:    What the agent should do when fired.
+        recurrence:     Optional repeat rule. Empty string for one-shot.
+                        Accepted forms:
+                          "every Nm" / "every Nh" / "every Nd"
+                          "hourly"   — same MM each hour
+                          "daily"    — same HH:MM each day
+                          "weekly"   — same weekday + HH:MM each week
+                          "weekdays" — Mon–Fri at HH:MM
+
+    Recurring tasks re-arm to the next occurrence after each successful
+    firing — the same row stays in the heartbeat table. Use
+    unschedule_task to stop a recurring task.
     """
     from scheduler import Scheduler
     try:
-        task = Scheduler().schedule(scheduled_time, description)
+        task = Scheduler().schedule(scheduled_time, description, recurrence=recurrence or None)
+        if task.recurrence:
+            return (
+                f"Task scheduled [#{task.id}]: {task.description} "
+                f"— first run at {task.time_str}, then {task.recurrence}"
+            )
         return f"Task scheduled [#{task.id}]: {task.description} at {task.time_str}"
-    except ValueError:
-        return "Error: Use 'YYYY-MM-DD HH:MM' format."
+    except ValueError as e:
+        msg = str(e)
+        if "unrecognized recurrence" in msg.lower() or "interval must be" in msg.lower():
+            return f"Error: {msg}"
+        return "Error: Use 'YYYY-MM-DD HH:MM' for scheduled_time."
     except Exception as e:
         return f"Error scheduling task: {e}"
 
@@ -986,7 +1094,8 @@ def list_scheduled_tasks() -> str:
             return "No scheduled tasks pending."
         lines = ["Active scheduled tasks:"]
         for t in sorted(tasks, key=lambda x: x.time):
-            lines.append(f"  [#{t.id}] {t.time_str}  {t.status}  — {t.description}")
+            rec = f"  ↻ {t.recurrence}" if t.recurrence else ""
+            lines.append(f"  [#{t.id}] {t.time_str}  {t.status}  — {t.description}{rec}")
         return "\n".join(lines)
     except Exception as e:
         return f"Error listing tasks: {e}"
@@ -1313,7 +1422,7 @@ def code_outline(path: str) -> str:
     try:
         full_path = get_workspace_path(path)
         if not os.path.exists(full_path):
-            return f"Error: File '{path}' does not exist."
+            return _missing_workspace_file_error(path, full_path)
 
         with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
             source = f.read()
@@ -1447,7 +1556,7 @@ def apply_diff(path: str, diff: str) -> str:
     except WorkspacePathError as e:
         return f"Error: {e}"
     if not os.path.exists(full_path):
-        return f"Error: File '{path}' does not exist. Use write_file to create it."
+        return _missing_workspace_file_error(path, full_path) + " To CREATE a new file, use write_file."
 
     try:
         with open(full_path, "r", encoding="utf-8") as f:

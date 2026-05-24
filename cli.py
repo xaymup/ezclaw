@@ -29,6 +29,207 @@ from prompt_toolkit.application import Application
 from prompt_toolkit.layout.containers import HSplit, VSplit, Window, ConditionalContainer
 from prompt_toolkit.layout.controls import FormattedTextControl, BufferControl
 from prompt_toolkit.layout.layout import Layout
+from prompt_toolkit.layout.dimension import Dimension as D
+from prompt_toolkit.input.ansi_escape_sequences import ANSI_SEQUENCES
+from prompt_toolkit.keys import Keys as _PtKeys
+
+
+# ── Shift+Enter support ────────────────────────────────────────────────────
+# By default prompt_toolkit's parser aliases every "Enter-with-modifier"
+# escape sequence to Keys.ControlM (same as plain Enter), so the app can't
+# tell Enter from Shift+Enter. We rebind the modifier variants to distinct
+# Keys.F24 / F23 / F22 (unused function keys) so the keybinding layer
+# below can react to them separately. We also rely on the terminal having
+# been put into either CSI u or xterm modifyOtherKeys mode so it actually
+# sends those byte sequences — `ChatUI.run` enables both modes at startup
+# and disables them on exit.
+SHIFT_ENTER = _PtKeys.F24      # repurposed unused function key
+CTRL_ENTER = _PtKeys.F23
+CTRL_SHIFT_ENTER = _PtKeys.F22
+
+# Modified Backspace under kitty CSI u arrives as \x1b[127;<mod>u
+# (keycode 127 = DEL) or \x1b[8;<mod>u (keycode 8 = BS). prompt_toolkit
+# has no discrete Keys.* for these, so we route them to two synthetic
+# keys: WORD_DELETE_BACK for Ctrl/Alt+Backspace (conventional word-
+# delete in most editors), and SHIFT_BACKSPACE for Shift+Backspace
+# (folded into a regular Backspace so nothing weird happens).
+WORD_DELETE_BACK = _PtKeys.F21
+SHIFT_BACKSPACE = _PtKeys.ControlH  # = same key as plain Backspace
+
+# Both CSI u (kitty keyboard protocol) and xterm modifyOtherKeys encode
+# Enter modifiers as `<bitmask>+1`. Bits:
+#   1=Shift  2=Alt  4=Ctrl  8=Super  16=Hyper  32=Meta
+#   64=CapsLock  128=NumLock
+# We care about the Shift / Ctrl / Shift+Ctrl combos, with any of the
+# four lock-key states the user might have on (none / Caps / Num /
+# both). Missing a lock-state variant means the parser doesn't match
+# the full sequence and inserts the suffix bytes as literal text in
+# the prompt — observed real-world: kitty + NumLock sent
+# `\x1b[13;130u` (130 = 1 + 128 + 1 = Shift + NumLock + 1) which used
+# to land as the literal text `[13;130u` in the input box.
+_MOD_SHIFT = 1
+_MOD_CTRL = 4
+_MOD_VARIANTS = (
+    (_MOD_SHIFT,           SHIFT_ENTER),
+    (_MOD_CTRL,            CTRL_ENTER),
+    (_MOD_SHIFT | _MOD_CTRL, CTRL_SHIFT_ENTER),
+)
+for _base, _key in _MOD_VARIANTS:
+    for _lock in (0, 64, 128, 64 | 128):  # none / Caps / Num / both
+        _modval = _base + _lock + 1  # protocol: bitmask + 1
+        ANSI_SEQUENCES[f"\x1b[13;{_modval}u"] = _key            # CSI u
+        ANSI_SEQUENCES[f"\x1b[27;{_modval};13~"] = _key         # modifyOtherKeys
+
+# Once kitty's CSI u flag is active, Ctrl+letter is no longer sent as
+# the legacy ASCII control byte (\x01..\x1a). Kitty instead emits e.g.
+# \x1b[99;5u for Ctrl+C, \x1b[99;133u for Ctrl+NumLock+C, etc. Without
+# the inverse mapping, prompt_toolkit's `c-c` binding (which listens for
+# Keys.ControlC = \x03) doesn't fire — the user observed Ctrl+C stopped
+# interrupting the app. Map every Ctrl+letter sequence (both CSI u and
+# modifyOtherKeys forms) back to the corresponding Keys.Control<X> so
+# the existing bindings keep working.
+for _codepoint in range(ord("a"), ord("z") + 1):
+    _letter = chr(_codepoint)
+    _ctrl_key = getattr(_PtKeys, f"Control{_letter.upper()}")
+    for _lock in (0, 64, 128, 64 | 128):
+        _modval = _MOD_CTRL + _lock + 1
+        ANSI_SEQUENCES[f"\x1b[{_codepoint};{_modval}u"] = _ctrl_key
+        ANSI_SEQUENCES[f"\x1b[27;{_modval};{_codepoint}~"] = _ctrl_key
+        # Ctrl+Shift+letter — prompt_toolkit doesn't ship discrete
+        # Keys.ControlShift<X> entries, but the byte sequence has to
+        # map to SOMETHING so it doesn't leak as literal text into the
+        # input. Re-use the plain Ctrl+letter key — the user pressing
+        # Ctrl+Shift+Z gets treated as Ctrl+Z, which is what nearly all
+        # CLI apps do anyway.
+        _modval_shift = _MOD_SHIFT | _MOD_CTRL + _lock + 1  # Shift+Ctrl + lock + 1
+        # Above is wrong precedence — explicit:
+        _modval_shift = (_MOD_SHIFT | _MOD_CTRL) + _lock + 1
+        ANSI_SEQUENCES[f"\x1b[{_codepoint};{_modval_shift}u"] = _ctrl_key
+        ANSI_SEQUENCES[f"\x1b[27;{_modval_shift};{_codepoint}~"] = _ctrl_key
+
+# Same shape as the Ctrl+letter problem, but for modified arrow keys.
+# Without NumLock prompt_toolkit knows e.g. \x1b[1;5D (Ctrl+Left), but
+# with NumLock kitty sends \x1b[1;133D which wasn't mapped — pressing
+# Ctrl+Left inserted "[1;133D" as literal text into the prompt instead
+# of moving the cursor word-left. Map all the lock-key permutations.
+#
+# Arrow direction letters: A=Up, B=Down, C=Right, D=Left.
+# Modifier combos worth mapping: Shift / Ctrl / Shift+Ctrl.
+_ARROW_KEYS = {
+    # (modifier_bits, direction_letter)  → Keys.<Modifier><Direction>
+    (_MOD_SHIFT, "A"):           _PtKeys.ShiftUp,
+    (_MOD_SHIFT, "B"):           _PtKeys.ShiftDown,
+    (_MOD_SHIFT, "C"):           _PtKeys.ShiftRight,
+    (_MOD_SHIFT, "D"):           _PtKeys.ShiftLeft,
+    (_MOD_CTRL, "A"):            _PtKeys.ControlUp,
+    (_MOD_CTRL, "B"):            _PtKeys.ControlDown,
+    (_MOD_CTRL, "C"):            _PtKeys.ControlRight,
+    (_MOD_CTRL, "D"):            _PtKeys.ControlLeft,
+    (_MOD_SHIFT | _MOD_CTRL, "A"): _PtKeys.ControlShiftUp,
+    (_MOD_SHIFT | _MOD_CTRL, "B"): _PtKeys.ControlShiftDown,
+    (_MOD_SHIFT | _MOD_CTRL, "C"): _PtKeys.ControlShiftRight,
+    (_MOD_SHIFT | _MOD_CTRL, "D"): _PtKeys.ControlShiftLeft,
+}
+for (_base, _letter), _key in _ARROW_KEYS.items():
+    for _lock in (0, 64, 128, 64 | 128):
+        _modval = _base + _lock + 1
+        ANSI_SEQUENCES[f"\x1b[1;{_modval}{_letter}"] = _key
+
+# Modified Backspace under kitty CSI u. Maps all
+# (Shift / Alt / Ctrl / Shift+Ctrl / Shift+Alt / Ctrl+Alt) × 4 lock
+# states × 2 keycodes (127=DEL, 8=BS) to the right synthetic key.
+# Shift+Backspace folds to a regular Backspace; Ctrl/Alt/Ctrl+Alt
+# variants go to WORD_DELETE_BACK so word-delete works.
+_MOD_ALT = 2
+_BACKSPACE_MOD_VARIANTS = (
+    (_MOD_SHIFT,                      SHIFT_BACKSPACE),
+    (_MOD_ALT,                        WORD_DELETE_BACK),
+    (_MOD_CTRL,                       WORD_DELETE_BACK),
+    (_MOD_SHIFT | _MOD_ALT,           WORD_DELETE_BACK),
+    (_MOD_SHIFT | _MOD_CTRL,          WORD_DELETE_BACK),
+    (_MOD_ALT | _MOD_CTRL,            WORD_DELETE_BACK),
+    (_MOD_SHIFT | _MOD_ALT | _MOD_CTRL, WORD_DELETE_BACK),
+)
+for _base, _key in _BACKSPACE_MOD_VARIANTS:
+    for _lock in (0, 64, 128, 64 | 128):
+        _modval = _base + _lock + 1
+        for _kc in (127, 8):
+            ANSI_SEQUENCES[f"\x1b[{_kc};{_modval}u"] = _key
+            ANSI_SEQUENCES[f"\x1b[27;{_modval};{_kc}~"] = _key
+# Alt+Backspace via the classic Esc-prefix is also a common encoding
+# (most terminals when "Option as Esc+" is on). Bind that too.
+ANSI_SEQUENCES["\x1b\x7f"] = WORD_DELETE_BACK
+ANSI_SEQUENCES["\x1b\x08"] = WORD_DELETE_BACK
+
+# Plain (unmodified) navigation keys with lock-state variants.
+# When kitty has modifyOtherKeys on and the user has NumLock or
+# CapsLock down, kitty includes the lock bit in the modifier value
+# EVEN FOR UNMODIFIED KEYS. So plain Left arrow becomes \x1b[1;129D
+# (NumLock = 128, +1 = 129) instead of legacy \x1b[D. prompt_toolkit
+# doesn't ship the lock-only variants, so they were getting split as
+# unknown CSI and dropped by the filter — arrows stopped moving.
+# Map every "modifier = lock-only" combination back to the plain key.
+_PLAIN_ARROW_LIKE = {
+    # letter → Keys.<name>  (no-modifier nav keys)
+    "A": _PtKeys.Up,
+    "B": _PtKeys.Down,
+    "C": _PtKeys.Right,
+    "D": _PtKeys.Left,
+    "H": _PtKeys.Home,
+    "F": _PtKeys.End,
+}
+_PLAIN_TILDE_NAV = {
+    # numeric prefix → Keys.<name>  (no-modifier nav keys, ~ terminator)
+    "2": _PtKeys.Insert,
+    "3": _PtKeys.Delete,
+    "5": _PtKeys.PageUp,
+    "6": _PtKeys.PageDown,
+    # F-keys 11..24 use the same ~ pattern in some terminals
+    "15": getattr(_PtKeys, "F5", None),
+    "17": getattr(_PtKeys, "F6", None),
+    "18": getattr(_PtKeys, "F7", None),
+    "19": getattr(_PtKeys, "F8", None),
+    "20": getattr(_PtKeys, "F9", None),
+    "21": getattr(_PtKeys, "F10", None),
+    "23": getattr(_PtKeys, "F11", None),
+    "24": getattr(_PtKeys, "F12", None),
+}
+# "Modifier = lock-only" values: 1 (no mod, but kitty may include this
+# spurious 1), 65 (Caps), 129 (Num), 193 (both).
+for _modval in (1, 65, 129, 193):
+    for _letter, _key in _PLAIN_ARROW_LIKE.items():
+        ANSI_SEQUENCES[f"\x1b[1;{_modval}{_letter}"] = _key
+    for _prefix, _key in _PLAIN_TILDE_NAV.items():
+        if _key is None:
+            continue
+        ANSI_SEQUENCES[f"\x1b[{_prefix};{_modval}~"] = _key
+
+# Home (`H`) and End (`F`) under modifiers + locks — same pattern.
+# Bare modified Home/End: prompt_toolkit ships ShiftHome / ControlHome
+# etc. Lock variants need explicit mapping.
+_HOME_END_KEYS = {
+    (_MOD_SHIFT, "H"):           getattr(_PtKeys, "ShiftHome", None),
+    (_MOD_SHIFT, "F"):           getattr(_PtKeys, "ShiftEnd", None),
+    (_MOD_CTRL, "H"):            getattr(_PtKeys, "ControlHome", None),
+    (_MOD_CTRL, "F"):            getattr(_PtKeys, "ControlEnd", None),
+}
+for (_base, _letter), _key in _HOME_END_KEYS.items():
+    if _key is None:
+        continue
+    for _lock in (0, 64, 128, 64 | 128):
+        _modval = _base + _lock + 1
+        ANSI_SEQUENCES[f"\x1b[1;{_modval}{_letter}"] = _key
+
+# Catch-all that DOESN'T need any terminal protocol: a fair number of
+# terminals send a literal CR+LF (\r\n) for Shift+Enter and bare \r for
+# plain Enter. Without an entry for \r\n in ANSI_SEQUENCES the parser
+# fires Keys.ControlM (submit) immediately on the \r and then the \n
+# is processed against an empty buffer — so Shift+Enter visibly
+# submits. Adding \r\n as a known sequence makes the parser wait for
+# the \n before firing, which we then route to SHIFT_ENTER. Plain
+# Enter still sends a bare \r (no \n behind it) so submit still fires
+# on the next flush.
+ANSI_SEQUENCES["\r\n"] = SHIFT_ENTER
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.widgets import Frame, TextArea
 from prompt_toolkit.styles import Style
@@ -70,6 +271,49 @@ DIM = THEME.palette.dim
 
 # Global console for rendering
 console = Console(file=io.StringIO(), force_terminal=True, width=100)
+
+def _fmt_duration(seconds: float) -> str:
+    """Human-readable duration that doesn't blow out at long elapsed
+    times. Used by the spinner status, the status-bar cost group, and
+    the per-turn cook-time annotation so they all read the same way.
+        12.3 → "12.3s"
+        125  → "2m 5s"
+        4500 → "1h 15m"
+    """
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    if seconds < 3600:
+        m, s = divmod(int(seconds), 60)
+        return f"{m}m {s}s"
+    h, rem = divmod(int(seconds), 3600)
+    m = rem // 60
+    return f"{h}h {m}m"
+
+
+# Full ECMA-48 CSI sequence: ESC `[`, optional parameter bytes (0x30-0x3f),
+# optional intermediate bytes (0x20-0x2f), then a final byte (0x40-0x7e).
+# SGR is the final byte 'm' (0x6d) — kept so colored output still renders;
+# everything else (cursor movement, screen clear, alt-screen entry like
+# `\x1b[?1049h`) is dropped before subprocess output reaches the TUI.
+# Without this, vim/top/htop/less inside the interactive pane would
+# clear or scramble the host terminal.
+_CSI_RE = re.compile(r'\x1b\[[\x30-\x3f]*[\x20-\x2f]*([\x40-\x7e])')
+# OSC sequences (window title, hyperlinks) and simple ESC designators.
+_OSC_RE = re.compile(r'\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)')
+_SIMPLE_ESC_RE = re.compile(r'\x1b[78cMEH=>()]')
+
+def _sanitize_subprocess_text(text: str) -> str:
+    """Strip cursor-positioning escapes and other dangerous control bytes
+    from raw subprocess output before we render it inside the TUI. Keeps
+    SGR color codes (so colored `ls`/`git` output still looks right) but
+    drops anything that would move the cursor, clear the screen, or enter
+    an alt-screen — all of which would otherwise leak through `ANSI()` and
+    clobber prompt_toolkit's layout."""
+    text = _CSI_RE.sub(lambda m: m.group(0) if m.group(1) == 'm' else '', text)
+    text = _OSC_RE.sub('', text)
+    text = _SIMPLE_ESC_RE.sub('', text)
+    return text.replace('\r', '').replace('\b', '')
+
 
 def render_to_ansi(renderable) -> str:
     with io.StringIO() as f:
@@ -172,6 +416,20 @@ class ChatUI:
         # launch a second one on top of it.
         self._reflection_inflight: bool = False
 
+        # ── Paste-as-block ────────────────────────────────────────────
+        # Large pastes are collapsed into a single-line placeholder
+        # ("[pasted #N: L lines, C chars]") so the input area stays
+        # compact. The real content lives in `_paste_blocks` keyed by
+        # the exact placeholder string; the Enter handler expands every
+        # known placeholder back to its original content before
+        # submitting. Cleared at submit / /clear.
+        self._paste_blocks: dict = {}
+        self._paste_seq: int = 0
+        # Pastes smaller than these thresholds are inserted verbatim —
+        # collapsing a 2-line paste would feel surprising.
+        self._paste_collapse_lines: int = 3
+        self._paste_collapse_chars: int = 200
+
         self.history_file = os.path.expanduser("~/.ezclaw_history")
         self.prompt_history = FileHistory(self.history_file)
 
@@ -204,11 +462,16 @@ class ChatUI:
             'frame.border': f'{DIM}',
         })
 
-        # Mouse capture is toggleable so the user can drop into terminal-native
-        # text selection (F2). When True, prompt_toolkit owns the mouse (enables
-        # our ScrollUp/Down bindings); when False, the terminal handles
-        # click-drag selection so the user can copy text from the chat.
-        self._mouse_capture = True
+        # Mouse capture: OFF by default so click-drag selection works
+        # in the terminal natively (the user can copy chat output with
+        # their terminal's normal Ctrl+Shift+C / Cmd+C / right-click).
+        # F2 toggles it ON to re-enable our ScrollUp/Down bindings
+        # (PgUp/PgDn / Home/End / Up/Down arrows still scroll regardless
+        # of this setting, so most users never need to flip it).
+        # Defaulting OFF: most users want to copy, far fewer rely on
+        # mouse-wheel scrolling — and the keyboard scroll keys cover
+        # that case anyway.
+        self._mouse_capture = False
         self.app = Application(
             layout=self.layout,
             key_bindings=self.kb,
@@ -216,6 +479,84 @@ class ChatUI:
             full_screen=True,
             mouse_support=Condition(lambda: self._mouse_capture),
         )
+
+        # ── feed_multiple wrapper ──────────────────────────────────────
+        # Wraps the input loop's batch path with TWO behaviors:
+        #
+        # 1. ALWAYS: filter out the "split unknown CSI sequence" pattern.
+        #    When prompt_toolkit's Vt100Parser sees a sequence it doesn't
+        #    recognize (e.g. \x1b[3;199~), it gives up and delivers each
+        #    character as a separate KeyPress: Keys.Escape, then '[',
+        #    '3', ';', '1', '9', '9', '~'. The non-escape chars then get
+        #    inserted into the input buffer as literal text — which is
+        #    why unmapped modified keys (DEL, F-keys, etc.) leaked
+        #    garbage in the prompt. We detect that pattern at the
+        #    feed_multiple boundary and drop the whole split sequence.
+        #
+        # 2. OPTIONAL (EZCLAW_KEYDEBUG=1): log every keypress's resolved
+        #    Key + raw byte data to /tmp/ezclaw_keys.log for diagnostics.
+        _original_feed_multiple = self.app.key_processor.feed_multiple
+        from prompt_toolkit.keys import Keys as _PtKeys2
+        _NOISE_KEYS = {_PtKeys2.Vt100MouseEvent, _PtKeys2.CPRResponse}
+        _KEYDEBUG = bool(os.environ.get("EZCLAW_KEYDEBUG"))
+
+        # CSI terminator: a letter (A-Z, a-z) or '~'. Stops scanning the
+        # split body so we know where the orphaned sequence ends.
+        def _is_csi_terminator(ch: str) -> bool:
+            return len(ch) == 1 and (ch.isalpha() or ch == "~")
+
+        def _filter_split_csi(key_presses):
+            """Drop runs that look like [Keys.Escape, '[', <body>, terminator].
+            Leaves recognized single-KeyPress sequences (Keys.Left, etc.)
+            untouched because they aren't split."""
+            out = []
+            i = 0
+            n = len(key_presses)
+            while i < n:
+                kp = key_presses[i]
+                if kp.key == _PtKeys2.Escape and i + 1 < n:
+                    nxt = key_presses[i + 1]
+                    if isinstance(nxt.data, str) and nxt.data == "[":
+                        # Find the terminator (CSI runs end on a letter or '~').
+                        j = i + 2
+                        while j < n and not _is_csi_terminator(key_presses[j].data):
+                            j += 1
+                        if j < n:
+                            # Drop [i .. j] (inclusive of terminator).
+                            i = j + 1
+                            continue
+                        # No terminator yet — keep the Esc, let the parser
+                        # accumulate more bytes next read.
+                out.append(kp)
+                i += 1
+            return out
+
+        def _wrapped_feed_multiple(key_presses, first=False):
+            filtered = _filter_split_csi(key_presses)
+            if _KEYDEBUG:
+                try:
+                    with open("/tmp/ezclaw_keys.log", "a") as _f:
+                        if len(filtered) != len(key_presses):
+                            _f.write(
+                                f"{time.strftime('%H:%M:%S')}  dropped {len(key_presses) - len(filtered)} bytes from unknown CSI\n"
+                            )
+                        for kp in filtered:
+                            if kp.key in _NOISE_KEYS:
+                                continue
+                            _f.write(
+                                f"{time.strftime('%H:%M:%S')}  key={kp.key!r:<22}  data={kp.data!r}\n"
+                            )
+                except Exception:
+                    pass
+            return _original_feed_multiple(filtered, first=first)
+
+        self.app.key_processor.feed_multiple = _wrapped_feed_multiple
+        if _KEYDEBUG:
+            try:
+                with open("/tmp/ezclaw_keys.log", "a") as _f:
+                    _f.write(f"\n--- ezclaw session start {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
+            except Exception:
+                pass
 
         self.welcome_shown = False
 
@@ -690,6 +1031,45 @@ class ChatUI:
             self._update_ui()
             event.app.invalidate()
 
+        # Editor pane scrolling. Alt+Up / Alt+Down scroll by one line;
+        # Alt+PageUp / Alt+PageDown scroll by ten. Only fires when the
+        # editor pane is currently rendered (toggle on + an open file).
+        # Reaches editor_window.vertical_scroll directly — the same
+        # mechanism the chat scrollback uses for its history window.
+        _editor_visible = Condition(
+            lambda: self._show_editor and bool(self._open_files)
+        )
+
+        @self.kb.add('escape', 'up', filter=_editor_visible)
+        def _editor_scroll_up(event):
+            self.editor_window.vertical_scroll = max(
+                0, self.editor_window.vertical_scroll - 1
+            )
+            event.app.invalidate()
+
+        @self.kb.add('escape', 'down', filter=_editor_visible)
+        def _editor_scroll_down(event):
+            self.editor_window.vertical_scroll += 1
+            event.app.invalidate()
+
+        @self.kb.add('escape', 'pageup', filter=_editor_visible)
+        def _editor_pageup(event):
+            self.editor_window.vertical_scroll = max(
+                0, self.editor_window.vertical_scroll - 10
+            )
+            event.app.invalidate()
+
+        @self.kb.add('escape', 'pagedown', filter=_editor_visible)
+        def _editor_pagedown(event):
+            self.editor_window.vertical_scroll += 10
+            event.app.invalidate()
+
+        # Reset scroll to top whenever the user cycles tabs or opens a
+        # new file — feels more natural than landing in the middle of
+        # the new file's content at the previous file's scroll offset.
+        # (The actual reset happens in _cycle_editor_tab and
+        # _open_or_update_file via direct vertical_scroll = 0 calls.)
+
         # Authorization keys (active only while an auth_required panel
         # is up — see self.auth_active). Semantics:
         #   Y  remember THIS tool for the rest of the session (most common
@@ -700,21 +1080,28 @@ class ChatUI:
         #      one call but stay strict on the rest).
         #   A  allow ALL tools session-wide.
         #   N  deny this call (no state change).
-        @self.kb.add('y', filter=Condition(lambda: self.auth_active))
-        def _(event):
-            self.auth_queue.put("allow_tool")
+        #
+        # Both lowercase AND uppercase bound for each — the panel shows
+        # `[Y]` `[O]` `[N]` `[A]` in uppercase, and users naturally press
+        # Shift+letter (especially with CapsLock on or on small phone
+        # keyboards). Without the uppercase binding, those keypresses
+        # produced no action and the user saw the panel re-appear on
+        # the next tool call because no auth had actually been granted.
+        _auth_filter = Condition(lambda: self.auth_active)
 
-        @self.kb.add('o', filter=Condition(lambda: self.auth_active))
-        def _(event):
-            self.auth_queue.put("allow")
+        def _auth(answer: str):
+            def _h(event):
+                self.auth_queue.put(answer)
+            return _h
 
-        @self.kb.add('n', filter=Condition(lambda: self.auth_active))
-        def _(event):
-            self.auth_queue.put("deny")
-
-        @self.kb.add('a', filter=Condition(lambda: self.auth_active))
-        def _(event):
-            self.auth_queue.put("allow_session")
+        for _k in ("y", "Y"):
+            self.kb.add(_k, filter=_auth_filter)(_auth("allow_tool"))
+        for _k in ("o", "O"):
+            self.kb.add(_k, filter=_auth_filter)(_auth("allow"))
+        for _k in ("n", "N"):
+            self.kb.add(_k, filter=_auth_filter)(_auth("deny"))
+        for _k in ("a", "A"):
+            self.kb.add(_k, filter=_auth_filter)(_auth("allow_session"))
 
         # Reasoning panel toggle (Tier 2.1) — Ctrl+R flips
         # show_reasoning. /reasoning command does the same via _handle_command.
@@ -723,42 +1110,363 @@ class ChatUI:
             self.show_reasoning = not self.show_reasoning
             self._update_ui()
 
+        # Ctrl/Alt+Backspace → delete previous word. The synthetic key
+        # WORD_DELETE_BACK (F21) catches every modifier+lock permutation
+        # mapped at module top. Implementation walks left across
+        # trailing whitespace, then across non-whitespace, and deletes
+        # the span — same shape as readline's `backward-kill-word`.
+        @self.kb.add(WORD_DELETE_BACK, filter=Condition(lambda: not self.auth_active))
+        def _delete_word_back(event):
+            buf = event.current_buffer
+            text = buf.text
+            pos = buf.cursor_position
+            if pos == 0:
+                return
+            # Skip trailing whitespace immediately left of cursor.
+            i = pos
+            while i > 0 and text[i - 1].isspace():
+                i -= 1
+            # Then skip the word itself (non-whitespace).
+            while i > 0 and not text[i - 1].isspace():
+                i -= 1
+            if i < pos:
+                buf.text = text[:i] + text[pos:]
+                buf.cursor_position = i
+
+        # Swallow Ctrl+Z so it doesn't leak its raw byte data into the
+        # input buffer. Observed in kitty + NumLock: pressing Ctrl+Z
+        # resolved to Keys.ControlZ but no binding fired, and
+        # prompt_toolkit's default fallback surfaced the literal
+        # sequence in the prompt as garbled characters. Explicit no-op
+        # consumes the event cleanly. Other Ctrl+letter keys with
+        # legitimate conventional meanings (Ctrl+L clear screen,
+        # Ctrl+P / Ctrl+N history, Ctrl+W word-delete, etc.) are left
+        # alone so prompt_toolkit's default TextArea bindings apply.
+        @self.kb.add('c-z', filter=Condition(lambda: not self.auth_active))
+        def _(event):
+            pass
+
+        # (The Keys.Any catch-all that used to live here was removed —
+        # it took precedence over the Buffer's default cursor-movement
+        # bindings, so plain arrow keys stopped working. The actual fix
+        # for unmapped-CSI-sequence leaks lives in the feed_multiple
+        # wrapper in __init__, which filters out the entire
+        # "Keys.Escape + split per-char CSI body" pattern before the
+        # KeyProcessor sees it. That fixes the leak at parse time
+        # without intercepting any recognized key.)
+
         # Skill-offer Y/N — active only when a draft is parked and no
         # auth prompt is competing for the same keys.
         _skill_offer_pending = Condition(
             lambda: self._pending_skill_offer is not None and not self.auth_active
         )
 
-        @self.kb.add('y', filter=_skill_offer_pending)
-        def _(event):
-            self._accept_skill_offer()
-
-        @self.kb.add('n', filter=_skill_offer_pending)
-        def _(event):
-            self._decline_skill_offer()
+        # Both cases bound, same reason as the auth keys above —
+        # Shift+Y / CapsLock'd Y otherwise produced no action.
+        for _k in ("y", "Y"):
+            self.kb.add(_k, filter=_skill_offer_pending)(lambda e: self._accept_skill_offer())
+        for _k in ("n", "N"):
+            self.kb.add(_k, filter=_skill_offer_pending)(lambda e: self._decline_skill_offer())
 
         @self.kb.add('enter', filter=Condition(lambda: not self.auth_active))
         def _(event):
-            text = self.input_field.text.strip()
-            if text:
-                # Add to history
-                self.input_field.buffer.append_to_history()
+            # Submit on plain Enter UNLESS the buffer ends with a
+            # backslash — in which case the user signaled "this Enter
+            # is a newline, not a submit" with the trailing `\`. We
+            # remove the backslash and insert `\n` instead. This is
+            # the always-works escape for terminals that can't send
+            # Shift+Enter distinctly (macOS Terminal.app, default
+            # GNOME Terminal, etc.) — every terminal in existence can
+            # type a `\` followed by Enter.
+            buf = self.input_field.buffer
+            text = buf.text
+            if text.endswith("\\"):
+                buf.text = text[:-1] + "\n"
+                buf.cursor_position = len(buf.text)
+                return
+            stripped = text.strip()
+            if stripped:
+                # Expand paste placeholders back to their original
+                # content before submitting. A placeholder that the
+                # user deleted partially won't match exactly and stays
+                # as literal text in the submission — acceptable
+                # trade-off; the user can re-paste if they wanted the
+                # block back.
+                if self._paste_blocks:
+                    for placeholder, content in list(self._paste_blocks.items()):
+                        if placeholder in stripped:
+                            stripped = stripped.replace(placeholder, content)
+                    # Turn boundary — drop the cached blocks so a future
+                    # paste with the same #N doesn't collide.
+                    self._paste_blocks.clear()
+                # Add to history (the placeholder form, not the expanded
+                # one — keeps Up-arrow recall compact).
+                buf.append_to_history()
                 self.input_field.text = ""
-                self.handle_input(text)
+                self.handle_input(stripped)
 
-        # Mouse scroll speed improvements
+        # Newline insertion for the multiline input.
+        #
+        # Plan: Enter submits, Shift+Enter inserts a newline. Most
+        # terminals send the same byte for Shift+Enter as for Enter
+        # (both = `\r`), so the application layer can't tell them apart
+        # at the byte stream level. To make Shift+Enter work the way
+        # users expect (and the way Claude Code's CLI does it), we:
+        #   1. Enable two keyboard protocols at app startup (see
+        #      `_enable_extended_keyboard_modes` called from `run()`):
+        #      xterm modifyOtherKeys level 2 and kitty CSI u. With
+        #      either active, the terminal sends a distinct escape
+        #      sequence for Shift+Enter instead of plain `\r`.
+        #   2. Override the ANSI_SEQUENCES table (top of this module)
+        #      so prompt_toolkit's parser routes those distinct
+        #      sequences to a synthetic `SHIFT_ENTER` key (F24) instead
+        #      of aliasing them back to ControlM.
+        #   3. Bind SHIFT_ENTER below to insert `\n`.
+        #
+        # Fallbacks for terminals that DON'T support either protocol:
+        #   - `c-j` (Ctrl+J)         — the literal `\n` byte; works
+        #                              universally.
+        #   - `escape, enter`        — prompt_toolkit's documented
+        #                              alt-enter convention; also fires
+        #                              when many terminals send the
+        #                              Esc+Enter pair for Alt+Enter.
+        # Plain insert-newline handler. The earlier diagnostic version
+        # logged WHICH key fired to /tmp/ezclaw_keys.log — that's now
+        # gated on EZCLAW_KEYDEBUG above (via the feed_multiple wrap),
+        # which captures everything anyway, so this stays clean.
+        def _make_newline_handler(label: str):
+            def _h(event):
+                event.current_buffer.insert_text("\n")
+            return _h
+
+        # Shift+Enter — works on terminals that honor either kitty
+        # CSI u (\x1b[13;2u) or xterm modifyOtherKeys level 2
+        # (\x1b[27;2;13~). Those sequences are rerouted to Keys.F24 at
+        # module top, and _enable_extended_keyboard_modes asks the
+        # terminal to emit them.
+        self.kb.add(SHIFT_ENTER, filter=Condition(lambda: not self.auth_active))(
+            _make_newline_handler("Shift+Enter (Keys.F24)")
+        )
+        # Ctrl+Enter — same idea, distinct rerouting (Keys.F23).
+        self.kb.add(CTRL_ENTER, filter=Condition(lambda: not self.auth_active))(
+            _make_newline_handler("Ctrl+Enter (Keys.F23)")
+        )
+        # Universal fallbacks: Ctrl+J (the literal newline byte) and
+        # Esc-then-Enter / Alt+Enter — both work in every terminal,
+        # including ones that don't support the extended protocols.
+        self.kb.add('c-j', filter=Condition(lambda: not self.auth_active))(
+            _make_newline_handler("Ctrl+J")
+        )
+        self.kb.add('escape', 'enter', filter=Condition(lambda: not self.auth_active))(
+            _make_newline_handler("Esc,Enter / Alt+Enter")
+        )
+
+        # Bracketed paste: collapse large blobs into a single-line
+        # placeholder. prompt_toolkit's bracketed-paste handler ships
+        # the full pasted body as `event.data`. Without this, pasting
+        # 100 lines into the prompt would expand the input box to its
+        # full height; users typically want the SEND action, not to
+        # edit the pasted content. Small pastes (<3 lines, <200 chars)
+        # are inserted verbatim so a one-line code snippet still feels
+        # natural.
+        @self.kb.add(Keys.BracketedPaste, filter=Condition(lambda: not self.auth_active))
+        def _on_paste(event):
+            pasted = event.data or ""
+            line_count = pasted.count("\n") + 1 if pasted else 0
+            char_count = len(pasted)
+            if (
+                line_count < self._paste_collapse_lines
+                and char_count < self._paste_collapse_chars
+            ):
+                event.current_buffer.insert_text(pasted)
+                return
+            self._paste_seq += 1
+            placeholder = (
+                f"[pasted #{self._paste_seq}: "
+                f"{line_count} line{'s' if line_count != 1 else ''}, "
+                f"{char_count} char{'s' if char_count != 1 else ''}]"
+            )
+            self._paste_blocks[placeholder] = pasted
+            event.current_buffer.insert_text(placeholder)
+
+        # Up / Down for the multiline input.
+        #
+        # TextArea(history=...) defaults to binding Up/Down to history
+        # navigation buffer-wide, so even with multiple lines composed
+        # the cursor couldn't move between them. Bind explicit
+        # app-level handlers that use the canonical prompt_toolkit
+        # Buffer methods:
+        #   - cursor_up()       — move cursor up one row (or no-op at top)
+        #   - cursor_down()     — move cursor down one row (or no-op at bottom)
+        #   - history_backward() / history_forward() at the line boundary
+        #
+        # No focus filter: app-level bindings already only fire when the
+        # app is taking input, and getting the wrong buffer is fine
+        # because event.current_buffer points to the focused one.
+        # Up / Down in the input field:
+        #   - if there's a line above/below, move the cursor between
+        #     lines (real multi-line editing)
+        #   - at the boundary, fall through to scrolling the CHAT
+        #     HISTORY window — NOT prompt history. Calling
+        #     history_backward() here used to nuke the user's typed
+        #     buffer with a recalled past prompt, which felt broken.
+        #
+        # If you actually want prompt-history recall, prompt_toolkit's
+        # default buffer bindings keep Ctrl+P (previous) and Ctrl+N
+        # (next) available — those don't interfere with the
+        # natural-feeling chat-scroll behavior on Up/Down.
+        _kd = bool(os.environ.get("EZCLAW_KEYDEBUG"))
+
+        def _arrow_log(direction, buf):
+            if not _kd:
+                return
+            try:
+                with open("/tmp/ezclaw_keys.log", "a") as _f:
+                    _f.write(
+                        f"{time.strftime('%H:%M:%S')}  arrow {direction}: "
+                        f"row={buf.document.cursor_position_row} "
+                        f"col={buf.document.cursor_position_col} "
+                        f"line_count={buf.document.line_count} "
+                        f"text={buf.text[:60]!r}\n"
+                    )
+            except Exception:
+                pass
+
+        @self.kb.add('up', filter=Condition(lambda: not self.auth_active), eager=True)
+        def _(event):
+            buf = event.current_buffer
+            _arrow_log("UP", buf)
+            if buf.document.cursor_position_row > 0:
+                buf.cursor_up()
+            else:
+                # Boundary: scroll chat history up by moving the history
+                # buffer's cursor. See the ScrollUp comment for why we
+                # can't just set vertical_scroll.
+                self.history_buffer.cursor_up(count=3)
+                event.app.invalidate()
+
+        @self.kb.add('down', filter=Condition(lambda: not self.auth_active), eager=True)
+        def _(event):
+            buf = event.current_buffer
+            _arrow_log("DOWN", buf)
+            if buf.document.cursor_position_row < buf.document.line_count - 1:
+                buf.cursor_down()
+            else:
+                # Boundary: scroll chat history down. See ScrollUp comment.
+                self.history_buffer.cursor_down(count=3)
+                event.app.invalidate()
+
+        # Helpers for treating `[pasted #N: ...]` placeholders as atomic
+        # units when navigating / deleting. Each helper scans the live
+        # placeholder set, so they're cheap when there are no pastes
+        # active and only do real work in the (rare) turns where one is.
+        def _placeholder_ending_at(text, pos):
+            """Return placeholder string if `text[:pos]` ends with one."""
+            if not self._paste_blocks:
+                return None
+            for placeholder in self._paste_blocks:
+                if text[:pos].endswith(placeholder):
+                    return placeholder
+            return None
+
+        def _placeholder_starting_at(text, pos):
+            """Return placeholder string if `text[pos:]` starts with one."""
+            if not self._paste_blocks:
+                return None
+            for placeholder in self._paste_blocks:
+                if text[pos:].startswith(placeholder):
+                    return placeholder
+            return None
+
+        # Left / Right wrap at \n boundaries AND skip placeholders as
+        # one atomic unit. Default Keys.Left stopped at column 0; we
+        # also need to teach it about placeholders so the cursor never
+        # lands inside `[pasted #N: ...]`.
+        @self.kb.add('left', filter=Condition(lambda: not self.auth_active), eager=True)
+        def _(event):
+            buf = event.current_buffer
+            _arrow_log("LEFT", buf)
+            text = buf.text
+            pos = buf.cursor_position
+            if pos <= 0:
+                return
+            ph = _placeholder_ending_at(text, pos)
+            if ph is not None:
+                # Cursor is right after a placeholder — jump to its start.
+                buf.cursor_position = pos - len(ph)
+                return
+            buf.cursor_position = pos - 1
+
+        @self.kb.add('right', filter=Condition(lambda: not self.auth_active), eager=True)
+        def _(event):
+            buf = event.current_buffer
+            _arrow_log("RIGHT", buf)
+            text = buf.text
+            pos = buf.cursor_position
+            if pos >= len(text):
+                return
+            ph = _placeholder_starting_at(text, pos)
+            if ph is not None:
+                # Cursor is right before a placeholder — jump past it.
+                buf.cursor_position = pos + len(ph)
+                return
+            buf.cursor_position = pos + 1
+
+        # Smart Backspace: at the end of a paste placeholder, one
+        # Backspace deletes the WHOLE placeholder AND drops its entry
+        # from `_paste_blocks` (so the collapsed paste is fully
+        # un-staged from the eventual submit). Otherwise normal
+        # single-char delete.
+        @self.kb.add('c-h', filter=Condition(lambda: not self.auth_active), eager=True)
+        def _smart_backspace(event):
+            buf = event.current_buffer
+            text = buf.text
+            pos = buf.cursor_position
+            if pos <= 0:
+                return
+            ph = _placeholder_ending_at(text, pos)
+            if ph is not None:
+                start = pos - len(ph)
+                buf.text = text[:start] + text[pos:]
+                buf.cursor_position = start
+                self._paste_blocks.pop(ph, None)
+                return
+            buf.text = text[:pos - 1] + text[pos:]
+            buf.cursor_position = pos - 1
+
+        # Smart Delete (forward-delete). At the start of a paste
+        # placeholder, one DEL deletes the whole placeholder + drops
+        # its entry. Otherwise normal single-char forward delete.
+        @self.kb.add('delete', filter=Condition(lambda: not self.auth_active), eager=True)
+        def _smart_delete(event):
+            buf = event.current_buffer
+            text = buf.text
+            pos = buf.cursor_position
+            if pos >= len(text):
+                return
+            ph = _placeholder_starting_at(text, pos)
+            if ph is not None:
+                end = pos + len(ph)
+                buf.text = text[:pos] + text[end:]
+                self._paste_blocks.pop(ph, None)
+                return
+            buf.text = text[:pos] + text[pos + 1:]
+
+        # Chat-history scrolling. We move `history_buffer.cursor_position`
+        # (via cursor_up/cursor_down) rather than poking the Window's
+        # `vertical_scroll` directly — prompt_toolkit clamps vertical_scroll
+        # on every render to keep the cursor visible, so writing it without
+        # also moving the cursor snaps right back on the next animation
+        # tick. To the user that looks like "scrolling does nothing."
         @self.kb.add(Keys.ScrollUp)
         def _(event):
-            # Scroll the history window up by 3 lines
-            self.history_window.vertical_scroll = max(0, self.history_window.vertical_scroll - 3)
+            self.history_buffer.cursor_up(count=3)
+            event.app.invalidate()
 
         @self.kb.add(Keys.ScrollDown)
         def _(event):
-            # Scroll the history window down by 3 lines
-            if self.history_window.render_info:
-                # We can't easily know the max scroll without render_info
-                # But we can just increment and prompt_toolkit will clamp it
-                self.history_window.vertical_scroll += 3
+            self.history_buffer.cursor_down(count=3)
+            event.app.invalidate()
 
         @self.kb.add('end')
         def _(event):
@@ -770,23 +1478,21 @@ class ChatUI:
         @self.kb.add('home')
         def _(event):
             # Jump to top of history.
-            self.history_window.vertical_scroll = 0
+            self.history_buffer.cursor_position = 0
             event.app.invalidate()
 
         @self.kb.add('pageup')
         def _(event):
             info = self.history_window.render_info
             jump = info.window_height - 1 if info else 10
-            self.history_window.vertical_scroll = max(
-                0, self.history_window.vertical_scroll - jump
-            )
+            self.history_buffer.cursor_up(count=jump)
             event.app.invalidate()
 
         @self.kb.add('pagedown')
         def _(event):
             info = self.history_window.render_info
             jump = info.window_height - 1 if info else 10
-            self.history_window.vertical_scroll += jump
+            self.history_buffer.cursor_down(count=jump)
             event.app.invalidate()
 
     def _create_layout(self):
@@ -804,10 +1510,23 @@ class ChatUI:
         self.status_control = FormattedTextControl(self._get_status_text)
         self.status_window = Window(content=self.status_control, height=1, style='class:status')
 
+        # Multiline TextArea — required for the prompt to handle pasted
+        # multi-line content as a single block instead of firing one
+        # submit per pasted newline (the old `multiline=False` interpreted
+        # every embedded `\n` as a press of Enter, so a 5-line paste
+        # produced 5 garbled half-turns).
+        #
+        # The `enter` keybinding below still submits the buffer; Shift+
+        # Enter, Ctrl+J, and Esc-then-Enter insert a literal newline so
+        # the user can compose multi-line prompts. The visible height
+        # grows with content (1 → 8 lines) so short prompts stay
+        # one-line while pastes / multi-line composition expand naturally.
         self.input_field = TextArea(
-            height=3,
+            height=D(min=1, max=8, preferred=1),
             prompt="ezclaw > ",
-            multiline=False,
+            multiline=True,
+            wrap_lines=True,
+            scrollbar=True,
             history=self.prompt_history,
         )
 
@@ -816,12 +1535,17 @@ class ChatUI:
         # least one file is open — keeps the chat full-width when the
         # agent isn't writing code.
         self.editor_control = FormattedTextControl(self._get_editor_text)
-        editor_window = Window(
+        # Make the editor pane scrollable: a ScrollbarMargin lets the
+        # user see scroll position, and `vertical_scroll` on the window
+        # can be adjusted via the Alt+Up / Alt+Down bindings below.
+        # Stored on self so the binding handlers can reach it.
+        self.editor_window = Window(
             content=self.editor_control,
             wrap_lines=False,
             width=64,
+            right_margins=[ScrollbarMargin(display_arrows=True)],
         )
-        editor_frame = Frame(editor_window, title="Editor")
+        editor_frame = Frame(self.editor_window, title="Editor")
         editor_container = ConditionalContainer(
             content=editor_frame,
             filter=Condition(lambda: self._show_editor and bool(self._open_files)),
@@ -850,12 +1574,35 @@ class ChatUI:
             filter=Condition(lambda: self._interactive_session is not None),
         )
 
+        # One-line hint below the input frame telling the user how to
+        # insert a newline. Shift+Enter only works on terminals that
+        # support kitty CSI u or xterm modifyOtherKeys — most don't.
+        # Three escape paths in order of universality:
+        #   1. `\` + Enter  → ALWAYS works (the Enter handler treats a
+        #                     trailing backslash as "insert newline,
+        #                     don't submit"). Pure-software, terminal-
+        #                     independent.
+        #   2. Ctrl+J       → ALWAYS works (it's the literal newline byte).
+        #   3. Alt+Enter    → works when the terminal sends Alt as Esc-
+        #                     prefix (most Linux terminals, iTerm2 in
+        #                     "Esc+" mode).
+        self._newline_hint_control = FormattedTextControl(
+            lambda: [("class:status #7a7570 italic",
+                      "  ⏎ Enter: send   ·   newline:  Ctrl+J   or   Alt+Enter   or   end line with \\ + Enter  ")]
+        )
+        newline_hint_window = Window(
+            content=self._newline_hint_control,
+            height=1,
+            style="class:status",
+        )
+
         return Layout(
             HSplit([
                 chat_plus_editor,
                 shell_pane_container,
                 self.status_window,
-                Frame(self.input_field, height=5)
+                Frame(self.input_field, height=D(min=3, max=10, preferred=3)),
+                newline_hint_window,
             ]),
             focused_element=self.input_field
         )
@@ -977,11 +1724,14 @@ class ChatUI:
             return ANSI("")
         tool = session.get("tool") or {}
         live_buffer = tool.get("_live_buffer") or []
-        # Bytes → text, tolerating partial UTF-8.
+        # Bytes → text, tolerating partial UTF-8. Then sanitize: subprocess
+        # cursor / screen-clear escapes would pass through ANSI() and
+        # corrupt the host terminal's layout. SGR colors survive.
         try:
             text = b"".join(live_buffer).decode("utf-8", errors="replace")
         except Exception:
             text = ""
+        text = _sanitize_subprocess_text(text)
         lines = text.splitlines()
         if len(lines) > 80:
             lines = lines[-80:]
@@ -1021,6 +1771,9 @@ class ChatUI:
                 existing["revealed_chars"] = 0
             else:
                 existing["revealed_chars"] = len(content or "")
+        # New/updated file → start at top of pane.
+        if hasattr(self, "editor_window"):
+            self.editor_window.vertical_scroll = 0
 
     def _cycle_editor_tab(self, direction: int) -> None:
         """Advance the active editor tab by `direction` (±1)."""
@@ -1033,6 +1786,9 @@ class ChatUI:
             idx = 0
         new_idx = (idx + direction) % len(paths)
         self._active_editor_path = paths[new_idx]
+        # Switching tabs → reset scroll to top of the new file.
+        if hasattr(self, "editor_window"):
+            self.editor_window.vertical_scroll = 0
 
     def _get_editor_text(self):
         """Return ANSI for the right-side editor panel (Feature 3).
@@ -1087,7 +1843,13 @@ class ChatUI:
         if revealed_n < target:
             header.append(f"  {revealed_n}/{target}", style=f"italic {DIM}")
 
-        # Syntax-highlight what's been revealed so far. Cap at 200 lines.
+        # Syntax-highlight the full revealed content. The window's
+        # vertical_scroll determines which slice is on-screen (set by
+        # the Alt+Up / Alt+Down / Alt+PageUp / Alt+PageDown bindings).
+        # Hard cap at 2000 lines for safety — beyond that, rendering
+        # every UI tick gets expensive. Tail-truncated so the most-
+        # recent content (typically what the agent just wrote) is the
+        # visible portion when first opened.
         ext = os.path.splitext(path)[1].lower().lstrip(".")
         lang_map = {
             "py": "python", "js": "javascript", "ts": "typescript",
@@ -1098,7 +1860,7 @@ class ChatUI:
             "html": "html", "css": "css",
         }
         lang = lang_map.get(ext, "text")
-        max_lines = 200
+        max_lines = 2000
         lines = revealed.splitlines()
         truncated = False
         if len(lines) > max_lines:
@@ -1108,7 +1870,7 @@ class ChatUI:
         renderables = [tabs, header]
         if truncated:
             renderables.append(Text(
-                f"… (showing last {max_lines} of {len(revealed.splitlines())} lines)",
+                f"… (showing last {max_lines} of {len(revealed.splitlines())} lines — file too large to render in full)",
                 style=DIM,
             ))
         if body:
@@ -1236,7 +1998,7 @@ class ChatUI:
                 DOT,
                 (BG + "#7fd070", f"⚙{n_tools}"),
                 DOT,
-                (BG + "#ff8c5c", f"{elapsed:.1f}s"),
+                (BG + "#ff8c5c", _fmt_duration(elapsed)),
             ])
 
         # ── Group 4: reflection (subtle, one segment, dim) ────────────
@@ -1258,8 +2020,11 @@ class ChatUI:
 
         # ── Group 5: active toggles (only when non-default) ───────────
         badges: list = []
-        if not self._mouse_capture:
-            badges.append((BG + "bold #ff8c5c", "✂ COPY"))
+        # _mouse_capture defaults False (terminal-native selection on).
+        # Show a badge only in the unusual ON state where prompt_toolkit
+        # owns mouse events for scrolling and selection is disabled.
+        if self._mouse_capture:
+            badges.append((BG + "bold #ff8c5c", "🖱 SCROLL (F2 = copy)"))
         if self._show_editor and self._open_files:
             n = len(self._open_files)
             badges.append((BG + "bold #7fd070", f"⊟ EDITOR ({n})" if n > 1 else "⊟ EDITOR"))
@@ -1307,13 +2072,17 @@ class ChatUI:
         parts = []
         # ── Layout order (top → bottom) ────────────────────────────────────
         # 1. Side messages         — context notes (memory stored, etc).
-        # 2. Assistant response    — the model output, first thing read.
-        # 3. Unattached tools      — tool calls not nested under a plan task.
-        # 4. Bottom slot (one of):
+        # 2. Unattached tools      — tool calls not nested under a plan task.
+        # 3. Bottom slot (one of):
         #      - Auth prompt       (when waiting on Y/O/N/A)
         #      - ask_user question (when the agent asked for input)
         #      - Skill offer       (when a draft skill is parked for Y/N)
-        #      - Unified panel     (plan tree + reasoning timeline)
+        #      - Unified panel     (plan tree)
+        # 4. Assistant response    — the model's final reply, BELOW the
+        #                            panel that produced it. Previously
+        #                            sat above the panel which read as
+        #                            "answer first, then the work that
+        #                            produced it" — backwards.
         # 5. Spinner               — role-aware status line, last.
         #
         # Tools attached to a plan step nest inside the unified panel under
@@ -1324,12 +2093,7 @@ class ChatUI:
         for msg in self.side_messages[-3:]:
             parts.append(Text(msg, style=f"dim {DIM} italic"))
 
-        # 2. Assistant response.
-        current_content = "".join(self.current_response_parts)
-        if current_content:
-            parts.append(Markdown(current_content))
-
-        # 3. Unattached tool panels — tools that ran outside any plan
+        # 2. Unattached tool panels — tools that ran outside any plan
         # task. Plan-attached tools render inside the unified panel
         # via _render_nested_tool_row.
         for idx, tool in enumerate(self.tool_executions, 1):
@@ -1337,7 +2101,7 @@ class ChatUI:
                 continue
             parts.append(self._build_tool_panel(tool, idx))
 
-        # 4. Bottom slot: exactly one of {auth, question, skill offer,
+        # 3. Bottom slot: exactly one of {auth, question, skill offer,
         # unified panel} renders here. Auth and ask_user are blocking on
         # user input so they take precedence over the plan/reasoning.
         if self.auth_active and self.current_auth_chunk:
@@ -1389,6 +2153,13 @@ class ChatUI:
             if unified_panel is not None:
                 parts.append(unified_panel)
 
+        # 4. Assistant response — rendered AFTER the unified panel so the
+        # user reads "plan → result" top-to-bottom. Previously this sat
+        # at position 2 (above the panel), which made the response feel
+        # disconnected from the work that produced it.
+        current_content = "".join(self.current_response_parts)
+        if current_content:
+            parts.append(Markdown(current_content))
 
         if self.is_generating:
             elapsed = time.time() - self.generation_start_time
@@ -1401,7 +2172,7 @@ class ChatUI:
             status_text = Text()
             status_text.append(f" {MASCOT}", style=f"bold {mascot_color}")
             status_text.append(f" {rs.icon} ", style=f"bold {rs.color}")
-            status_text.append(f"{self.current_status}  [{elapsed:.1f}s]", style=f"bold {rs.color}")
+            status_text.append(f"{self.current_status}  [{_fmt_duration(elapsed)}]", style=f"bold {rs.color}")
             if idle_time > 15:
                 status_text.append(f"  ⚠ idle {idle_time:.0f}s", style=f"bold {WARN}")
             spinner = self._spinner_for(self.current_role)
@@ -1564,144 +2335,51 @@ class ChatUI:
                 render_subtree(root, 0)
             body_renderables.extend(plan_lines)
 
-        # ── Divider + reasoning section ────────────────────────────────
-        steps = self._group_reasoning_into_steps() if has_reasoning else []
-        n_steps = len(steps)
-
-        if has_reasoning:
-            if has_plan:
-                # Slim divider separating the two sections inside one panel.
-                divider = Text()
-                divider.append("  ── Reasoning ", style=f"dim {REASON_COLOR}")
-                divider.append("─" * 40, style=f"dim {DIM}")
-                body_renderables.append(divider)
-
-            if not self.show_reasoning:
-                # Collapsed: one-line chip pointing at the latest step.
-                head = steps[-1]["head"] if steps else {"body": "", "label": ""}
-                preview = head["body"].split("·")[0].strip()
-                if len(preview) > 80:
-                    preview = preview[:77] + "…"
-                chip = Text()
-                chip.append(f"  🧠 reasoning · step {n_steps} · ",
-                            style=f"dim {REASON_COLOR}")
-                chip.append(preview, style=f"italic dim {REASON_COLOR}")
-                chip.append("   [Ctrl+R] expand", style=f"dim {DIM}")
-                body_renderables.append(chip)
-            else:
-                status_glyphs = {
-                    "done":        ("●", "#5fd75f"),
-                    "in_progress": ("▸", "#5fafff"),
-                    "failed":      ("✗", "#e85a5a"),
-                }
-                sub_glyphs = {
-                    "agent": "✦",
-                    "skill": "⚑",
-                    "self_check": "⚐",
-                }
-                visible_steps = steps[-12:]
-                truncated = len(steps) - len(visible_steps)
-                reasoning_text = Text()
-                if truncated > 0:
-                    reasoning_text.append(
-                        f"  … ({truncated} earlier step{'s' if truncated != 1 else ''} hidden)\n",
-                        style=f"dim {DIM}",
-                    )
-                # When a plan is active, the reasoning timeline often
-                # repeats each task description verbatim (the architect's
-                # `goal:` field == the active plan task). Build a set of
-                # normalized plan-task descriptions so we can suppress
-                # those duplicate rows — the user already sees them in
-                # the plan section just above.
-                plan_descs_norm: set = set()
-                if has_plan:
-                    from plan import _norm_desc as _nd
-                    plan_descs_norm = {_nd(t.description) for t in self.current_plan.tasks if t.description}
-                start_n = truncated + 1
-                for offset, step in enumerate(visible_steps):
-                    step_n = start_n + offset
-                    head = step["head"]
-                    status = step["status"]
-                    glyph, gcolor = status_glyphs.get(status, ("○", DIM))
-                    weight = "bold " if status == "in_progress" else ""
-                    headline = head["body"]
-                    if "goal:" in headline:
-                        goal_part = headline.split("·")[0].strip()
-                        if goal_part.startswith("goal:"):
-                            goal_part = goal_part[len("goal:"):].strip()
-                        headline = goal_part
-                    # Skip this row if its headline matches an existing
-                    # plan task — the plan section already covers it.
-                    # Substeps under that step (skill matches, self-checks,
-                    # agent <think>) are still worth showing, but the
-                    # redundant architect row would just clutter.
-                    if has_plan and headline:
-                        from plan import _norm_desc as _nd
-                        if _nd(headline) in plan_descs_norm:
-                            # Render only the substeps if any are
-                            # non-redundant (skill / self_check), else skip
-                            # the row entirely.
-                            interesting = [s for s in step["subs"] if s["kind"] in ("skill", "self_check")]
-                            if not interesting:
-                                continue
-                            for sub in interesting:
-                                sub_glyph = sub_glyphs.get(sub["kind"], "·")
-                                sub_text = sub["body"]
-                                if len(sub_text) > 140:
-                                    sub_text = sub_text[:137] + "…"
-                                reasoning_text.append("       ", style="")
-                                reasoning_text.append(f"{sub_glyph} ", style=f"{REASON_COLOR}")
-                                reasoning_text.append(f"{sub['label']}: ", style=f"dim {REASON_COLOR}")
-                                reasoning_text.append(sub_text, style=f"italic dim {REASON_COLOR}")
-                                reasoning_text.append("\n")
-                            continue
-                    if len(headline) > 110:
-                        headline = headline[:107] + "…"
-                    reasoning_text.append(f"  {glyph} ", style=f"{weight}{gcolor}")
-                    reasoning_text.append(f"{step_n}. ", style=f"dim {DIM}")
-                    reasoning_text.append(f"{head['label']} ", style=f"{weight}dim {REASON_COLOR}")
-                    reasoning_text.append("— ", style=f"dim {DIM}")
-                    reasoning_text.append(headline, style=f"{weight}italic {REASON_COLOR}")
-                    reasoning_text.append("\n")
-                    for sub in step["subs"]:
-                        if status == "done" and sub["kind"] == "agent":
-                            continue
-                        sub_glyph = sub_glyphs.get(sub["kind"], "·")
-                        sub_text = sub["body"]
-                        if len(sub_text) > 140:
-                            sub_text = sub_text[:137] + "…"
-                        reasoning_text.append("       ", style="")
-                        reasoning_text.append(f"{sub_glyph} ", style=f"{REASON_COLOR}")
-                        reasoning_text.append(f"{sub['label']}: ", style=f"dim {REASON_COLOR}")
-                        reasoning_text.append(sub_text, style=f"italic dim {REASON_COLOR}")
-                        reasoning_text.append("\n")
-                body_renderables.append(reasoning_text)
+        # The separate "Reasoning" section that used to live here was
+        # removed: every architect step's `goal` field is the same string
+        # as the active plan task's description (it's literally what the
+        # architect promoted into a task), so the section duplicated the
+        # plan tree verbatim. Architect intent (goal / observation /
+        # critical_thinking) is now rendered inline under the in-progress
+        # task via _render_intent_lines, which is the only non-duplicate
+        # piece of reasoning content. Substeps that DO carry independent
+        # info (skill matches, self-check verdicts) still come through
+        # via the reasoning_log → side_messages path elsewhere.
+        #
+        # When the plan is empty but reasoning has fired (rare — single-
+        # step runs that didn't produce a plan), surface the latest
+        # architect goal as a single italic line so the panel isn't
+        # completely empty.
+        if not has_plan and has_reasoning:
+            steps = self._group_reasoning_into_steps()
+            if steps:
+                head = steps[-1]["head"] or {}
+                headline = (head.get("body") or "").split("·")[0].strip()
+                if headline.startswith("goal:"):
+                    headline = headline[len("goal:"):].strip()
+                if len(headline) > 110:
+                    headline = headline[:107] + "…"
+                if headline:
+                    line = Text()
+                    line.append("  ", style="")
+                    line.append(head.get("label") or "agent", style=f"dim {REASON_COLOR}")
+                    line.append(" — ", style=f"dim {DIM}")
+                    line.append(headline, style=f"italic {REASON_COLOR}")
+                    body_renderables.append(line)
 
         # ── Wrap in one outer Panel ────────────────────────────────────
-        # Title blends both sections so the user sees plan progress AND
-        # current reasoning step without scrolling.
-        #
-        # Animation policy: the plan panel sits on screen the whole turn
-        # and shouldn't visually pulse — it was fighting for attention
-        # with the agent's actual output. The title color drifts slowly
-        # (period 8s) and the border no longer breathes between bright
-        # and dim — it stays a steady dim warm to read as "ambient" rather
-        # than "live".
+        # Animation policy: the panel sits on screen the whole turn and
+        # shouldn't visually pulse. Title color drifts slowly (period 8s),
+        # border stays a steady dim warm.
         PANEL_TITLE_PERIOD_SEC = 8.0
-        if has_plan and has_reasoning:
-            title_color = self._cycle_palette_color(TITLE_GRADIENT, period_sec=PANEL_TITLE_PERIOD_SEC)
-            title = f"{plan_title_text}  ·  🧠 step {n_steps}"
-            border_style = f"dim {title_color}"
-            title_markup = f"[bold {title_color}]{title}[/bold {title_color}]  [dim {DIM}](Ctrl+R / /reasoning)[/dim {DIM}]"
-        elif has_plan:
+        if has_plan:
             title_color = self._cycle_palette_color(TITLE_GRADIENT, period_sec=PANEL_TITLE_PERIOD_SEC)
             border_style = f"dim {title_color}"
             title_markup = f"[bold {title_color}]{plan_title_text}[/bold {title_color}]"
         else:
-            # Reasoning-only — single-step or pre-plan window.
-            title = f"🧠 Reasoning  ·  step {n_steps}  ·  {n_steps} total"
+            # Reasoning-only fallback — no plan was created.
             border_style = f"dim {REASON_COLOR}"
-            title_markup = f"[bold {REASON_COLOR}]{title}[/bold {REASON_COLOR}]  [dim {DIM}](Ctrl+R / /reasoning)[/dim {DIM}]"
+            title_markup = f"[bold {REASON_COLOR}]Working[/bold {REASON_COLOR}]"
 
         return Panel(
             Group(*body_renderables),
@@ -1899,8 +2577,17 @@ class ChatUI:
         body.append(f"./workspace\n", style=f"dim {DIM}")
         body.append("\n", "")
         body.append("Commands: ", style="bold")
-        body.append("/help [F1]  /settings  /queue  /skills  /memory  /diagnose  /clear  /thinking  /notify",
-                    style=f"dim {DIM}")
+        body.append(
+            "/help [F1]  /settings  /queue  /skills  /memory  /phrases  /wisdom  /diagnose  /clear",
+            style=f"dim {DIM}",
+        )
+        body.append("\n", "")
+        body.append("Keys:     ", style="bold")
+        body.append(
+            "[F2] copy  [F3] strategy  [F4] tools  [F5] editor  [F6/F7] tab  [Ctrl+R] reasoning  "
+            "[Ctrl+J] newline",
+            style=f"dim {DIM}",
+        )
         return Panel(
             body,
             box=ROUNDED, padding=(1, 2), border_style=DIM,
@@ -2062,7 +2749,7 @@ class ChatUI:
                 from phrases import pick as _pick, TOOL_RUNNING as _TR
                 verb = _pick(_TR)
                 tool["_running_verb"] = verb
-            elapsed_str = f" ({elapsed:.1f}s)" if elapsed > 1 else ""
+            elapsed_str = f" ({_fmt_duration(elapsed)})" if elapsed > 1 else ""
 
             # Embedded interactive shell — render the streaming subprocess
             # output as a live tool panel inside the chat. The panel
@@ -2117,14 +2804,16 @@ class ChatUI:
                     head.append("   ↳ keys → subprocess", style=f"bold {WARN}")
                     head.append("  (Esc to chat, Ctrl+C to interrupt)", style=f"{SECONDARY} italic")
 
-                # Decode the streaming bytes and strip ANSI; keep the last
-                # ~40 lines so the panel doesn't grow indefinitely on a
-                # very chatty subprocess.
+                # Decode the streaming bytes; sanitize cursor/screen-clear
+                # escapes (which would corrupt our layout) while keeping
+                # SGR colors so things like `ls --color` look right. Cap
+                # at ~40 lines so a chatty subprocess can't grow this
+                # panel indefinitely.
                 try:
                     full = b"".join(live_buffer).decode("utf-8", errors="ignore")
                 except Exception:
                     full = ""
-                full = re.sub(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])", "", full)
+                full = _sanitize_subprocess_text(full)
                 lines = [l for l in full.splitlines() if l.strip("\r")][-40:]
                 body = Text("\n".join(lines), style="")
                 return Panel(
@@ -2488,6 +3177,8 @@ class ChatUI:
             self.last_cook_time = 0.0
             self._open_files = {}
             self._active_editor_path = None
+            self._paste_blocks.clear()
+            self._paste_seq = 0
         elif cmd.startswith("/expand") or cmd.startswith("/collapse"):
             self._toggle_tool_expansion(cmd)
         elif cmd.startswith("/copy"):
@@ -2552,7 +3243,7 @@ class ChatUI:
                 ("Thinking panel",     "on" if SHOW_THINKING else "off", "/thinking"),
                 ("Strategy panel",     "expanded" if self.show_architect else "compact chip", "F3"),
                 ("Tool panels",        "full" if not self.compact_tools else "compact (one-line)", "F4"),
-                ("Mouse copy mode",    "on" if not self._mouse_capture else "off", "F2"),
+                ("Mouse mode",         "scroll (selection disabled)" if self._mouse_capture else "select & copy", "F2"),
             ]),
             ("Behavior", [
                 ("Session auth",       "always allow" if self.agent.session_authorized else "ask per tool", "/authorize"),
@@ -2744,33 +3435,73 @@ class ChatUI:
     def _show_help(self) -> None:
         """Help grouped by category — easier to scan than a flat command list."""
         sections = [
-            ("Navigation", [
-                ("[PgUp] / [PgDn]",    "scroll one screen"),
-                ("[Home] / [End]",     "jump to top / bottom"),
-                ("[F1]",               "open this help"),
-                ("[Arrows] / mouse",   "scroll"),
+            ("Input & navigation", [
+                ("[Enter]",             "send the prompt"),
+                ("[Shift+Enter]",       "newline (requires kitty / WezTerm / iTerm2 with CSI u)"),
+                ("[Ctrl+J]",            "newline (universal, works in any terminal)"),
+                ("[Alt+Enter]",         "newline (Esc-prefix terminals; most Linux + iTerm2)"),
+                ("end line with \\ + Enter", "newline (always works — backslash gets swapped for \\n)"),
+                ("paste",               "large pastes collapse to [pasted #N: L lines, C chars]"),
+                ("[PgUp] / [PgDn]",     "scroll one screen"),
+                ("[Home] / [End]",      "jump to top / bottom"),
+                ("[Ctrl+C]",            "interrupt / quit"),
             ]),
-            ("Display toggles", [
-                ("[F2]",               "copy mode (terminal-native selection)"),
-                ("[F3]",               "expanded strategy / reflection panel"),
-                ("[F4]",               "compact / full tool panel layout"),
-                ("/thinking [on|off]", "show / hide reasoning panel"),
-                ("/notify  [on|off]",  "desktop notification on/off"),
+            ("Panel toggles", [
+                ("[F1]",                "open this help"),
+                ("[F2]",                "copy mode (terminal-native mouse selection)"),
+                ("[F3]",                "expanded architect-strategy panels"),
+                ("[F4]",                "compact / full tool-panel layout"),
+                ("[F5]",                "show / hide right-side editor pane"),
+                ("[F6] / [F7]",         "cycle editor tabs (prev / next)"),
+                ("[Alt+↑] / [Alt+↓]",   "scroll editor pane (one line)"),
+                ("[Alt+PgUp/PgDn]",     "scroll editor pane (10 lines)"),
+                ("[Ctrl+R]",            "toggle reasoning visibility"),
+                ("[Esc]",               "(while interactive shell active) toggle input → subprocess / chat"),
             ]),
-            ("Inspection", [
-                ("/settings",          "show all settings + how to change each"),
-                ("/queue",             "list active scheduled tasks"),
-                ("/skills",            "list learned skills"),
-                ("/memory [query]",    "show stored memories (with optional search)"),
-                ("/diagnose",          "GPU / Ollama / system probe"),
+            ("Authorization (when 🛡 panel is up)", [
+                ("[Y]",                 "allow this tool for the rest of the session"),
+                ("[O]",                 "allow once only"),
+                ("[N]",                 "deny this call"),
+                ("[A]",                 "allow all tools session-wide"),
             ]),
-            ("Session", [
-                ("/clear",             "wipe current session history"),
-                ("/authorize",         "toggle session-wide tool authorization"),
-                ("/expand [N|all]",    "expand a tool panel (defaults to last)"),
-                ("/collapse [N|all]",  "re-collapse a tool panel"),
-                ("/copy [last|all|N]", "copy assistant text (OSC52 clipboard)"),
-                ("exit / quit",        "leave EzClaw"),
+            ("Slash commands — inspection", [
+                ("/settings",           "all settings + how to change each"),
+                ("/queue",              "list active scheduled tasks (incl. recurring)"),
+                ("/skills",             "list learned skills (~/.ezclaw/skills/)"),
+                ("/memory [query]",     "show stored memories (optional search)"),
+                ("/diagnose",           "GPU / Ollama / system probe"),
+            ]),
+            ("Slash commands — display", [
+                ("/thinking [on|off]",  "show / hide reasoning content"),
+                ("/notify  [on|off]",   "desktop notifications on/off"),
+                ("/reasoning [on|off]", "alias for /thinking"),
+                ("/expand [N|all]",     "expand a tool panel (defaults to last)"),
+                ("/collapse [N|all]",   "re-collapse a tool panel"),
+                ("/copy [last|all|N]",  "copy assistant text (OSC52 clipboard)"),
+            ]),
+            ("Slash commands — flavor", [
+                ("/wisdom",             "refresh the reflection line in the status bar"),
+                ("/phrases",            "show built-in status phrase counts"),
+                ("/phrases refresh",    "ask the LLM for new phrases, persist to disk"),
+                ("/phrases reset",      "revert phrase pool to defaults, delete cache"),
+            ]),
+            ("Slash commands — session", [
+                ("/clear",              "wipe history + reset session tokens / energy / cook time"),
+                ("/authorize",          "toggle session-wide tool authorization"),
+                ("/cancel",             "cancel a pending ask_user question"),
+                ("exit / quit",         "leave EzClaw"),
+            ]),
+            ("Scheduled tasks (agent tools)", [
+                ("schedule_task(time, description)",  "one-shot at YYYY-MM-DD HH:MM"),
+                ("schedule_task(..., recurrence=...)", "recurring: every Nm/Nh/Nd, hourly, daily, weekly, weekdays"),
+                ("unschedule_task(id)",                "cancel a pending/recurring task by ID"),
+                ("list_scheduled_tasks()",             "see the queue (same as /queue)"),
+            ]),
+            ("Direct commands (bypass the LLM)", [
+                ("list tasks / show tasks",   "→ list_scheduled_tasks (instant)"),
+                ("list skills",                "→ list_skills"),
+                ("system info",                "→ get_system_info"),
+                ("what time is it",            "→ current_datetime"),
             ]),
         ]
         from rich.table import Table
@@ -3040,17 +3771,32 @@ class ChatUI:
                     is_int = chunk.get("interactive", False)
                     # Tag the call with the plan step it belongs to so the
                     # plan panel can render tools nested under their task.
+                    # Cascading fallback so EVERY tool gets a home in the
+                    # plan tree (was previously orphaned as a flat panel
+                    # above the plan when none of the conditions met):
+                    #   1. architect's explicit current_task_id
+                    #   2. any in_progress task
+                    #   3. most recently touched task (latest non-pending,
+                    #      scanning from the end — this is the task the
+                    #      architect was working on, just hasn't formally
+                    #      transitioned to in_progress this turn)
+                    #   4. last task in the plan (last resort — guarantees
+                    #      no orphans when a plan exists)
                     active_task_id = None
                     if self.current_plan is not None:
                         active_task_id = self.current_plan.current_task_id
-                        # Fall back to the first in_progress task — guards
-                        # against the architect having not yet called
-                        # advance() for the step it's currently working on.
                         if active_task_id is None:
                             for t in self.current_plan.tasks:
                                 if t.status == "in_progress":
                                     active_task_id = t.id
                                     break
+                        if active_task_id is None:
+                            for t in reversed(self.current_plan.tasks):
+                                if t.status != "pending":
+                                    active_task_id = t.id
+                                    break
+                        if active_task_id is None and self.current_plan.tasks:
+                            active_task_id = self.current_plan.tasks[-1].id
                     self.tool_executions.append({
                         "name": chunk["name"],
                         "args": chunk["arguments"],
@@ -3091,10 +3837,13 @@ class ChatUI:
             final_renderable = self._get_current_renderable_ansi()
             # Feature 1: append a dim cook-time annotation under the bubble
             # so the user can scan "how long did each response take" while
-            # scrolling history.
+            # scrolling history. Format: nicely placed on its own
+            # right-margined line with a clock glyph + human-readable
+            # duration. Previously a bare "  · 12.3s" with default font
+            # rendering looked detached/orphaned.
             if cook > 0:
                 final_renderable += render_to_ansi(
-                    Text(f"  · {cook:.1f}s", style=f"italic {DIM}")
+                    Text(f"⏱  {_fmt_duration(cook)}", style=f"italic {DIM}", justify="right")
                 )
             self.history_ansi.append(final_renderable)
             self.current_response_parts = []
@@ -3366,7 +4115,40 @@ class ChatUI:
         # the status bar gets populated within a few seconds of startup —
         # the welcome banner has time to be visible before this lands.
         self._maybe_refresh_reflection(force=True)
-        self.app.run()
+        # Conservative keyboard-protocol push: enable ONLY xterm
+        # modifyOtherKeys level 2. This is narrower than kitty's CSI u
+        # disambiguate flag — it adds distinct reporting for modified
+        # printable keys (so Shift+Enter arrives as \x1b[27;2;13~
+        # which we map to SHIFT_ENTER → newline) but leaves plain
+        # arrow keys, DEL, Home/End, and other navigation keys in
+        # their legacy encoding that prompt_toolkit handles natively.
+        # Kitty supports modifyOtherKeys for xterm compat; in
+        # terminals that don't, this is a no-op and Shift+Enter falls
+        # back to indistinguishable-from-Enter — users use Ctrl+J or
+        # Alt+Enter for newlines instead.
+        def _on_first_render_done(_app):
+            try:
+                out = self.app.output
+                out.write_raw("\x1b[>4;2m")  # modifyOtherKeys level 2
+                out.flush()
+            except Exception:
+                pass
+            try:
+                self.app.after_render -= _on_first_render_done
+            except Exception:
+                pass
+
+        self.app.after_render += _on_first_render_done
+
+        try:
+            self.app.run()
+        finally:
+            # Restore modifyOtherKeys to off on exit.
+            try:
+                self.app.output.write_raw("\x1b[>4;0m")
+                self.app.output.flush()
+            except Exception:
+                pass
 
     def _heartbeat_monitor(self):
         """Poll the Scheduler every 30s for due tasks. When a task fires,
@@ -3448,9 +4230,11 @@ class ChatUI:
                 self._agent_worker(task.description)
                 # Reach here only after the worker generator exhausts.
                 # _agent_worker handles its own is_generating reset.
-                sched.mark_status(task.id, "Done")
+                # For recurring tasks this re-arms the row to the next
+                # occurrence; for one-shots it marks Done as before.
+                sched.complete_or_reschedule(task.id, success=True)
             except Exception:
-                sched.mark_status(task.id, "Failed")
+                sched.complete_or_reschedule(task.id, success=False)
 
         threading.Thread(target=worker, daemon=True).start()
 

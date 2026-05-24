@@ -147,12 +147,153 @@ def test_load_migrates_old_3column_format(sched):
 
 
 def test_save_normalizes_to_new_schema(sched):
-    """After save, the file should use the 4-column ID/Time/Task/Status schema."""
+    """After save, the file should use the 5-column
+    ID/Time/Task/Status/Recurrence schema. The Recurrence cell is blank
+    for a one-shot task."""
     sched.schedule("2026-06-01 09:00", "fresh")
     with open(sched.path) as f:
         content = f.read()
     assert "| ID |" in content
-    assert "| 1 | 2026-06-01 09:00 | fresh | Pending |" in content
+    assert "| Recurrence |" in content
+    assert "| 1 | 2026-06-01 09:00 | fresh | Pending |  |" in content
+
+
+def test_load_migrates_4column_to_5column(sched):
+    """Heartbeat written before recurrence-support had 4 columns. Loading
+    must accept the older shape and normalize on the next save."""
+    with open(sched.path, "w") as f:
+        f.write(
+            "# EzClaw Heartbeat\n\n"
+            "| ID | Scheduled Time | Task | Status |\n"
+            "|---:|:---|:---|:---|\n"
+            "| 1 | 2026-06-01 09:00 | legacy task | Pending |\n"
+        )
+    tasks = sched.load()
+    assert len(tasks) == 1
+    assert tasks[0].id == 1
+    assert tasks[0].recurrence is None
+    sched.save(tasks)
+    with open(sched.path) as f:
+        content = f.read()
+    assert "| Recurrence |" in content
+
+
+# ── Recurrence ──────────────────────────────────────────────────────────────
+
+def test_recurrence_normalization_named():
+    from scheduler import _normalize_recurrence
+    for s in ("hourly", "DAILY", "  weekly  ", "Weekdays"):
+        out = _normalize_recurrence(s)
+        assert out in {"hourly", "daily", "weekly", "weekdays"}
+
+
+def test_recurrence_normalization_intervals():
+    from scheduler import _normalize_recurrence
+    assert _normalize_recurrence("every 5m") == "every 5m"
+    assert _normalize_recurrence("EVERY 30s") == "every 30s"
+    assert _normalize_recurrence("every  2h") == "every 2h"
+    assert _normalize_recurrence("every 1d") == "every 1d"
+
+
+def test_recurrence_normalization_empty_returns_none():
+    from scheduler import _normalize_recurrence
+    assert _normalize_recurrence(None) is None
+    assert _normalize_recurrence("") is None
+    assert _normalize_recurrence("   ") is None
+
+
+def test_recurrence_normalization_rejects_garbage():
+    from scheduler import _normalize_recurrence
+    with pytest.raises(ValueError):
+        _normalize_recurrence("nonsense")
+    with pytest.raises(ValueError):
+        _normalize_recurrence("every 0m")  # non-positive
+    with pytest.raises(ValueError):
+        _normalize_recurrence("every -5m")
+
+
+def test_next_occurrence_interval_skips_missed_slots():
+    """If the scheduler missed several firings (laptop asleep), next
+    advances past `now` rather than catching up by firing for each one."""
+    from scheduler import next_occurrence
+    base = datetime(2026, 6, 1, 9, 0)
+    # 7 minutes past base — `every 5m` would have fired at 9:00 and 9:05;
+    # next future slot is 9:10.
+    now = datetime(2026, 6, 1, 9, 7)
+    assert next_occurrence("every 5m", base, now=now) == datetime(2026, 6, 1, 9, 10)
+
+
+def test_next_occurrence_daily():
+    from scheduler import next_occurrence
+    base = datetime(2026, 6, 1, 9, 0)
+    now = datetime(2026, 6, 1, 10, 0)
+    assert next_occurrence("daily", base, now=now) == datetime(2026, 6, 2, 9, 0)
+
+
+def test_next_occurrence_weekly():
+    from scheduler import next_occurrence
+    base = datetime(2026, 6, 1, 9, 0)        # Monday
+    now = datetime(2026, 6, 5, 9, 0)         # following Friday
+    nxt = next_occurrence("weekly", base, now=now)
+    assert nxt == datetime(2026, 6, 8, 9, 0)
+    assert nxt.weekday() == base.weekday()
+
+
+def test_next_occurrence_weekdays_skips_weekend():
+    from scheduler import next_occurrence
+    base = datetime(2026, 6, 5, 9, 0)        # Friday
+    assert base.weekday() == 4
+    now = datetime(2026, 6, 5, 9, 30)        # past Friday's slot
+    nxt = next_occurrence("weekdays", base, now=now)
+    assert nxt == datetime(2026, 6, 8, 9, 0) # next Monday
+    assert nxt.weekday() == 0
+
+
+def test_schedule_with_recurrence_persists(sched):
+    t = sched.schedule("2026-06-01 09:00", "morning standup", recurrence="weekdays")
+    assert t.recurrence == "weekdays"
+    assert t.is_recurring
+    reloaded = sched.load()
+    assert reloaded[0].recurrence == "weekdays"
+
+
+def test_schedule_rejects_bad_recurrence(sched):
+    with pytest.raises(ValueError):
+        sched.schedule("2026-06-01 09:00", "x", recurrence="every banana")
+
+
+def test_complete_or_reschedule_oneshot_marks_done(sched):
+    t = sched.schedule("2026-06-01 09:00", "one and done")
+    result = sched.complete_or_reschedule(t.id, success=True)
+    assert result.status == "Done"
+    assert sched.list_pending() == []
+
+
+def test_complete_or_reschedule_recurring_rearms_to_next_slot(sched):
+    t = sched.schedule("2026-06-01 09:00", "ping inbox", recurrence="every 5m")
+    now = datetime(2026, 6, 1, 9, 7)
+    result = sched.complete_or_reschedule(t.id, success=True, now=now)
+    assert result.status == "Pending"
+    assert result.time == datetime(2026, 6, 1, 9, 10)
+    pending = sched.list_pending()
+    assert len(pending) == 1
+    assert pending[0].id == t.id
+
+
+def test_complete_or_reschedule_recurring_on_failure_does_not_rearm(sched):
+    """Silent self-repair on failures would hide breakage. We deliberately
+    mark Failed and let the user decide whether to re-arm."""
+    t = sched.schedule("2026-06-01 09:00", "ping webhook", recurrence="hourly")
+    result = sched.complete_or_reschedule(t.id, success=False)
+    assert result.status == "Failed"
+    assert sched.list_pending() == []
+
+
+def test_unschedule_stops_recurring_task(sched):
+    t = sched.schedule("2026-06-01 09:00", "every five", recurrence="every 5m")
+    cancelled = sched.unschedule(t.id)
+    assert cancelled.status == "Cancelled"
+    assert sched.list_pending() == []
 
 
 # ── list_pending ────────────────────────────────────────────────────────────

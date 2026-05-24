@@ -106,35 +106,39 @@ class Theme:
 _PALETTE = Palette()
 
 _ROLES: Dict[str, RoleStyle] = {
+    # Each role gets a real emoji that maps to its job. Spinner frames
+    # stay as monochrome glyphs because they animate every UI tick —
+    # emoji frame swaps look jittery in some terminals due to varying
+    # glyph widths.
     "executor": RoleStyle(
         color="#5fafff",
-        icon="◇",
+        icon="⚙️",                   # gear — turning the crank
         spinner_frames=("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"),
         flash_color="#afd7ff",
     ),
     "researcher": RoleStyle(
         color="#5fd75f",
-        icon="✦",
+        icon="🔍",                  # magnifying glass — searching
         spinner_frames=("✦", "✧", "⋆", "✧"),
         flash_color="#afffaf",
     ),
     "debugger": RoleStyle(
         color="#ff6f6f",
-        icon="⚠",
+        icon="🐛",                  # bug — debugging, literally
         spinner_frames=("⚠", "⚡", "⚠", "⚡"),
         flash_color="#ffafaf",
     ),
     "general": RoleStyle(
         color="#d75fd7",
-        icon="●",
+        icon="💬",                  # speech bubble — conversational replies
         spinner_frames=("·", "··", "···", "····"),
         flash_color="#ffafff",
     ),
     "architect": RoleStyle(
-        color=_PALETTE.primary,    # tracks the palette so the chip + welcome agree
-        icon="◈",
+        color=_PALETTE.primary,
+        icon="🏛️",                  # classical building — the designer / orchestrator
         spinner_frames=("◇", "◈", "◆", "◈"),
-        flash_color="#ffd9a0",     # brighter variant of primary amber
+        flash_color="#ffd9a0",
     ),
 }
 
@@ -236,12 +240,20 @@ def model_emoji(name: str) -> str:
 
 # Task-state styling for the plan panel. The state key matches Plan task
 # statuses (plan.TASK_STATUSES). Each entry is (icon_glyph, color_hex).
+#
+# Note on `skipped`: Plan.progress() counts both `done` and `skipped`
+# toward the "N/M" tally in the title bar — they're both "settled, not
+# in your way." Render `skipped` in a muted-green so it visually reads
+# as resolved (matching the tally), but with the `⊘` glyph so it's
+# distinguishable from `done` if you look closely. Without this,
+# skipped tasks rendered in dim grey looked "unfinished" while the
+# title said 5/5.
 TASK_STATE_STYLE: dict = {
     "pending":     ("○", _PALETTE.dim),
     "in_progress": ("▸", "#5fafff"),     # executor blue
     "done":        ("●", "#5fd75f"),     # green
     "failed":      ("✗", _PALETTE.err),
-    "skipped":     ("⊘", _PALETTE.dim),
+    "skipped":     ("⊘", "#7fb37f"),     # muted green — settled, just not executed
 }
 
 # Brighter variant of each state's color, used for the one-tick flash
