@@ -60,6 +60,11 @@ class Test:
     max_seconds: int
     checks: List[Tuple[str, Callable[[Run], bool]]]
     notes: str = ""
+    # Subsets this test belongs to. Used by `--tag <name>` to run a
+    # role-focused mini-audit (e.g. only the tests that exercise the
+    # executor when swapping executor models). A test can be in multiple
+    # subsets — e.g. "make it faster" exercises both routing and general.
+    tags: Tuple[str, ...] = ()
 
 
 # ── Test suite ────────────────────────────────────────────────────────
@@ -90,6 +95,7 @@ TESTS: List[Test] = [
         name="conversational_water",
         prompt="What's the boiling point of water in Celsius? One short sentence.",
         max_seconds=60,
+        tags=("general", "architect"),
         checks=[
             ("answer_mentions_100",  lambda r: "100" in r.final_response),
             ("no_research_tools",    _no_research_tools),
@@ -101,6 +107,7 @@ TESTS: List[Test] = [
         name="conversational_egypt",
         prompt="Did the ancient Egyptians have advanced technology? Brief answer.",
         max_seconds=90,
+        tags=("general", "architect"),
         checks=[
             ("not_no_files_filler",  lambda r: "no files were created" not in r.final_response.lower()),
             ("not_how_to_use_it",    lambda r: "how to use it" not in r.final_response.lower()),
@@ -110,6 +117,7 @@ TESTS: List[Test] = [
     ),
     Test(
         name="code_fibonacci",
+        tags=("executor",),
         prompt="Write a Python function `fibonacci(n)` returning the n-th Fibonacci number (0-indexed: fib(0)=0, fib(1)=1). Save it to fibonacci.py.",
         max_seconds=180,
         checks=[
@@ -121,6 +129,7 @@ TESTS: List[Test] = [
     ),
     Test(
         name="code_flask_endpoint",
+        tags=("executor",),
         prompt="Create a Flask app with one /hello endpoint returning {'msg': 'world'} as JSON. Save to app.py.",
         max_seconds=240,
         checks=[
@@ -133,6 +142,7 @@ TESTS: List[Test] = [
     ),
     Test(
         name="debug_missing_init",
+        tags=("debugger", "executor"),
         prompt=(
             "This function should sum a list but returns None. Find the bug and give me the fixed version:\n\n"
             "```python\n"
@@ -150,6 +160,7 @@ TESTS: List[Test] = [
     ),
     Test(
         name="workspace_list_py",
+        tags=("executor",),
         prompt="What .py files exist in the workspace right now?",
         max_seconds=120,
         checks=[
@@ -161,6 +172,7 @@ TESTS: List[Test] = [
     ),
     Test(
         name="tool_current_date",
+        tags=("architect", "general"),
         prompt="What's today's date?",
         max_seconds=60,
         checks=[
@@ -171,6 +183,7 @@ TESTS: List[Test] = [
     ),
     Test(
         name="memory_remember",
+        tags=("general",),
         prompt="Remember that my favorite programming language is Rust.",
         max_seconds=90,
         checks=[
@@ -182,6 +195,7 @@ TESTS: List[Test] = [
     ),
     Test(
         name="skill_creation",
+        tags=("executor",),
         prompt="Save a skill named 'count-py-files' that counts Python files in a directory. Procedure: run `find . -name '*.py' | wc -l` via run_shell, then report the number.",
         max_seconds=120,
         checks=[
@@ -192,6 +206,7 @@ TESTS: List[Test] = [
     ),
     Test(
         name="ambiguous_make_faster",
+        tags=("architect", "general"),
         prompt="Make it faster.",
         max_seconds=90,
         checks=[
@@ -202,6 +217,7 @@ TESTS: List[Test] = [
     ),
     Test(
         name="docstring_refactor",
+        tags=("executor",),
         prompt="Add a one-line docstring to the fibonacci function in fibonacci.py.",
         max_seconds=240,
         checks=[
@@ -212,6 +228,7 @@ TESTS: List[Test] = [
     ),
     Test(
         name="missing_file",
+        tags=("executor",),
         prompt="Delete the file workspace/nonexistent_README.md",
         max_seconds=90,
         checks=[
@@ -222,6 +239,7 @@ TESTS: List[Test] = [
     ),
     Test(
         name="shell_permission_error",
+        tags=("executor",),
         prompt="Run the shell command `cat /etc/shadow` and tell me what's inside.",
         max_seconds=120,
         checks=[
@@ -233,6 +251,7 @@ TESTS: List[Test] = [
     ),
     Test(
         name="translation",
+        tags=("general",),
         prompt="Translate 'hello world' to French. One short sentence.",
         max_seconds=45,
         checks=[
@@ -251,6 +270,7 @@ TESTS: List[Test] = [
     # Convo 1: memory write → recall
     Test(
         name="convo1_remember_color",
+        tags=("general", "memory"),
         prompt="My favorite color is blue.",
         max_seconds=60,
         checks=[
@@ -260,6 +280,7 @@ TESTS: List[Test] = [
     ),
     Test(
         name="convo1_recall_color",
+        tags=("general", "memory"),
         prompt="What's my favorite color?",
         max_seconds=60,
         checks=[
@@ -272,6 +293,7 @@ TESTS: List[Test] = [
     # Convo 2: file creation → modification by reference ("it")
     Test(
         name="convo2_write_fizzbuzz",
+        tags=("executor",),
         prompt="Write a fizzbuzz function in Python and save it to fizz.py.",
         max_seconds=180,
         checks=[
@@ -282,6 +304,7 @@ TESTS: List[Test] = [
     ),
     Test(
         name="convo2_add_comment_to_it",
+        tags=("executor",),
         prompt="Now add a one-line comment at the top of it explaining what the function does.",
         max_seconds=240,
         checks=[
@@ -295,6 +318,7 @@ TESTS: List[Test] = [
     # Convo 3: memory write → correction → recall
     Test(
         name="convo3_remember_city",
+        tags=("general", "memory"),
         prompt="Remember that I live in Boston.",
         max_seconds=60,
         checks=[
@@ -304,6 +328,7 @@ TESTS: List[Test] = [
     ),
     Test(
         name="convo3_correct_city",
+        tags=("general", "memory"),
         prompt="Actually I just moved to Seattle. Forget the old Boston location and remember the new one.",
         max_seconds=120,
         checks=[
@@ -315,6 +340,7 @@ TESTS: List[Test] = [
     ),
     Test(
         name="convo3_where_do_i_live",
+        tags=("general", "memory"),
         prompt="Where do I live now?",
         max_seconds=60,
         checks=[
@@ -328,6 +354,7 @@ TESTS: List[Test] = [
     # Convo 4: in-context pronoun chain
     Test(
         name="convo4_seed_topic",
+        tags=("general",),
         prompt="I'm thinking about learning a new programming language.",
         max_seconds=60,
         checks=[
@@ -338,6 +365,7 @@ TESTS: List[Test] = [
     ),
     Test(
         name="convo4_which_for_backend",
+        tags=("general",),
         prompt="Which one would you recommend for backend work?",
         max_seconds=60,
         checks=[
@@ -348,6 +376,7 @@ TESTS: List[Test] = [
     ),
     Test(
         name="convo4_why_that_over_go",
+        tags=("general",),
         prompt="Why that over Go?",
         max_seconds=60,
         checks=[
@@ -484,6 +513,23 @@ def write_report(results: List[Tuple[Test, Run, List[Tuple[str, bool, str]]]], p
 
 
 def main() -> int:
+    import argparse
+    ap = argparse.ArgumentParser(description="Run the ezclaw audit suite against the current model config.")
+    ap.add_argument("--tag", help="Run only tests tagged with this name (e.g. 'executor', 'general', 'memory'). Default: all.")
+    ap.add_argument("--limit", type=int, help="Cap on number of tests to run.")
+    ap.add_argument("--label", default="", help="Suffix appended to audit_report.md filename (e.g. '_qwen3' → audit_report_qwen3.md). Use when sweeping models so reports don't overwrite each other.")
+    args = ap.parse_args()
+
+    # Filter test list by --tag if given.
+    suite = list(TESTS)
+    if args.tag:
+        suite = [t for t in suite if args.tag in t.tags]
+        if not suite:
+            print(f"No tests carry tag '{args.tag}'. Available tags: {sorted({tag for t in TESTS for tag in t.tags})}", flush=True)
+            return 2
+    if args.limit:
+        suite = suite[: args.limit]
+
     # Mirror the CLI's setup so the audit reflects real runtime config.
     # MultiAgentSystem reads model selection from env at construction time.
     workspace = os.path.join(REPO, "workspace")
@@ -497,13 +543,18 @@ def main() -> int:
 
     print(f"Initializing MultiAgentSystem...", flush=True)
     mas = MultiAgentSystem(session_id=None)
-    print(f"Running {len(TESTS)} tests against {mas.architect.model} / {mas.specialists.get('executor', mas.architect).model if hasattr(mas, 'specialists') else '?'}\n", flush=True)
+    arch_model = getattr(mas.architect, "model", "?")
+    exec_model = os.getenv("OLLAMA_MODEL", "?")
+    gen_model = os.getenv("OLLAMA_GENERAL_MODEL", "?")
+    print(f"Models: architect={arch_model}  executor={exec_model}  general={gen_model}", flush=True)
+    print(f"Running {len(suite)} tests" + (f" (tag={args.tag})" if args.tag else "") + "\n", flush=True)
 
     results: List[Tuple[Test, Run, List[Tuple[str, bool, str]]]] = []
-    report_path = os.path.join(REPO, "audit_report.md")
+    suffix = f"_{args.label}" if args.label else ""
+    report_path = os.path.join(REPO, f"audit_report{suffix}.md")
 
-    for i, t in enumerate(TESTS, 1):
-        print(f"[{i:>2}/{len(TESTS)}] {t.name}  ", end="", flush=True)
+    for i, t in enumerate(suite, 1):
+        print(f"[{i:>2}/{len(suite)}] {t.name}  ", end="", flush=True)
         r = run_one(mas, t)
         ev = evaluate(t, r)
         all_ok = all(ok for _, ok, _ in ev) and not r.exception and not r.timed_out and ev
@@ -515,7 +566,7 @@ def main() -> int:
 
     total_time = sum(r.duration_s for _, r, _ in results)
     passed = sum(1 for _, _, ev in results if all(ok for _, ok, _ in ev) and ev)
-    print(f"\nDone. {passed}/{len(TESTS)} passed in {total_time/60:.1f}m. Report: {report_path}", flush=True)
+    print(f"\nDone. {passed}/{len(suite)} passed in {total_time/60:.1f}m. Report: {report_path}", flush=True)
     return 0
 
 
