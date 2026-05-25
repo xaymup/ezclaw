@@ -761,7 +761,16 @@ def list_dir(path: str = ".") -> str:
 @registry.register
 def web_fetch(url: str) -> str:
     """
-    Fetch URL content for research, documentation, or news.
+    Fetch the page at `url` (must be a full http:// or https:// URL).
+
+    Argument is `url`, never `query`. There is no `query` parameter.
+
+    To SEARCH the web (you only have a topic, not a URL): first call
+    `web_fetch(url="https://duckduckgo.com/html/?q=YOUR+SEARCH+TERMS")`
+    — the result will contain anchor tags with `<a href="..."` pointing
+    at result pages. Pick a relevant one and call `web_fetch` again on
+    that URL. Do NOT try `run_shell("google search ...")` or any other
+    fake search command — no such shell command exists.
     """
     try:
         with httpx.Client(follow_redirects=True, timeout=20.0) as client:
