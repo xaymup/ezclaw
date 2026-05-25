@@ -404,9 +404,10 @@ When in doubt, search — a 5-second search beats a confident-but-wrong diagnosi
 
 Rules:
 - Respond in plain text. Be concise — no preambles, no fluff.
-- When user shares personal info ("my name is X", "I like Y"), use `remember` to store it.
-- When user asks about themselves ("what's my name", "do you know me"), use `recall` to check.
-- Use `forget` if the user asks you to delete something.
+- **When you call a tool that returns information, your reply MUST surface the relevant part of that result.** The user does NOT see tool results directly — they see only your reply. So `current_datetime` → say "Today is 2026-05-25" with the actual date. `recall` → list the memories it returned. `list_dir` → name the files it found. `read_file` → quote the lines that answer the question. Replying with just "Done." or "Completed." after a tool call is a bug — the user sees no answer.
+- When user shares personal info ("my name is X", "I like Y"), use `remember` to store it. After it succeeds, confirm in one short sentence ("Got it, you like Y") — do NOT call `recall` to verify what you just stored.
+- When user asks about themselves ("what's my name", "do you know me"), use `recall` once, then read the returned facts back. Don't call recall twice with synonyms.
+- Use `forget` if the user asks you to delete something. The matcher requires every content word to appear in the matched fact and refuses on >5 matches — if you get back "Refused to delete", narrow the query, don't retry the same one.
 - If recall returns nothing relevant, say so directly — don't fabricate.
 - **For ANY question about workspace content** — a project, file, directory, build, "the code", "how to run X", "is X done" — your training data doesn't contain the user's workspace. Use `list_dir` to see what's there, `read_file` to inspect specific files, and `run_shell` (with `interactive=false`) to check things like `make -n` or `ls`. Don't fabricate answers from prior knowledge when the workspace has the actual data.""",
     },
@@ -1842,6 +1843,17 @@ No fluff. No "In this task...". Just facts."""
     def run(self, user_input: str) -> Iterator[Dict[str, Any]]:
         if len(user_input) > 4000:
             user_input = user_input[:4000] + "\n... (truncated)"
+        # Refresh skills from disk on every turn. `self.skills` was loaded
+        # once at MAS construction — without this, a skill saved earlier
+        # in the SAME session via `learn_skill` was invisible to the
+        # matcher on subsequent turns, and a skill saved between sessions
+        # but before this session's launch was also missed when the
+        # `~/.ezclaw/skills/` directory updated after MAS init. Verified
+        # by a scheduled task "Daily summary of last emails and world
+        # news" running `ls -la ~/Mail/` instead of the saved himalaya
+        # procedure (which match_skills scored 0.615 — well above
+        # threshold — when re-checked from disk).
+        self.skills = load_skills()
         task_context = f"User Request: {user_input}"
         self.current_plan = None
         # Persistence-first orchestration: keep iterating until the user's
