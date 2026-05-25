@@ -36,8 +36,9 @@ Multi-agent mode runs four specialist roles on local Ollama. The setup below is 
 
 ```bash
 # Specialist models (pull once)
-ollama pull qwen3:14b               # architect + executor (default, audited)
-ollama pull qwen3.5:9b              # researcher + general (smaller, faster handoffs)
+ollama pull qwen3:14b               # architect + executor (audited)
+ollama pull qwen3.5:9b              # researcher
+ollama pull gpt-oss:20b             # general (audited: best tool-selection accuracy)
 ollama pull deepseek-r1:14b         # debugger (chain-of-thought root-cause analysis)
 
 # Embedding model — load-bearing, not optional. See "Why embeddings matter" below.
@@ -52,7 +53,7 @@ OLLAMA_MODEL=qwen3:14b               # executor
 OLLAMA_ARCHITECT_MODEL=qwen3:14b     # fast non-reasoning model; R1's CoT is unnecessary here
 OLLAMA_RESEARCHER_MODEL=qwen3.5:9b
 OLLAMA_DEBUGGER_MODEL=deepseek-r1:14b
-OLLAMA_GENERAL_MODEL=qwen3.5:9b
+OLLAMA_GENERAL_MODEL=gpt-oss:20b     # audited winner — see audit_comparison_general.md
 OLLAMA_EMBED_MODEL=mxbai-embed-large
 OLLAMA_NUM_CTX=16384
 OLLAMA_KEEP_ALIVE=60m                # avoid re-loading between turns
