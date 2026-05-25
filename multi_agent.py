@@ -901,6 +901,8 @@ Return `kind: single` ONLY when the request is purely workspace-independent:
 - Greetings, acknowledgments, social niceties ("hi", "thanks", "lol")
 - Definitions of general concepts ("what is recursion", "explain async/await")
 - Arithmetic, simple computations the model can do in its head
+- **General-knowledge questions** about the world, history, science, geography, culture, language, common topics — "did the ancient Egyptians have advanced technology", "who wrote The Iliad", "what's the capital of Brazil", "how do volcanoes form". The model knows these. Do NOT route to web research for things in its training data — that produces 6 failed `run_shell("google search...")` and `web_fetch` attempts before answering. The user gets the same answer faster from a direct `general` reply.
+- **Opinion / advice / brainstorming** the model can answer from general knowledge — "what should I name my band", "is X a good idea", "ideas for a birthday gift". Route to `general` directly.
 
 **Anything that names something in the workspace requires inspection** — a project name (blex_os, the API server), a file (cli.py, README), a directory, "the build", "the tests", "this code", "the bug", "how to run X" where X is in `./workspace/` — return `kind: plan`. The executor needs `read_file` / `list_dir` / `run_shell` to actually look at what's there; the model's training data does NOT contain the user's workspace.
 
@@ -1588,6 +1590,54 @@ Return ONLY the JSON object."""
                     "```\n" + joined + "\n```\n"
                 )
 
+        # Branch the synthesis template by whether this turn actually
+        # delivered code/files. The "what's where / how to use it"
+        # scaffolding is for code-delivery turns; applying it to a
+        # conversational answer produces absurd boilerplate like "No files
+        # were created or modified as part of this research-based answer."
+        # (real example from "did the ancient egyptians have advanced
+        # technology?"). Informational turns get a stripped template.
+        _CODE_DELIVERY_TOOLS = {"write_file", "apply_diff", "learn_skill", "run_tests"}
+        had_code_delivery = any(
+            t in _CODE_DELIVERY_TOOLS
+            for step in step_history
+            for t in (step.get("tools") or [])
+        )
+
+        if had_code_delivery:
+            body_rules = (
+                "- If the plan succeeded, write a short delivery summary in "
+                "this shape:\n"
+                "    1. **One-line outcome.** What you built, in one sentence.\n"
+                "    2. **What's where.** Specific files written or modified "
+                "(e.g. `game.py`, `tests/test_game.py`), one per line if more "
+                "than one.\n"
+                "    3. **How to use it.** One line — the exact command to "
+                "run, open, or import what you built (e.g. `Run `python "
+                "game.py`` or `Import `Game` from `game.py``).\n"
+                "    4. **Next steps (optional, 1–2 max).** Phrased as "
+                "OFFERS the user can decline, NOT auto-applied work. E.g. "
+                "`Want me to add tests? Or wire up two-player mode?`. Skip "
+                "this if there's no natural follow-up.\n"
+            )
+        else:
+            body_rules = (
+                "- This was an informational / conversational turn — no "
+                "files were written or modified. Just answer the question.\n"
+                "    1. Lead with the answer, directly, in one short paragraph "
+                "(2-4 sentences max). No preamble.\n"
+                "    2. If natural, add 1-3 bullets with concrete facts that "
+                "deepen the answer. Skip if the lead paragraph stands alone.\n"
+                "    3. Optionally close with ONE offer the user can pick up "
+                "(e.g. `Want me to go deeper on the construction methods?`). "
+                "Skip if there's no obvious follow-up.\n"
+                "- Do NOT include 'What's where' or 'How to use it' sections. "
+                "Those are for code-delivery turns; this is not one.\n"
+                "- Do NOT add filler like 'No files were created' or 'This "
+                "information can be used to...' — the user can see no files "
+                "were touched, and they know what to do with an answer.\n"
+            )
+
         prompt = (
             "You orchestrated a multi-step plan to answer the user's "
             "request. Now write the FINAL user-facing reply.\n\n"
@@ -1596,27 +1646,14 @@ Return ONLY the JSON object."""
             "\"executor\", \"task ID\", \"architect\", \"step\".\n"
             "- Do not re-narrate every step — the user has already seen "
             "the plan panel update in real time. Focus on the OUTCOME.\n"
-            "- If the plan succeeded, write a short delivery summary in "
-            "this shape:\n"
-            "    1. **One-line outcome.** What you built, in one sentence.\n"
-            "    2. **What's where.** Specific files written or modified "
-            "(e.g. `game.py`, `tests/test_game.py`), one per line if more "
-            "than one.\n"
-            "    3. **How to use it.** One line — the exact command to "
-            "run, open, or import what you built (e.g. `Run `python "
-            "game.py`` or `Import `Game` from `game.py``).\n"
-            "    4. **Next steps (optional, 1–2 max).** Phrased as "
-            "OFFERS the user can decline, NOT auto-applied work. E.g. "
-            "`Want me to add tests? Or wire up two-player mode?`. Skip "
-            "this if there's no natural follow-up.\n"
+            f"{body_rules}"
             "- If the user asked for the OUTPUT of a script/command (see "
             "the explicit output block below, if present), your reply "
             "must START with that output quoted in a fenced code block, "
             "then one short sentence of context. The user's primary "
             "want is to SEE the output — don't bury it.\n"
             "- If anything failed, say so plainly and stop. Do not pretend "
-            "work was done that wasn't. Skip the 'how to use' and 'next "
-            "steps' sections on failure.\n"
+            "work was done that wasn't.\n"
             "- No JSON, no markdown headers above level-3, no code fences "
             "unless quoting actual code.\n\n"
             f"User request:\n{user_input}\n\n"
