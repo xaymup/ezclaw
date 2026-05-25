@@ -36,9 +36,10 @@ Multi-agent mode runs four specialist roles on local Ollama. The setup below is 
 
 ```bash
 # Specialist models (pull once)
-ollama pull qwen3:14b           # architect + executor (default)
-ollama pull qwen3.5:9b          # researcher + general (smaller, faster handoffs)
-ollama pull deepseek-r1:14b     # debugger (chain-of-thought root-cause analysis)
+ollama pull qwen3:14b               # architect (orchestration, every turn)
+ollama pull qwen2.5-coder:14b       # executor (tool-tuned — respects "don't repeat" patterns)
+ollama pull qwen3.5:9b              # researcher + general (smaller, faster handoffs)
+ollama pull deepseek-r1:14b         # debugger (chain-of-thought root-cause analysis)
 
 # Embedding model — load-bearing, not optional. See "Why embeddings matter" below.
 ollama pull mxbai-embed-large
@@ -48,8 +49,8 @@ Then in `.env`:
 
 ```ini
 ENABLE_MULTI_AGENT=true
-OLLAMA_MODEL=qwen3:14b               # executor
-OLLAMA_ARCHITECT_MODEL=qwen3:14b
+OLLAMA_MODEL=qwen2.5-coder:14b       # executor — coder-tuned for reliable tool-call traces
+OLLAMA_ARCHITECT_MODEL=qwen3:14b     # fast non-reasoning model; R1's CoT is unnecessary here
 OLLAMA_RESEARCHER_MODEL=qwen3.5:9b
 OLLAMA_DEBUGGER_MODEL=deepseek-r1:14b
 OLLAMA_GENERAL_MODEL=qwen3.5:9b
@@ -58,10 +59,12 @@ OLLAMA_NUM_CTX=16384
 OLLAMA_KEEP_ALIVE=60m                # avoid re-loading between turns
 ```
 
+**Why this split.** The executor runs every tool call, so it benefits most from a coder-tuned model that respects "don't repeat the same tool" patterns — `qwen2.5-coder:14b` is trained on tool-use traces specifically. The architect runs ~3-8× per turn but only does routing/planning, which doesn't need chain-of-thought — moving it off `deepseek-r1` shaves 15-30s per dispatch. R1's CoT actually helps in the debugger, where root-cause analysis is the job.
+
 **Variations:**
-- **Lower VRAM (12 GB)**: swap `qwen3:14b` → `qwen3.5:9b` for the architect/executor too, or use `qwen2.5-coder:14b-q4_K_M` quantized.
+- **Lower VRAM (12 GB)**: swap to `qwen3.5:9b` for the architect/executor, or use `qwen2.5-coder:14b-q4_K_M` quantized.
 - **Faster planning, no local compute**: set `ARCHITECT_PROVIDER=deepseek` with a free [DeepSeek API key](https://platform.deepseek.com/). The architect runs in the cloud, executor stays local.
-- **Heavier reasoning**: replace the architect with `phi4-reasoning:plus` if you have headroom; it's slower but produces tighter plans.
+- **Heavier reasoning**: replace the architect with `phi4-reasoning:plus` if you have headroom; slower per dispatch but produces tighter plans.
 
 ## Performance
 
