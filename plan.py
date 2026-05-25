@@ -131,6 +131,22 @@ class Plan:
         """
         normalized = _norm_desc(description)
         new_verb = _leading_verb(description)
+
+        # First check: if inserting as a sub-task, don't insert a copy of
+        # the parent itself. A snapshot from a real run showed step 6
+        # "Add user interface elements" added as a child of step 3 of
+        # the same name — the original dedupe missed this because the
+        # parent_ids differed (None vs 3). Architect new_tasks emissions
+        # that just re-describe the parent shouldn't bloat the tree.
+        if parent_id is not None:
+            parent = next((t for t in self.tasks if t.id == parent_id), None)
+            if parent is not None:
+                parent_norm = _norm_desc(parent.description)
+                if parent_norm == normalized:
+                    return parent
+                if parent_norm and normalized and _ratio(parent_norm, normalized) >= 0.92:
+                    return parent
+
         for existing in self.tasks:
             if (
                 existing.parent_id != parent_id

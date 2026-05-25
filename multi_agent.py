@@ -165,6 +165,31 @@ def _format_tool_typeerror(tool_name: str, tool_func, passed_args: dict, exc: Ty
             "Hint: `write_file` takes `path` and `content`. To EXECUTE a "
             "shell command use run_shell(command=...)."
         )
+    elif tool_name == "remember" and any(
+        k in passed for k in ("content", "text", "memory", "value", "data")
+    ):
+        hint = (
+            'Hint: `remember` takes (fact, tags). Pass the content as '
+            '`fact="..."` (not `content=`/`text=`/`memory=`). `tags` is '
+            'OPTIONAL and must be a comma-separated string, e.g. '
+            'tags="location" — not a list.'
+        )
+    elif tool_name == "forget" and any(
+        k in passed for k in ("fact", "content", "text", "memory")
+    ):
+        hint = (
+            'Hint: `forget` takes (query). Pass the search phrase as '
+            '`query="..."` — a distinctive word from the fact you want '
+            'gone, NOT the whole fact verbatim.'
+        )
+    elif tool_name == "recall" and any(
+        k in passed for k in ("fact", "memory", "limit", "n", "top_k")
+    ):
+        hint = (
+            'Hint: `recall` takes a single arg `query`. There is no '
+            '`limit` / `top_k` parameter — call `recall(query="...")` '
+            'once and read the returned list.'
+        )
     if hint:
         parts.append(f"  {hint}")
     return "\n".join(parts)
@@ -292,7 +317,7 @@ A name correction is exactly one `remember` (the new canonical fact) plus at mos
 - **Don't pre-validate**: Just call `read_file(path)` — if it errors, then act. Do NOT `list_dir` first to "check if the file exists."
 - **Use the efficient tools when they fit** — they save context budget and avoid common mistakes:
     - `code_outline(file)` BEFORE `read_file` on large source files. The outline tells you which symbols exist; only `read_file` after you know which part you want.
-    - `apply_diff(file, diff)` INSTEAD of `write_file` for small edits. It sends just the hunks, not the whole file. **HARD RULE**: only call `apply_diff` on a file you've actually `read_file`'d (or written via `write_file`) in THIS turn. Diffs against an un-read file rely on your model's guess of the surrounding context lines, which is wrong roughly half the time — the diff gets rejected and you waste a turn retrying. When in doubt, `read_file` first to confirm the context, OR use `write_file` with the full final content.
+    - `apply_diff(file, diff)` INSTEAD of `write_file` for small edits. It sends just the hunks, not the whole file. **HARD RULE**: call `read_file` IMMEDIATELY before every `apply_diff`, EVEN IF you just wrote the file with `write_file` in the SAME turn. Your model "memory" of what you wrote is not byte-accurate — line numbers and exact context lines drift, and the diff gets rejected. The cost of one extra `read_file` is tiny; the cost of a rejected diff is a wasted turn plus a confused recovery. If you want to skip the read, use `write_file` with the full final content instead of `apply_diff`.
     - `grep_codebase(pattern)` INSTEAD of `run_shell("grep -rn …")`. Structured output, skips binary/cache dirs automatically.
     - `run_tests([target])` INSTEAD of guessing pytest/jest/cargo invocations.
     - `python_eval(expr)` INSTEAD of mental math, datetime arithmetic, or JSON manipulation. Use it whenever the answer is computable.
@@ -949,6 +974,7 @@ Rules for execution:
     - **Routing to `general` to "clarify user preferences" without an `ask_user` call.** The `general` agent can't actually ask the user anything — it just produces conversational filler. If you genuinely need a decision from the user before proceeding, route an agent to call `ask_user("specific question")` exactly once. Otherwise pick the most-likely interpretation and proceed.
     - One exception: if a genuine blocker was discovered (missing dependency, broken import, the deliverable doesn't actually run), insert ONE corrective task. Otherwise: complete.
 - `plan` is the step-by-step instruction the routed agent will execute this turn. Make it concrete and actionable: "Read sse_handler.py, find the handle_disconnect function, add a `connection.cleanup()` call before the return." Not "Work on the leak."
+- **Preserve every action verb from the user's request in the `plan`.** If the user combined clauses with "and"/"also"/"plus" — "forget X AND remember Y", "delete the old file AND write the new one", "remove Boston memory AND update to Seattle" — your `plan` MUST enumerate BOTH actions as numbered steps for the routed agent. Compressing "remove Seattle AND remember Giza" down to "update user location" is a bug: the deletion clause vanishes, the routed agent only does the second half, and the synthesis ends up lying about work that never happened. When in doubt, list more steps, not fewer.
 - `reflection.observation` is one short sentence describing what actually happened in the previous step. Skip if first step.
 - `reflection.critical_thinking` is REQUIRED on every turn. One short sentence on WHY this routing/plan vs. the alternative you discarded. Use it to make the trade-off explicit ("routing to executor because the previous step's file read showed the function is in this module, not elsewhere").
 - **Use the `ask_user` tool when you need user input — never narrate it in `plan`.** If the next step requires clarification or a value only the user knows (location, file path, preference), route to an agent and instruct it to call `ask_user("...")`. NEVER emit `plan` like "Ask the user about their preferences" without a corresponding tool call — that just produces empty agent turns that loop forever waiting for a response that won't come.
@@ -1457,6 +1483,17 @@ Return ONLY the JSON object."""
         ("how do I deal with", "general"),
         ("recommend a book about", "general"),
         ("what are some habits for", "general"),
+        # Conversational seeds — "I'm thinking about X" / "I've been
+        # wondering Y" / "I want to learn Z" are pure chat. Without
+        # these the architect tried to build a multi-step plan for
+        # "I'm thinking about learning a new programming language."
+        # and timed out at 76s.
+        ("I'm thinking about learning", "general"),
+        ("I'm considering trying", "general"),
+        ("I've been wondering about", "general"),
+        ("I want to learn", "general"),
+        ("I'd like to understand", "general"),
+        ("tell me about", "general"),
         # Research / web lookup
         ("search the web for", "researcher"), ("look up information about", "researcher"),
         ("find documentation for", "researcher"), ("what is the latest news", "researcher"),
@@ -1605,6 +1642,49 @@ Return ONLY the JSON object."""
             for t in (step.get("tools") or [])
         )
 
+        # Intent-vs-tools gap detection. Catches the failure where the
+        # user asked to delete/remove X, the architect dropped the
+        # deletion clause when routing, and the synthesis then
+        # confidently claims "X was removed" with no `forget` in the
+        # tool history. The visible chat lied. Build a list of explicit
+        # gaps and inject them into the prompt so the synthesis cannot
+        # paper over missing work.
+        all_tools_fired = {
+            t for step in step_history for t in (step.get("tools") or [])
+        }
+        user_lower = user_input.lower()
+        intent_gaps: list = []
+        _DELETE_RE = (
+            r"\b(?:forget|remove|delete|clear|wipe|erase|drop)\b"
+            r"(?!\s+(?:the\s+)?(?:file|folder|directory|line|comment|test|var|variable|import))"
+        )
+        import re as _re_intent
+        if _re_intent.search(_DELETE_RE, user_lower) and "forget" not in all_tools_fired:
+            intent_gaps.append(
+                "The user asked you to delete/remove/forget something, but "
+                "NO `forget` tool was called in any step. You MUST NOT claim "
+                "anything was removed, deleted, cleared, or filtered out. "
+                "Acknowledge in your reply that the deletion was not "
+                "performed and offer to do it now."
+            )
+        if _re_intent.search(r"\bremember\b|\bsave that\b|\bnote that\b", user_lower) \
+                and "remember" not in all_tools_fired \
+                and "learn_skill" not in all_tools_fired:
+            intent_gaps.append(
+                "The user asked you to remember/save something, but neither "
+                "`remember` nor `learn_skill` was called. You MUST NOT claim "
+                "anything was saved or remembered."
+            )
+        intent_block = ""
+        if intent_gaps:
+            intent_block = (
+                "\n\n[CRITICAL — DO NOT IGNORE]\n"
+                "These intents from the user were NOT satisfied by the tools "
+                "that ran. You MUST surface this honestly in your reply:\n- "
+                + "\n- ".join(intent_gaps)
+                + "\n"
+            )
+
         if had_code_delivery:
             body_rules = (
                 "- If the plan succeeded, write a short delivery summary in "
@@ -1655,12 +1735,17 @@ Return ONLY the JSON object."""
             "want is to SEE the output — don't bury it.\n"
             "- If anything failed, say so plainly and stop. Do not pretend "
             "work was done that wasn't.\n"
+            "- The `Steps taken` list is the GROUND TRUTH for what tools "
+            "ran. If a tool name is not in that list, the action it would "
+            "have performed DID NOT HAPPEN. Never describe a deletion, "
+            "save, or file write that the tool list doesn't show.\n"
             "- No JSON, no markdown headers above level-3, no code fences "
             "unless quoting actual code.\n\n"
             f"User request:\n{user_input}\n\n"
             f"Steps taken (internal record):\n{history_block}\n\n"
             f"Last sub-agent output:\n{last_step_output}"
-            f"{output_block}\n\n"
+            f"{output_block}"
+            f"{intent_block}\n\n"
             "Your reply to the user:"
         )
 
@@ -1746,9 +1831,24 @@ Return ONLY the JSON object."""
         # call — and definitely shouldn't reach the architect loop where it
         # can spin until the stuck-detector trips.
         stripped = user_input.strip()
-        if 0 < len(stripped) <= 40:
+        # 40 chars was too aggressive: "I'm thinking about learning a new
+        # programming language." is 56 chars, has no code chars, no
+        # request verbs, no workspace references — but still fell through
+        # to the architect loop and took 76s to produce a no-tool reply.
+        # 140 chars covers most one-sentence conversational seeds while
+        # still excluding the long, multi-clause requests that legitimately
+        # need planning.
+        if 0 < len(stripped) <= 140:
             # No code/punctuation that suggests an actual request
             no_code_chars = not any(c in stripped for c in "(){}[];=<>|\\$/`")
+            # No workspace references — "the code", "this file", "my project"
+            # need an executor turn even when verb-light.
+            _ws_phrases = (
+                "the code", "this code", "my code", "the file", "this file",
+                "the project", "this project", "my project", "the repo",
+                "this repo", "the build", "the tests", "the bug",
+            )
+            no_workspace_ref = not any(p in stripped.lower() for p in _ws_phrases)
             no_request_verbs = not any(
                 w in stripped.lower().split()
                 for w in {
@@ -1759,6 +1859,12 @@ Return ONLY the JSON object."""
                     "check",
                 }
             )
+            # Bare-conjunctive conversational phrasings — "I'm thinking
+            # about X", "I've been wondering Y", "what do you think about
+            # Z" — are pure chat. The verb list above doesn't catch
+            # "thinking"/"wondering"/"considering" because those are NOT
+            # action verbs; flag them as positive evidence for general.
+            no_request_verbs = no_request_verbs and no_workspace_ref
             if no_code_chars and no_request_verbs:
                 # Before bailing to `general`, check if a saved skill matches
                 # at a *high* threshold. Short, verb-light inputs like

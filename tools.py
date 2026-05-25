@@ -1267,8 +1267,23 @@ def create_memory_tools(db: Any):
     """Integrates Database-backed memory tools."""
     @registry.register
     def remember(fact: str, tags: Optional[str] = None) -> str:
-        """Store a fact, preference, or project detail in long-term memory."""
-        db.add_memory(fact, tags)
+        """Store a fact, preference, or project detail in long-term memory.
+
+        `tags` is a comma-separated string ("location,preference"). If the
+        model passes a list/tuple it's coerced — SQLite cannot bind list
+        values and the model otherwise wastes a turn retrying. If the same
+        fact is already stored (case-insensitive verbatim match), this is
+        a no-op and the response says so — call `forget` first if you want
+        to change a fact, do not re-call `remember` with a rephrasing.
+        """
+        if isinstance(tags, (list, tuple)):
+            tags = ",".join(str(t).strip() for t in tags if t is not None) or None
+        inserted = db.add_memory(fact, tags)
+        if not inserted:
+            return (
+                f"Already stored (no change): {fact}. "
+                f"If you want to update this, call forget(query=...) first."
+            )
         return f"Memory stored: {fact}"
 
     @registry.register
@@ -1289,13 +1304,49 @@ def create_memory_tools(db: Any):
         if not deleted: return f"No memories found matching '{query}' to forget."
         if deleted and deleted[0].startswith("[REFUSED:"):
             total = deleted[0][len("[REFUSED:"):-1]
-            preview = "\n- ".join(deleted[1:])
+            preview_facts = deleted[1:]
+            preview = "\n- ".join(preview_facts)
+
+            # Surface tokens that appear in SOME but not ALL matched
+            # facts — those are the words the model can use to narrow.
+            # The previous refusal text said "narrow the query" but
+            # didn't tell the model which words would actually narrow
+            # it, so the model often retried with a near-identical
+            # query and got refused again.
+            _stop = {
+                "the", "a", "an", "is", "was", "are", "were", "be", "been",
+                "of", "in", "on", "at", "to", "for", "and", "or", "but",
+                "my", "your", "his", "her", "their", "our", "i", "you", "he",
+                "she", "it", "we", "they", "this", "that", "these", "those",
+                "user", "memory", "fact",
+            }
+            import re as _re_tok
+            token_sets = [
+                {w for w in _re_tok.findall(r"[a-z0-9]+", f.lower())
+                 if w not in _stop and len(w) > 2}
+                for f in preview_facts
+            ]
+            if token_sets:
+                in_all = set.intersection(*token_sets) if token_sets else set()
+                distinctive = sorted({
+                    t for ts in token_sets for t in ts if t not in in_all
+                })[:8]
+            else:
+                distinctive = []
+            distinct_line = (
+                f"Distinctive words across these matches: {', '.join(distinctive)}.\n"
+                if distinctive
+                else ""
+            )
+
             return (
                 f"Refused to delete: query '{query}' matches {total} memories — "
                 f"too many to safely remove in one call.\n"
                 f"First few that would have been deleted:\n- {preview}\n"
-                f"Narrow the query with more distinctive words, or use a "
-                f"specific tag, then call forget again."
+                f"{distinct_line}"
+                f"Pick a word from the matches that identifies ONLY the fact "
+                f"you want gone, then call forget again with that as the query. "
+                f"Do NOT retry with a near-identical query — it will be refused again."
             )
         return "Deleted memories:\n- " + "\n- ".join(deleted)
 

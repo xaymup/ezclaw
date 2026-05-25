@@ -95,7 +95,17 @@ class Database:
                 messages.append(msg)
             return messages
 
-    def add_memory(self, fact: str, tags: Optional[str] = None):
+    def add_memory(self, fact: str, tags: Optional[str] = None) -> bool:
+        """Store a fact. Returns True if inserted, False if an identical
+        fact (verbatim or case-insensitive match) already exists.
+
+        Exact-match dedup at the storage layer is the hard guarantee
+        behind the prompt-only "one remember per fact" rule — the
+        executor's loop detector only catches identical tool-call
+        hashes, so two `remember` calls with the same fact phrased
+        slightly differently across turns used to stack duplicate
+        rows ("User lives in Seattle" × 4 was a real failure).
+        """
         if not tags:
             keywords = {
                 'location': ['location', 'lives in', 'city', 'country', 'home'],
@@ -111,6 +121,15 @@ class Database:
             if found_tags:
                 tags = ",".join(found_tags)
 
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT 1 FROM memories WHERE LOWER(fact) = LOWER(?) LIMIT 1",
+                (fact,),
+            )
+            if cursor.fetchone():
+                return False
+
         from embed import embed
         try:
             vector = embed(fact)
@@ -122,6 +141,7 @@ class Database:
             cursor = conn.cursor()
             cursor.execute("INSERT INTO memories (fact, tags, embedding) VALUES (?, ?, ?)", (fact, tags, blob))
             conn.commit()
+        return True
 
     def _ensure_embedding(self, row_id: int, fact: str, emb_blob: Optional[bytes]):
         if emb_blob:

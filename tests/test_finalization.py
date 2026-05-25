@@ -120,11 +120,20 @@ def test_synthesis_prompt_lists_finalization_shape():
 
 def test_synthesis_failure_branch_skips_finalization_shape():
     """On failure the synthesis should say what failed and stop —
-    NOT produce 'how to use it' for work that wasn't done."""
+    NOT produce 'how to use it' for work that wasn't done.
+
+    The earlier 'Skip the how to use and next steps sections on failure'
+    text was removed when the conversational branch stopped emitting
+    those sections entirely. The stronger rule that replaced it is now:
+    Steps taken is GROUND TRUTH for what tools ran; do not describe
+    actions that aren't in the tool list. That covers failure too — if a
+    tool didn't fire, the action it would have performed did not happen.
+    """
     import multi_agent
     src = open(multi_agent.__file__).read()
-    # The rule is present and unambiguous
-    assert "Skip the 'how to use' and 'next " in src
+    assert "Do not pretend " in src
+    assert "GROUND TRUTH for what tools" in src
+    assert "DID NOT HAPPEN" in src
 
 
 # ── Integration: architect doesn't drift after a finished plan ─────────────
